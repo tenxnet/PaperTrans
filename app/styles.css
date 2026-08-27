@@ -1,0 +1,24 @@
+:root { color-scheme: light; --paper:#fffdf9; --ink:#20242c; --muted:#6c7480; --line:#dfe3e8; --blue:#2859b8; }
+* { box-sizing:border-box; }
+body { margin:0; background:#f2f1ed; color:var(--ink); font-family:"Hiragino Sans","Noto Sans JP",sans-serif; }
+button,input { font:inherit; }
+.shell { min-height:100vh; padding:28px; }
+.topbar { max-width:1440px; margin:auto; display:flex; justify-content:space-between; align-items:flex-end; gap:28px; }
+.product { margin:0 0 4px; color:var(--blue); font-size:13px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+h1 { margin:0; font-family:Georgia,"Yu Mincho",serif; font-size:30px; font-weight:500; }
+.upload { display:flex; align-items:center; flex-wrap:wrap; justify-content:flex-end; gap:10px; max-width:620px; }
+.upload label { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:13px; }
+.upload input { max-width:260px; }
+.upload button { border:0; border-radius:6px; background:var(--blue); color:white; padding:10px 15px; cursor:pointer; }
+.upload small { flex-basis:100%; text-align:right; color:var(--muted); }
+.summary { max-width:1440px; margin:22px auto 14px; display:grid; grid-template-columns:2fr repeat(4, 1fr); border:1px solid var(--line); background:var(--paper); }
+.summary div { min-width:0; padding:13px 16px; border-right:1px solid var(--line); }
+.summary div:last-child { border-right:0; }
+.summary span { display:block; color:var(--muted); font-size:11px; margin-bottom:4px; }
+.summary strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
+.reader-frame { max-width:1440px; height:calc(100vh - 188px); margin:auto; background:white; border:1px solid var(--line); }
+.reader-toolbar { height:42px; display:flex; align-items:center; justify-content:space-between; padding:0 14px; border-bottom:1px solid var(--line); color:var(--muted); font-size:12px; }
+.reader-toolbar a { color:var(--blue); text-decoration:none; }
+.reader-frame iframe { display:block; width:100%; height:calc(100% - 42px); border:0; }
+.empty { max-width:1440px; margin:14px auto; padding:40px; border:1px solid var(--line); background:var(--paper); color:var(--muted); text-align:center; }
+@media (max-width:900px) { .shell{padding:16px}.topbar{display:block}.upload{justify-content:flex-start;margin-top:18px}.summary{grid-template-columns:1fr 1fr}.summary div{border-bottom:1px solid var(--line)}.reader-frame{height:75vh} }
