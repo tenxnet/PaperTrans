@@ -7,7 +7,7 @@ from pathlib import Path
 from .extract import extract_document
 from .io import load_document
 from .render import create_bundle, render_document
-from .structure import analyze_layout, extract_layout_evidence, render_visual_objects
+from .structure import analyze_layout, extract_layout_evidence, render_visual_objects, write_visual_qa
 from .translate import translate_document
 
 
@@ -103,6 +103,7 @@ def main() -> None:
             (args.output.parent / "visual-objects.json").write_text(
                 json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            write_visual_qa(objects, args.output.parent / "visual-qa.html")
         print(
             json.dumps(
                 {

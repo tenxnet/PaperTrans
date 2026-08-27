@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+from html import escape
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -211,68 +212,106 @@ def analyze_layout(
     combined_warnings: list[str] = []
     previous_context: dict[str, Any] = {"sections": [], "tailAssignments": []}
 
-    for offset in range(0, len(pages), batch_size):
-        batch = pages[offset : offset + batch_size]
-        batch_number = offset // batch_size + 1
-        batch_path = structure_dir / f"batch-{batch_number:03d}.json"
+    def updated_context(context: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+        section_values: dict[str, dict[str, Any]] = {
+            section["sectionId"]: section for section in context.get("sections", [])
+        }
+        for section in result.get("sections", []):
+            section_values[section["sectionId"]] = section
+        return {
+            "sections": list(section_values.values())[-12:],
+            "tailAssignments": result["pages"][-1]["blockAssignments"][-6:],
+        }
+
+    def run_batch(batch: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
+        first_page = batch[0]["pageNumber"]
+        last_page = batch[-1]["pageNumber"]
+        batch_path = structure_dir / f"pages-{first_page:03d}-{last_page:03d}.json"
         if batch_path.exists():
-            result = json.loads(batch_path.read_text(encoding="utf-8"))
-            validate_structure_batch(batch, result)
-            print(f"Reused structure batch {batch_number}", file=sys.stderr, flush=True)
-        else:
-            payload = {
-                "document": {
-                    "sourceFile": evidence["sourceFile"],
-                    "pageCount": evidence["pageCount"],
-                },
-                "attachedImages": [
-                    {"attachmentIndex": index + 1, "pageNumber": page["pageNumber"]}
-                    for index, page in enumerate(batch)
-                ],
-                "previousContext": previous_context,
-                "pages": batch,
-            }
-            images = [work_dir / page["image"] for page in batch]
+            cached = json.loads(batch_path.read_text(encoding="utf-8"))
+            validate_structure_batch(batch, cached)
+            print(f"Reused structure pages {first_page}-{last_page}", file=sys.stderr, flush=True)
+            return cached
+
+        payload = {
+            "document": {
+                "sourceFile": evidence["sourceFile"],
+                "pageCount": evidence["pageCount"],
+            },
+            "attachedImages": [
+                {"attachmentIndex": index + 1, "pageNumber": page["pageNumber"]}
+                for index, page in enumerate(batch)
+            ],
+            "previousContext": context,
+            "pages": batch,
+        }
+        images = [work_dir / page["image"] for page in batch]
+        print(f"Analyzing structure pages {first_page}-{last_page}", file=sys.stderr, flush=True)
+        attempts = retries + 1 if len(batch) == 1 else 1
+        timeout_seconds = 600 if len(batch) == 1 else 240
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                process = subprocess.run(
+                    _structure_command(repo_root, schema, images),
+                    input=json.dumps(payload, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                )
+                if process.returncode != 0:
+                    detail = process.stderr.strip()[-3000:]
+                    raise RuntimeError(detail or f"Codex exited with {process.returncode}")
+                result = _parse_json(process.stdout)
+                validate_structure_batch(batch, result)
+                batch_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                return result
+            except Exception as error:
+                last_error = error
+                if attempt + 1 < attempts:
+                    print(
+                        f"Retrying structure page {first_page}: {str(error)[-500:]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        if len(batch) > 1:
             print(
-                f"Analyzing structure pages {batch[0]['pageNumber']}-{batch[-1]['pageNumber']}",
+                f"Splitting slow/invalid batch {first_page}-{last_page} into single pages",
                 file=sys.stderr,
                 flush=True,
             )
-            result: dict[str, Any] | None = None
-            last_error: Exception | None = None
-            for attempt in range(retries + 1):
-                try:
-                    process = subprocess.run(
-                        _structure_command(repo_root, schema, images),
-                        input=json.dumps(payload, ensure_ascii=False),
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                        timeout=1200,
-                    )
-                    if process.returncode != 0:
-                        raise RuntimeError(process.stderr.strip() or f"Codex exited with {process.returncode}")
-                    result = _parse_json(process.stdout)
-                    validate_structure_batch(batch, result)
-                    break
-                except Exception as error:
-                    last_error = error
-                    result = None
-                    if attempt == retries:
-                        raise RuntimeError(f"structure batch {batch_number} failed: {error}") from error
-            if result is None:
-                raise RuntimeError(f"structure batch {batch_number} failed: {last_error}")
-            batch_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            page_results: list[dict[str, Any]] = []
+            section_values: dict[str, dict[str, Any]] = {}
+            warnings: list[str] = []
+            sub_context = context
+            for page in batch:
+                page_result = run_batch([page], sub_context)
+                page_results.extend(page_result["pages"])
+                for section in page_result.get("sections", []):
+                    section_values[section["sectionId"]] = section
+                warnings.extend(page_result.get("warnings", []))
+                sub_context = updated_context(sub_context, page_result)
+            split_result = {
+                "pages": page_results,
+                "sections": list(section_values.values()),
+                "warnings": warnings,
+            }
+            validate_structure_batch(batch, split_result)
+            batch_path.write_text(json.dumps(split_result, ensure_ascii=False, indent=2), encoding="utf-8")
+            return split_result
+        raise RuntimeError(f"structure page {first_page} failed: {last_error}") from last_error
+
+    for offset in range(0, len(pages), batch_size):
+        batch = pages[offset : offset + batch_size]
+        result = run_batch(batch, previous_context)
 
         combined_pages.extend(result["pages"])
         for section in result.get("sections", []):
             combined_sections[section["sectionId"]] = section
         combined_warnings.extend(str(warning) for warning in result.get("warnings", []))
-        last_page = result["pages"][-1]
-        previous_context = {
-            "sections": list(combined_sections.values())[-12:],
-            "tailAssignments": last_page["blockAssignments"][-6:],
-        }
+        previous_context = updated_context(previous_context, result)
 
     combined = {
         "version": 2,
@@ -319,3 +358,33 @@ def render_visual_objects(
             )
     pdf.close()
     return rendered
+
+
+def write_visual_qa(objects: list[dict[str, Any]], output_path: Path) -> Path:
+    cards: list[str] = []
+    for visual in objects:
+        label = visual.get("label") or visual["objectId"]
+        warnings = " / ".join(str(value) for value in visual.get("warnings", [])) or "none"
+        cards.append(
+            "<article>"
+            f"<header><strong>{escape(str(label))}</strong>"
+            f"<span>page {visual['pageNumber']} · {escape(visual['kind'])} · "
+            f"confidence {float(visual['confidence']):.2f}</span></header>"
+            f"<img src=\"{escape(visual['asset'])}\" alt=\"{escape(str(label))}\">"
+            f"<p>bbox {escape(json.dumps(visual['bboxNormalized']))}</p>"
+            f"<p>warnings: {escape(warnings)}</p>"
+            "</article>"
+        )
+    html_text = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>PaperTrans visual object QA</title>
+<style>
+body{{margin:0;background:#ecebe7;color:#20242c;font-family:system-ui,sans-serif}}
+main{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;padding:20px}}
+article{{background:white;border:1px solid #d8dbe0;padding:12px;break-inside:avoid}}
+header{{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-bottom:10px}}
+header span,p{{font-size:11px;color:#69717f}}img{{display:block;width:100%;height:auto;background:white}}
+@media(max-width:900px){{main{{grid-template-columns:1fr}}}}
+</style></head><body><main>{''.join(cards)}</main></body></html>"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html_text, encoding="utf-8")
+    return output_path
