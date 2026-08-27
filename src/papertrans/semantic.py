@@ -134,13 +134,39 @@ def build_semantic_document(
 
     sections: list[dict[str, Any]] = []
     section_by_id: dict[str, dict[str, Any]] = {}
+    split_intro_units: list[dict[str, Any]] = []
     for value in structure["sections"]:
         title_block_id = value["titleBlockId"]
         title_assignment = assignment_by_id[title_block_id]
         raw_title = raw_blocks[title_block_id]["text"].strip()
         display_title = raw_title
         if value.get("number"):
-            display_title = re.sub(rf"^{re.escape(str(value['number']))}\s*", "", raw_title, count=1)
+            number_match = re.search(rf"(?:^|\s){re.escape(str(value['number']))}\s+", raw_title)
+            if number_match:
+                prefix = raw_title[: number_match.start()].strip()
+                display_title = raw_title[number_match.end() :].strip()
+                if prefix and value.get("parentSectionId"):
+                    split_intro_units.append(
+                        {
+                            "id": f"intro-{value['sectionId']}",
+                            "kind": "paragraph",
+                            "sectionId": value["parentSectionId"],
+                            "original": prefix,
+                            "japanese": "",
+                            "sourceBlockIds": [title_block_id],
+                            "pages": [raw_blocks[title_block_id]["pageNumber"]],
+                            "citations": [],
+                            "objectReferences": [],
+                            "referenceLabel": None,
+                            "preservedTerms": [],
+                            "warnings": ["A mixed PDF block was split at a verified numbered-heading boundary."],
+                            "confidence": float(title_assignment.get("confidence", 0)),
+                            "position": positions[title_block_id] - 0.1,
+                            "endPosition": positions[title_block_id] - 0.1,
+                        }
+                    )
+            else:
+                display_title = re.sub(rf"^{re.escape(str(value['number']))}\s*", "", raw_title, count=1)
         title_unit = {
             "id": f"heading-{value['sectionId']}",
             "kind": "heading",
@@ -154,7 +180,11 @@ def build_semantic_document(
             "objectReferences": [],
             "referenceLabel": None,
             "preservedTerms": [],
-            "warnings": title_assignment.get("warnings", []),
+            "warnings": [
+                warning
+                for warning in title_assignment.get("warnings", [])
+                if "merges the introductory prose" not in str(warning)
+            ],
             "confidence": float(title_assignment.get("confidence", 0)),
             "position": positions[title_block_id],
             "endPosition": positions[title_block_id],
@@ -206,6 +236,10 @@ def build_semantic_document(
         section = section_by_id.get(unit["sectionId"])
         if section:
             section["content"].append({"type": "unit", "position": unit["position"], "value": unit})
+    for unit in split_intro_units:
+        section = section_by_id.get(unit["sectionId"])
+        if section:
+            section["content"].append({"type": "unit", "position": unit["position"], "value": unit})
     for visual in rendered_visuals:
         section = section_by_id.get(visual["sectionId"])
         if section:
@@ -215,6 +249,21 @@ def build_semantic_document(
 
     title_entries = front.get("title", [])
     title = title_entries[0]["original"] if title_entries else Path(evidence["sourceFile"]).stem
+    known_affiliations = sorted(
+        {entry["original"] for entry in front.get("affiliation", []) if entry["original"]},
+        key=len,
+        reverse=True,
+    )
+    for author in front.get("author", []):
+        if not any("merged" in str(warning).lower() for warning in author.get("warnings", [])):
+            continue
+        for affiliation in known_affiliations:
+            if author["original"].endswith(affiliation) and author["original"] != affiliation:
+                author["original"] = author["original"][: -len(affiliation)].strip()
+                author["warnings"] = [
+                    "Author and affiliation were separated using an exact affiliation match."
+                ]
+                break
     title_unit = {
         "id": "paper-title",
         "kind": "title",
@@ -241,9 +290,35 @@ def build_semantic_document(
         },
         "sections": sections,
         "visualObjects": rendered_visuals,
-        "warnings": structure.get("warnings", []),
+        "warnings": [
+            warning
+            for warning in structure.get("warnings", [])
+            if not (
+                ("Only pages" in str(warning) and "were supplied" in str(warning))
+                or ("combines Section" in str(warning) and "heading in one indivisible" in str(warning))
+            )
+        ],
         "glossary": [],
     }
+
+
+def merge_semantic_translations(document: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    previous_units = {unit["id"]: unit for unit in iter_translatable_units(previous)}
+    copied = 0
+    for unit in iter_translatable_units(document):
+        old = previous_units.get(unit["id"])
+        if not old or old.get("original") != unit.get("original") or not old.get("japanese", "").strip():
+            continue
+        unit["japanese"] = old["japanese"]
+        unit["preservedTerms"] = list(old.get("preservedTerms", []))
+        for warning in old.get("warnings", []):
+            if warning not in unit["warnings"]:
+                unit["warnings"].append(warning)
+        copied += 1
+    total = sum(1 for _ in iter_translatable_units(document))
+    document["model"]["translation"] = previous.get("model", {}).get("translation")
+    document["status"] = previous.get("status", "structured") if copied == total else "structured"
+    return document
 
 
 def save_semantic_document(document: dict[str, Any], path: Path) -> None:

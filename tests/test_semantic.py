@@ -94,6 +94,22 @@ def test_builds_real_sections_and_semantic_paragraphs():
     assert content[1]["value"]["caption"] == "Figure 1: Original caption."
 
 
+def test_splits_author_from_known_affiliation():
+    evidence, structure, visuals = sample_semantic_inputs()
+    evidence["pages"][0]["blocks"].insert(1, {"blockId": "p1-author", "text": "Ada Lovelace Example University"})
+    evidence["pages"][0]["blocks"].insert(2, {"blockId": "p1-affiliation", "text": "Example University"})
+    assignments = structure["pages"][0]["blockAssignments"]
+    for item in assignments:
+        if item["blockId"] != "p1-b1":
+            item["readingOrder"] += 2
+    assignments[1:1] = [
+        {"blockId": "p1-author", "role": "author", "readingOrder": 2, "sectionId": None, "paragraphId": None, "hidden": False, "citations": [], "objectReferences": [], "referenceLabel": None, "confidence": .8, "warnings": ["Author and affiliation are merged."]},
+        {"blockId": "p1-affiliation", "role": "affiliation", "readingOrder": 3, "sectionId": None, "paragraphId": None, "hidden": False, "citations": [], "objectReferences": [], "referenceLabel": None, "confidence": 1, "warnings": []},
+    ]
+    document = build_semantic_document(evidence, structure, visuals)
+    assert document["frontMatter"]["authors"][0]["original"] == "Ada Lovelace"
+
+
 def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
     document = build_semantic_document(*sample_semantic_inputs())
     units = list(iter_translatable_units(document))
@@ -122,4 +138,3 @@ def test_semantic_translation_rejects_missing_units():
         assert "missing" in str(error)
     else:
         raise AssertionError("missing unit was accepted")
-

@@ -7,7 +7,12 @@ from pathlib import Path
 from .extract import extract_document
 from .io import load_document
 from .render import create_bundle, render_document
-from .semantic import build_semantic_document, load_semantic_document, save_semantic_document
+from .semantic import (
+    build_semantic_document,
+    load_semantic_document,
+    merge_semantic_translations,
+    save_semantic_document,
+)
 from .semantic_render import render_semantic_document
 from .semantic_translate import translate_semantic_document
 from .structure import analyze_layout, extract_layout_evidence, render_visual_objects, write_visual_qa
@@ -63,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     semantic_build.add_argument("structure", type=Path)
     semantic_build.add_argument("visual_objects", type=Path)
     semantic_build.add_argument("--output", type=Path, required=True)
+    semantic_build.add_argument("--previous", type=Path)
 
     semantic_translate = subparsers.add_parser("semantic-translate", help="Translate reconstructed semantic paragraphs")
     semantic_translate.add_argument("document", type=Path)
@@ -138,11 +144,14 @@ def main() -> None:
         return
 
     if args.command == "semantic-build":
+        previous = load_semantic_document(args.previous) if args.previous and args.previous.exists() else None
         document = build_semantic_document(
             json.loads(args.evidence.read_text(encoding="utf-8")),
             json.loads(args.structure.read_text(encoding="utf-8")),
             json.loads(args.visual_objects.read_text(encoding="utf-8")),
         )
+        if previous:
+            merge_semantic_translations(document, previous)
         save_semantic_document(document, args.output)
         unit_count = sum(
             1 for section in document["sections"] for item in section["content"] if item["type"] == "unit"

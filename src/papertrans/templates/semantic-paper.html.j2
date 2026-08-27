@@ -21,7 +21,7 @@
   </style>
 </head>
 <body>
-  <header class="topbar"><span class="brand">PaperTrans</span><nav><span class="status">{{ document.status }}</span><span>翻訳: {{ document.model.translation or "未実行" }}</span><a href="source.pdf">原文PDF</a><a href="semantic-document.json">構造JSON</a></nav></header>
+  <header class="topbar"><span class="brand">PaperTrans</span><nav><span class="status">{% if document.status == "needs_review" %}翻訳完了・要確認{% elif document.status == "translated" %}翻訳完了{% else %}{{ document.status }}{% endif %}</span><span>翻訳: {{ document.model.translation or "未実行" }}</span><a href="source.pdf">原文PDF</a><a href="semantic-document.json">構造JSON</a></nav></header>
   <div class="shell">
     <main>
       <header class="paper-head">
