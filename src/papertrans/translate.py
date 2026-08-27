@@ -4,6 +4,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -86,8 +88,6 @@ def _command(repo_root: Path, schema_path: Path) -> list[str]:
         "--ephemeral",
         "--sandbox",
         "read-only",
-        "--ask-for-approval",
-        "never",
         "--output-schema",
         str(schema_path),
         (
@@ -142,6 +142,12 @@ def translate_document(
         payload = _build_payload(document, chunk)
         last_error: Exception | None = None
         result: dict | None = None
+        print(
+            f"Translating chunk {chunk.index}/{len(chunks)} "
+            f"({len(chunk.items)} blocks, {chunk.character_count} characters)",
+            file=sys.stderr,
+            flush=True,
+        )
         for attempt in range(retries + 1):
             try:
                 process = subprocess.run(
@@ -155,9 +161,26 @@ def translate_document(
                 if process.returncode != 0:
                     raise RuntimeError(process.stderr.strip() or f"Codex exited with {process.returncode}")
                 result = _parse_result(process.stdout)
+                translations = result.get("translations", [])
+                expected_ids = [item.id for item in chunk.items]
+                actual_ids = [entry.get("blockId") for entry in translations]
+                counts = Counter(actual_ids)
+                missing_ids = [block_id for block_id in expected_ids if counts[block_id] == 0]
+                duplicate_ids = [str(block_id) for block_id, count in counts.items() if count > 1]
+                unknown_ids = [str(block_id) for block_id in counts if block_id not in expected_ids]
+                if missing_ids or duplicate_ids or unknown_ids:
+                    problems = []
+                    if missing_ids:
+                        problems.append(f"missing: {', '.join(missing_ids)}")
+                    if duplicate_ids:
+                        problems.append(f"duplicate: {', '.join(duplicate_ids)}")
+                    if unknown_ids:
+                        problems.append(f"unknown: {', '.join(unknown_ids)}")
+                    raise ValueError("invalid block identity; " + "; ".join(problems))
                 break
             except Exception as error:
                 last_error = error
+                result = None
                 if attempt == retries:
                     raise RuntimeError(f"chunk {chunk.index} failed: {error}") from error
         if result is None:
@@ -165,10 +188,6 @@ def translate_document(
 
         translations = result.get("translations", [])
         by_id = {entry.get("blockId"): entry for entry in translations}
-        missing_ids = [item.id for item in chunk.items if item.id not in by_id]
-        if missing_ids:
-            raise RuntimeError(f"chunk {chunk.index} omitted blocks: {', '.join(missing_ids)}")
-
         for item in chunk.items:
             entry = by_id[item.id]
             item.japanese = str(entry.get("japanese", "")).strip()
@@ -176,9 +195,9 @@ def translate_document(
             item.warnings = [str(warning) for warning in entry.get("warnings", [])]
             item.warnings.extend(_check_invariants(item.original, item.japanese))
         save_document(document, document_path)
+        print(f"Completed chunk {chunk.index}/{len(chunks)}", file=sys.stderr, flush=True)
 
     warnings = [warning for item in document.iter_items() for warning in item.warnings]
     document.status = "needs_review" if warnings else "translated"
     save_document(document, document_path)
     return document
-

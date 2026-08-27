@@ -2,7 +2,7 @@ from pathlib import Path
 
 from papertrans.models import BBox, DocumentIR, DocumentItem, PageIR
 from papertrans.render import create_bundle, render_document
-from papertrans.translate import _check_invariants, create_chunks
+from papertrans.translate import _check_invariants, _command, create_chunks
 
 
 def sample_document() -> DocumentIR:
@@ -61,3 +61,10 @@ def test_render_and_zip(tmp_path: Path):
     assert "図表・数式の確認用" in text
     assert "page-001-original.jpg" in text
     assert bundle.exists()
+
+
+def test_codex_command_uses_read_only_sandbox(tmp_path: Path):
+    command = _command(tmp_path, tmp_path / "schema.json")
+    assert command[0] == "codex"
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "--ask-for-approval" not in command
