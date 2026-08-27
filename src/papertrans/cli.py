@@ -7,6 +7,9 @@ from pathlib import Path
 from .extract import extract_document
 from .io import load_document
 from .render import create_bundle, render_document
+from .semantic import build_semantic_document, load_semantic_document, save_semantic_document
+from .semantic_render import render_semantic_document
+from .semantic_translate import translate_semantic_document
 from .structure import analyze_layout, extract_layout_evidence, render_visual_objects, write_visual_qa
 from .translate import translate_document
 
@@ -54,6 +57,25 @@ def _parser() -> argparse.ArgumentParser:
     structure.add_argument("--max-pages", type=int)
     structure.add_argument("--source-pdf", type=Path)
     structure.add_argument("--assets-dir", type=Path)
+
+    semantic_build = subparsers.add_parser("semantic-build", help="Build chapter and paragraph document semantics")
+    semantic_build.add_argument("evidence", type=Path)
+    semantic_build.add_argument("structure", type=Path)
+    semantic_build.add_argument("visual_objects", type=Path)
+    semantic_build.add_argument("--output", type=Path, required=True)
+
+    semantic_translate = subparsers.add_parser("semantic-translate", help="Translate reconstructed semantic paragraphs")
+    semantic_translate.add_argument("document", type=Path)
+    semantic_translate.add_argument("--repo-root", type=Path, default=Path.cwd())
+    semantic_translate.add_argument("--cache-dir", type=Path, required=True)
+    semantic_translate.add_argument("--max-characters", type=int, default=11000)
+
+    semantic_render = subparsers.add_parser("semantic-render", help="Render chapter-structured HTML")
+    semantic_render.add_argument("document", type=Path)
+    semantic_render.add_argument("--work-dir", type=Path, required=True)
+    semantic_render.add_argument("--output-dir", type=Path, required=True)
+    semantic_render.add_argument("--source-pdf", type=Path)
+    semantic_render.add_argument("--zip", type=Path)
     return parser
 
 
@@ -113,6 +135,39 @@ def main() -> None:
                 }
             )
         )
+        return
+
+    if args.command == "semantic-build":
+        document = build_semantic_document(
+            json.loads(args.evidence.read_text(encoding="utf-8")),
+            json.loads(args.structure.read_text(encoding="utf-8")),
+            json.loads(args.visual_objects.read_text(encoding="utf-8")),
+        )
+        save_semantic_document(document, args.output)
+        unit_count = sum(
+            1 for section in document["sections"] for item in section["content"] if item["type"] == "unit"
+        )
+        print(json.dumps({"sections": len(document["sections"]), "units": unit_count}))
+        return
+
+    if args.command == "semantic-translate":
+        document = load_semantic_document(args.document)
+        translate_semantic_document(
+            document,
+            args.document,
+            args.repo_root.resolve(),
+            args.cache_dir,
+            max_characters=args.max_characters,
+        )
+        print(json.dumps({"status": document["status"], "model": document["model"]["translation"]}))
+        return
+
+    if args.command == "semantic-render":
+        document = load_semantic_document(args.document)
+        index = render_semantic_document(document, args.work_dir, args.output_dir, args.source_pdf)
+        if args.zip:
+            create_bundle(args.output_dir, args.zip)
+        print(index)
         return
 
     if args.command == "pipeline":
