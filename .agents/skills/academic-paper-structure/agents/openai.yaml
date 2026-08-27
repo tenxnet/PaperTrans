@@ -1,0 +1,3 @@
+interface:
+  display_name: "Academic Paper Structure"
+  short_description: "Recover sections, paragraphs, equations, figures, and citations from PDF pages"

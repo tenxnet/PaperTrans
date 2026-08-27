@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "pageNumber": { "type": "integer", "minimum": 1 },
+          "blockAssignments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "blockId": { "type": "string", "minLength": 1 },
+                "role": { "type": "string", "enum": ["title", "author", "affiliation", "metadata", "abstract", "heading", "paragraph", "list_item", "caption", "footnote", "reference", "header", "footer", "page_number", "equation", "algorithm", "noise"] },
+                "readingOrder": { "type": "integer", "minimum": 1 },
+                "sectionId": { "type": ["string", "null"] },
+                "paragraphId": { "type": ["string", "null"] },
+                "continuesFrom": { "type": ["string", "null"] },
+                "hidden": { "type": "boolean" },
+                "citations": { "type": "array", "items": { "type": "string" } },
+                "objectReferences": { "type": "array", "items": { "type": "string" } },
+                "referenceLabel": { "type": ["string", "null"] },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "warnings": { "type": "array", "items": { "type": "string" } }
+              },
+              "required": ["blockId", "role", "readingOrder", "sectionId", "paragraphId", "continuesFrom", "hidden", "citations", "objectReferences", "referenceLabel", "confidence", "warnings"],
+              "additionalProperties": false
+            }
+          },
+          "visualObjects": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "objectId": { "type": "string", "minLength": 1 },
+                "kind": { "type": "string", "enum": ["figure", "table", "equation", "algorithm"] },
+                "label": { "type": ["string", "null"] },
+                "bboxNormalized": {
+                  "type": "array",
+                  "items": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "captionBlockIds": { "type": "array", "items": { "type": "string" } },
+                "insertAfterBlockId": { "type": ["string", "null"] },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "warnings": { "type": "array", "items": { "type": "string" } }
+              },
+              "required": ["objectId", "kind", "label", "bboxNormalized", "captionBlockIds", "insertAfterBlockId", "confidence", "warnings"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["pageNumber", "blockAssignments", "visualObjects"],
+        "additionalProperties": false
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sectionId": { "type": "string", "minLength": 1 },
+          "number": { "type": ["string", "null"] },
+          "titleBlockId": { "type": "string", "minLength": 1 },
+          "level": { "type": "integer", "minimum": 1, "maximum": 6 },
+          "parentSectionId": { "type": ["string", "null"] },
+          "pageStart": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["sectionId", "number", "titleBlockId", "level", "parentSectionId", "pageStart"],
+        "additionalProperties": false
+      }
+    },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["pages", "sections", "warnings"],
+  "additionalProperties": false
+}
