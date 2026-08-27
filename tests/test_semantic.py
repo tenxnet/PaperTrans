@@ -4,6 +4,7 @@ from pathlib import Path
 from papertrans.semantic import build_semantic_document, iter_translatable_units
 from papertrans.semantic_render import render_semantic_document
 from papertrans.semantic_translate import _command, _validate_result
+from papertrans.structure import validate_structure_batch
 
 
 def sample_semantic_inputs():
@@ -138,3 +139,22 @@ def test_semantic_translation_rejects_missing_units():
         assert "missing" in str(error)
     else:
         raise AssertionError("missing unit was accepted")
+
+
+def test_structure_validation_rejects_missing_blocks():
+    pages = [{"pageNumber": 1, "blocks": [{"blockId": "p1-b1"}, {"blockId": "p1-b2"}]}]
+    result = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [{"blockId": "p1-b1", "readingOrder": 1}],
+                "visualObjects": [],
+            }
+        ]
+    }
+    try:
+        validate_structure_batch(pages, result)
+    except ValueError as error:
+        assert "missing" in str(error)
+    else:
+        raise AssertionError("missing block was accepted")
