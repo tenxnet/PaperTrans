@@ -1,0 +1,12 @@
+.DS_Store
+.next/
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+data/
+tmp/
+output/
+*.log

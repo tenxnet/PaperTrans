@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["version", "source_file", "source_sha256", "title", "page_count", "pages"],
+  "properties": {
+    "version": { "const": 1 },
+    "source_file": { "type": "string" },
+    "source_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "title": { "type": "string" },
+    "authors": { "type": "string" },
+    "page_count": { "type": "integer", "minimum": 1 },
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["number", "width", "height", "items"],
+        "properties": {
+          "number": { "type": "integer", "minimum": 1 },
+          "width": { "type": "number", "exclusiveMinimum": 0 },
+          "height": { "type": "number", "exclusiveMinimum": 0 },
+          "source_image": { "type": ["string", "null"] },
+          "items": { "type": "array" }
+        }
+      }
+    }
+  }
+}

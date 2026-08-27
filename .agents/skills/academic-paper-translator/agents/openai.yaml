@@ -1,0 +1,4 @@
+interface:
+  display_name: "Academic Paper Translator"
+  short_description: "Translate academic papers into Japanese with source fidelity"
+  default_prompt: "Use $academic-paper-translator to translate this academic paper into Japanese while preserving figures, equations, citations, and key terminology."

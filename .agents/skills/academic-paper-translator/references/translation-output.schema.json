@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "translations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "blockId": { "type": "string", "minLength": 1 },
+          "japanese": { "type": "string", "minLength": 1 },
+          "preservedTerms": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "warnings": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["blockId", "japanese", "preservedTerms", "warnings"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["translations"],
+  "additionalProperties": false
+}

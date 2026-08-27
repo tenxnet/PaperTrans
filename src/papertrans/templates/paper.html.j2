@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ document.title }} - PaperTrans</title>
+  <style>
+    :root { color-scheme: light; --ink:#20242c; --muted:#69717f; --line:#dfe3e8; --paper:#fffdf9; --accent:#2859b8; --warn:#8a5a00; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:#f4f2ed; color:var(--ink); font-family:"Hiragino Sans","Noto Sans JP",sans-serif; line-height:1.8; }
+    header { position:sticky; top:0; z-index:5; background:rgba(255,253,249,.96); border-bottom:1px solid var(--line); padding:14px 24px; display:flex; align-items:center; justify-content:space-between; gap:20px; backdrop-filter:blur(10px); }
+    header strong { font-family:Georgia,"Yu Mincho",serif; font-size:18px; }
+    header nav { display:flex; gap:14px; font-size:13px; }
+    header a { color:var(--accent); text-decoration:none; }
+    .layout { max-width:1320px; margin:0 auto; display:grid; grid-template-columns:minmax(0, 860px) 260px; gap:52px; padding:46px 34px 90px; align-items:start; }
+    main { background:var(--paper); padding:54px 66px 72px; border:1px solid #e6e2da; }
+    aside { position:sticky; top:82px; max-height:calc(100vh - 110px); overflow:auto; font-size:13px; }
+    aside h2 { font-size:14px; margin:0 0 12px; }
+    aside ol { margin:0; padding-left:24px; }
+    aside a { color:#4f5968; text-decoration:none; }
+    .eyebrow { color:var(--muted); font-size:13px; letter-spacing:.04em; }
+    h1 { font-family:Georgia,"Yu Mincho",serif; font-weight:500; font-size:38px; line-height:1.28; margin:10px 0 12px; }
+    .authors { color:#355b9e; margin:0 0 34px; }
+    .status { display:inline-flex; padding:4px 9px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:12px; }
+    .page { border-top:1px solid var(--line); margin-top:44px; padding-top:12px; }
+    .page-label { color:var(--muted); font-size:12px; margin-bottom:24px; }
+    h2,h3,h4 { font-family:Georgia,"Yu Mincho",serif; line-height:1.45; margin:34px 0 16px; }
+    h2 { font-size:25px; } h3 { font-size:21px; } h4 { font-size:18px; }
+    .translated { font-family:"Yu Mincho","Hiragino Mincho ProN",serif; font-size:17px; line-height:2; margin:0 0 14px; }
+    .untranslated { color:var(--warn); border-left:3px solid #d9a441; padding-left:14px; }
+    details.original { margin:0 0 26px; border-left:2px solid var(--accent); background:#fafbfd; padding:10px 14px; font-size:14px; }
+    details.original summary { color:var(--accent); cursor:pointer; font-weight:600; }
+    details.original p { font-family:Georgia,serif; line-height:1.65; margin:10px 0 2px; color:#3d4654; }
+    figure { margin:34px 0; padding:14px 0 18px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+    figure img { display:block; width:100%; height:auto; background:white; }
+    figcaption { font-family:Georgia,serif; color:#3f4752; font-size:13px; line-height:1.5; margin-top:12px; }
+    figure.equation { border:0; padding:6px 0; }
+    figure.equation img { max-width:78%; margin:auto; }
+    .terms { display:flex; flex-wrap:wrap; gap:6px; margin:-8px 0 20px; }
+    .term { background:#edf3ff; color:#244e98; padding:2px 7px; border-radius:4px; font-size:11px; }
+    .warnings { color:var(--warn); font-size:12px; margin:8px 0 20px; }
+    .reference { font-family:Georgia,serif; font-size:13px; line-height:1.55; color:#444b56; }
+    details.page-source { margin:36px 0 8px; border:1px solid var(--line); background:#f8f7f3; padding:10px 14px; }
+    details.page-source summary { color:var(--muted); cursor:pointer; font-size:13px; font-weight:600; }
+    details.page-source img { display:block; width:100%; height:auto; margin-top:12px; background:white; }
+    @media (max-width: 960px) { .layout{display:block;padding:20px}.layout aside{display:none}main{padding:34px 28px}h1{font-size:30px} }
+    @media print { header,aside,details.original summary{display:none}.layout{display:block;padding:0}main{border:0;padding:0}.original[open]{display:block}body{background:white} }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>PaperTrans</strong>
+    <nav><span class="status">{{ document.status }}</span><a href="source.pdf">原文PDF</a><a href="document.json">DocumentIR</a></nav>
+  </header>
+  <div class="layout">
+    <main>
+      <div class="eyebrow">Japanese academic translation · {{ document.page_count }} pages</div>
+      <h1>{{ document.title }}</h1>
+      {% if document.authors %}<p class="authors">{{ document.authors }}</p>{% endif %}
+      {% for page in document.pages %}
+      <section class="page" id="page-{{ page.number }}">
+        <div class="page-label">原文 {{ page.number }} ページ</div>
+        {% for item in page.items %}
+          {% if item.kind == "heading" %}
+            <h{{ item.level or 2 }} id="{{ item.id }}">{{ item.japanese or item.original }}</h{{ item.level or 2 }}>
+            {% if item.japanese %}<details class="original"><summary>原文を表示</summary><p>{{ item.original }}</p></details>{% endif %}
+          {% elif item.kind == "paragraph" %}
+            <p class="translated{% if not item.japanese %} untranslated{% endif %}" id="{{ item.id }}">{{ item.japanese or item.original }}</p>
+            {% if item.preserved_terms %}<div class="terms">{% for term in item.preserved_terms %}<span class="term">{{ term }}</span>{% endfor %}</div>{% endif %}
+            {% if item.warnings %}<div class="warnings">要確認: {{ item.warnings|join(" / ") }}</div>{% endif %}
+            {% if item.japanese %}<details class="original"><summary>原文を表示（段落）</summary><p>{{ item.original }}</p></details>{% endif %}
+          {% elif item.kind in ["figure", "table", "equation"] %}
+            <figure class="{{ item.kind }}" id="{{ item.id }}">
+              <img src="{{ item.asset }}" alt="Original {{ item.kind }} from page {{ item.page }}">
+              {% if item.caption %}<figcaption>{{ item.caption }}</figcaption>{% endif %}
+            </figure>
+          {% elif item.kind == "reference" %}
+            <p class="reference" id="{{ item.id }}">{{ item.original }}</p>
+          {% endif %}
+        {% endfor %}
+        {% if page.source_image %}
+          <details class="page-source">
+            <summary>原文ページ全体を表示（図表・数式の確認用）</summary>
+            <img src="{{ page.source_image }}" alt="Original source page {{ page.number }}">
+          </details>
+        {% endif %}
+      </section>
+      {% endfor %}
+    </main>
+    <aside>
+      <h2>ページ</h2>
+      <ol>{% for page in document.pages %}<li><a href="#page-{{ page.number }}">{{ page.number }}</a></li>{% endfor %}</ol>
+    </aside>
+  </div>
+</body>
+</html>
