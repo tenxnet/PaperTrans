@@ -169,8 +169,17 @@ def _parse_json(stdout: str) -> dict[str, Any]:
         return json.loads(value[start : end + 1])
 
 
-def validate_structure_batch(pages: list[dict[str, Any]], result: dict[str, Any]) -> None:
+def validate_structure_batch(
+    pages: list[dict[str, Any]],
+    result: dict[str, Any],
+    allowed_anchor_ids: set[str] | None = None,
+) -> None:
     expected_pages = [page["pageNumber"] for page in pages]
+    known_anchor_ids = {
+        block["blockId"]
+        for source_page in pages
+        for block in source_page["blocks"]
+    } | (allowed_anchor_ids or set())
     actual_pages = [page.get("pageNumber") for page in result.get("pages", [])]
     if actual_pages != expected_pages:
         raise ValueError(f"page identity mismatch: expected {expected_pages}, received {actual_pages}")
@@ -199,7 +208,7 @@ def validate_structure_batch(pages: list[dict[str, Any]], result: dict[str, Any]
             if unknown_captions:
                 raise ValueError(f"unknown caption blocks for {visual['objectId']}: {unknown_captions}")
             anchor = visual.get("insertAfterBlockId")
-            if anchor is not None and anchor not in known_ids:
+            if anchor is not None and anchor not in known_anchor_ids:
                 raise ValueError(f"unknown insertion anchor for {visual['objectId']}: {anchor}")
 
 
@@ -242,9 +251,14 @@ def analyze_layout(
         last_page = batch[-1]["pageNumber"]
         cache_model = re.sub(r"[^a-zA-Z0-9]+", "-", f"{model}-{reasoning_effort}").strip("-")
         batch_path = structure_dir / f"pages-{first_page:03d}-{last_page:03d}-{cache_model}.json"
+        context_anchor_ids = {
+            str(assignment["blockId"])
+            for assignment in context.get("tailAssignments", [])
+            if assignment.get("blockId")
+        }
         if batch_path.exists():
             cached = json.loads(batch_path.read_text(encoding="utf-8"))
-            validate_structure_batch(batch, cached)
+            validate_structure_batch(batch, cached, allowed_anchor_ids=context_anchor_ids)
             stats["cacheHits"] += 1
             print(f"Reused structure pages {first_page}-{last_page}", file=sys.stderr, flush=True)
             return cached
@@ -287,7 +301,7 @@ def analyze_layout(
                     detail = process.stderr.strip()[-3000:]
                     raise RuntimeError(detail or f"Codex exited with {process.returncode}")
                 result = _parse_json(process.stdout)
-                validate_structure_batch(batch, result)
+                validate_structure_batch(batch, result, allowed_anchor_ids=context_anchor_ids)
                 batch_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
                 return result
             except Exception as error:
@@ -323,7 +337,7 @@ def analyze_layout(
                 "sections": list(section_values.values()),
                 "warnings": warnings,
             }
-            validate_structure_batch(batch, split_result)
+            validate_structure_batch(batch, split_result, allowed_anchor_ids=context_anchor_ids)
             batch_path.write_text(json.dumps(split_result, ensure_ascii=False, indent=2), encoding="utf-8")
             return split_result
         raise RuntimeError(f"structure page {first_page} failed: {last_error}") from last_error

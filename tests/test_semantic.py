@@ -208,3 +208,24 @@ def test_structure_validation_rejects_missing_blocks():
         assert "missing" in str(error)
     else:
         raise AssertionError("missing block was accepted")
+
+
+def test_structure_validation_accepts_previous_page_visual_anchor():
+    pages = [{"pageNumber": 2, "blocks": [{"blockId": "p2-b1"}]}]
+    result = {
+        "pages": [
+            {
+                "pageNumber": 2,
+                "blockAssignments": [{"blockId": "p2-b1", "readingOrder": 1}],
+                "visualObjects": [
+                    {
+                        "objectId": "figure-2",
+                        "bboxNormalized": [0.1, 0.1, 0.8, 0.6],
+                        "captionBlockIds": [],
+                        "insertAfterBlockId": "p1-b39",
+                    }
+                ],
+            }
+        ]
+    }
+    validate_structure_batch(pages, result, allowed_anchor_ids={"p1-b39"})
