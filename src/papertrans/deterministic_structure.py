@@ -135,8 +135,12 @@ def _heading(block: dict[str, Any], body_font: float) -> tuple[str | None, int, 
     if numbered:
         number = numbered.group(1).rstrip(".")
         title = numbered.group(2).strip()
+        if title.startswith(".") or re.fullmatch(r"[\d.%+\-\s]+", title):
+            return None
         level = min(6, number.count(".") + 1)
-        font_support = bool(block.get("bold")) or float(block.get("fontSizeMax", 0)) >= body_font * 1.04
+        font_support = float(block.get("fontSizeMax", 0)) >= body_font * 1.04 or (
+            bool(block.get("bold")) and "." in number
+        )
         if len(title) <= 150 and font_support:
             return number, level, 0.97
     appendix = APPENDIX_HEADING.match(text) or BARE_APPENDIX_HEADING.match(text)

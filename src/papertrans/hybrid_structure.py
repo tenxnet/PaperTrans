@@ -156,9 +156,26 @@ def _merge_reviewed_pages(
         if minimum < 0.7:
             unresolved.append(int(page["pageNumber"]))
 
-    warnings = list(baseline.get("warnings", []))
+    warnings: list[str] = []
+    for warning in baseline.get("warnings", []):
+        unresolved_match = re.match(r"Page (\d+): unresolved original visual objects:", warning)
+        if unresolved_match and int(unresolved_match.group(1)) in reviewed_page_numbers:
+            continue
+        if warning.startswith("Deterministic analysis marked pages requiring semantic review:"):
+            continue
+        warnings.append(str(warning))
+    if unresolved:
+        warnings.append(
+            "Hybrid analysis still requires review on pages: "
+            + ", ".join(str(value) for value in unresolved)
+        )
     for page_number, result in reviewed.items():
         warnings.extend(f"Page {page_number}: {warning}" for warning in result.get("warnings", []))
+    section_order = {
+        str(assignment["blockId"]): (int(page["pageNumber"]), int(assignment["readingOrder"]))
+        for page in pages
+        for assignment in page["blockAssignments"]
+    }
     return {
         **baseline,
         "model": {
@@ -167,7 +184,10 @@ def _merge_reviewed_pages(
         },
         "pages": pages,
         "sections": sorted(
-            section_values.values(), key=lambda value: (int(value["pageStart"]), int(value["level"]))
+            section_values.values(),
+            key=lambda value: section_order.get(
+                str(value["titleBlockId"]), (int(value["pageStart"]), 1_000_000)
+            ),
         ),
         "warnings": warnings,
         "analysis": {
@@ -242,23 +262,15 @@ def refine_structure_with_llm(
             if assignment.get("blockId")
         }
         reusable: tuple[Path, dict[str, Any]] | None = None
-        cache_candidates = [cache_path] + sorted(
-            cache_dir.glob(f"page-{page_number:03d}-{safe_model}-*.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for candidate_path in dict.fromkeys(cache_candidates):
-            if not candidate_path.exists():
-                continue
+        if cache_path.exists():
             try:
-                candidate_result = json.loads(candidate_path.read_text(encoding="utf-8"))
+                candidate_result = json.loads(cache_path.read_text(encoding="utf-8"))
                 validate_structure_batch(
                     [source_page], candidate_result, allowed_anchor_ids=allowed_anchor_ids
                 )
-                reusable = candidate_path, candidate_result
-                break
+                reusable = cache_path, candidate_result
             except (ValueError, KeyError, json.JSONDecodeError):
-                continue
+                reusable = None
         if reusable is not None:
             reused_path, result = reusable
             if reused_path != cache_path:

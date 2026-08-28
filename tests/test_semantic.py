@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import papertrans.semantic_translate as semantic_translation
 from papertrans.deterministic_structure import analyze_layout_deterministic, evaluate_structure
-from papertrans.hybrid_structure import _stable_cache_payload, select_review_pages
+from papertrans.hybrid_structure import _merge_reviewed_pages, _stable_cache_payload, select_review_pages
 from papertrans.semantic import build_semantic_document, iter_translatable_units
 from papertrans.semantic_render import render_semantic_document
 from papertrans.semantic_translate import _command, _validate_result
@@ -407,6 +407,58 @@ def test_deterministic_structure_escalates_unlabelled_drawing_group(tmp_path: Pa
     assert any("unassociated visual region" in warning for warning in result["warnings"])
 
 
+def test_deterministic_structure_does_not_treat_list_or_numeric_cells_as_headings(tmp_path: Path):
+    evidence = {
+        "version": 4,
+        "sourceFile": "numbered-content.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "drawingClusters": [],
+                "imageRegions": [],
+                "blocks": [
+                    {
+                        "blockId": "p1-b1",
+                        "text": "1 Method",
+                        "bboxNormalized": [0.1, 0.1, 0.4, 0.14],
+                        "fontSizeMax": 12,
+                        "bold": True,
+                    },
+                    {
+                        "blockId": "p1-b2",
+                        "text": "2. Stage progression monitoring",
+                        "bboxNormalized": [0.1, 0.2, 0.6, 0.24],
+                        "fontSizeMax": 10,
+                        "bold": True,
+                    },
+                    {
+                        "blockId": "p1-b3",
+                        "text": "60.0 56.7",
+                        "bboxNormalized": [0.1, 0.3, 0.3, 0.34],
+                        "fontSizeMax": 11,
+                        "bold": True,
+                    },
+                    {
+                        "blockId": "p1-b4",
+                        "text": "A sufficiently long body paragraph establishes the normal font used by this fixture.",
+                        "bboxNormalized": [0.1, 0.4, 0.8, 0.48],
+                        "fontSizeMax": 10,
+                        "bold": False,
+                    },
+                ],
+            }
+        ],
+    }
+    result = analyze_layout_deterministic(evidence, tmp_path / "structure.json")
+    assignments = {
+        value["blockId"]: value for value in result["pages"][0]["blockAssignments"]
+    }
+    assert [section["number"] for section in result["sections"]] == ["1"]
+    assert assignments["p1-b2"]["role"] != "heading"
+    assert assignments["p1-b3"]["role"] != "heading"
+
+
 def test_structure_evaluation_reports_role_and_visual_accuracy(tmp_path: Path):
     evidence, structure, _ = sample_semantic_inputs()
     candidate = json.loads(json.dumps(structure))
@@ -476,3 +528,92 @@ def test_hybrid_cache_ignores_confidence_only_changes():
     before = _stable_cache_payload(payload)
     payload["deterministicProposal"]["blockAssignments"][0]["confidence"] = 0.95
     assert _stable_cache_payload(payload) == before
+
+
+def test_hybrid_merge_removes_resolved_deterministic_warnings():
+    assignment = {
+        "blockId": "p2-b1",
+        "role": "paragraph",
+        "readingOrder": 1,
+        "sectionId": "sec-test",
+        "paragraphId": "para-1",
+        "continuesFrom": None,
+        "hidden": False,
+        "citations": [],
+        "objectReferences": [],
+        "referenceLabel": None,
+        "confidence": 0.95,
+        "warnings": [],
+    }
+    baseline = {
+        "pages": [{"pageNumber": 2, "blockAssignments": [assignment], "visualObjects": []}],
+        "sections": [],
+        "warnings": [
+            "Page 2: unresolved original visual objects: Table A.1",
+            "Deterministic analysis marked pages requiring semantic review: 2",
+        ],
+        "analysis": {"pageConfidence": {"2": 0.0}},
+    }
+    reviewed = {
+        2: {
+            "pages": [{"pageNumber": 2, "blockAssignments": [assignment], "visualObjects": []}],
+            "sections": [],
+            "warnings": ["A real semantic warning remains."],
+        }
+    }
+    result = _merge_reviewed_pages(baseline, reviewed, "gpt-5.6-sol", "high")
+    assert result["analysis"]["unresolvedPages"] == []
+    assert result["warnings"] == ["Page 2: A real semantic warning remains."]
+
+
+def test_hybrid_merge_orders_sections_by_page_reading_order():
+    def assignment(block_id: str, reading_order: int):
+        return {
+            "blockId": block_id,
+            "role": "heading",
+            "readingOrder": reading_order,
+            "sectionId": f"sec-{block_id}",
+            "paragraphId": None,
+            "continuesFrom": None,
+            "hidden": False,
+            "citations": [],
+            "objectReferences": [],
+            "referenceLabel": None,
+            "confidence": 0.95,
+            "warnings": [],
+        }
+
+    baseline = {
+        "pages": [
+            {
+                "pageNumber": 2,
+                "blockAssignments": [assignment("later", 8), assignment("earlier", 3)],
+                "visualObjects": [],
+            }
+        ],
+        "sections": [
+            {
+                "sectionId": "sec-later",
+                "number": "3",
+                "titleBlockId": "later",
+                "level": 1,
+                "parentSectionId": None,
+                "pageStart": 2,
+            },
+            {
+                "sectionId": "sec-earlier",
+                "number": "2.1",
+                "titleBlockId": "earlier",
+                "level": 2,
+                "parentSectionId": None,
+                "pageStart": 2,
+            },
+        ],
+        "warnings": [],
+        "analysis": {"pageConfidence": {"2": 0.95}},
+    }
+    result = _merge_reviewed_pages(baseline, {}, "gpt-5.6-sol", "high")
+    assert [section["sectionId"] for section in result["sections"]] == [
+        "sec-earlier",
+        "sec-later",
+    ]
