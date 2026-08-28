@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -187,6 +188,7 @@ def refine_structure_with_llm(
     confidence_threshold: float = 0.7,
     explicit_pages: list[int] | None = None,
     max_review_pages: int | None = None,
+    max_workers: int = 3,
     model: str = "gpt-5.6-sol",
     reasoning_effort: str = "high",
     metrics_path: Path | None = None,
@@ -207,7 +209,7 @@ def refine_structure_with_llm(
     model_calls = 0
     cache_hits = 0
 
-    for page_number in selected:
+    def review_page(page_number: int) -> tuple[int, dict[str, Any], bool, int]:
         source_page = evidence_pages[page_number]
         context = _baseline_context(baseline, page_number)
         payload = {
@@ -261,11 +263,13 @@ def refine_structure_with_llm(
             reused_path, result = reusable
             if reused_path != cache_path:
                 cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            cache_hits += 1
             print(f"Reused hybrid review page {page_number}", file=sys.stderr, flush=True)
+            cache_hit = True
+            call_count = 0
         else:
             print(f"Reviewing low-confidence page {page_number} with {model}", file=sys.stderr, flush=True)
-            model_calls += 1
+            cache_hit = False
+            call_count = 1
             process = subprocess.run(
                 _review_command(
                     repo_root,
@@ -286,7 +290,16 @@ def refine_structure_with_llm(
             result = _parse_json(process.stdout)
             validate_structure_batch([source_page], result, allowed_anchor_ids=allowed_anchor_ids)
             cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        reviewed[page_number] = result
+        return page_number, result, cache_hit, call_count
+
+    worker_count = max(1, min(max_workers, len(selected) or 1))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="papertrans-structure") as executor:
+        futures = [executor.submit(review_page, page_number) for page_number in selected]
+        for future in as_completed(futures):
+            page_number, result, cache_hit, call_count = future.result()
+            reviewed[page_number] = result
+            cache_hits += int(cache_hit)
+            model_calls += call_count
 
     combined = _merge_reviewed_pages(baseline, reviewed, model, reasoning_effort)
     output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +314,7 @@ def refine_structure_with_llm(
             "reasoningEffort": reasoning_effort,
             "confidenceThreshold": confidence_threshold,
             "selectedPages": selected,
+            "workers": worker_count,
             "reviewedPages": len(reviewed),
             "modelCalls": model_calls,
             "cacheHits": cache_hits,

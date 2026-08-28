@@ -213,7 +213,11 @@ def translate_semantic_document(
 ) -> dict[str, Any]:
     stage_started: datetime = utc_now()
     schema = repo_root / ".agents/skills/academic-paper-translator/references/translation-output.schema.json"
-    units = list(iter_translatable_units(document))
+    units = [
+        unit
+        for unit in iter_translatable_units(document)
+        if not str(unit.get("japanese", "")).strip()
+    ]
     chunks = _chunks(units, max_characters)
     document["status"] = "translating"
     document["model"]["translation"] = model

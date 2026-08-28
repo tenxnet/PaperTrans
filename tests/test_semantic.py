@@ -297,6 +297,116 @@ def test_deterministic_structure_hides_visual_text_and_keeps_caption(tmp_path: P
     assert output.exists()
 
 
+def test_deterministic_structure_recognizes_appendix_object_labels(tmp_path: Path):
+    evidence = {
+        "version": 4,
+        "sourceFile": "appendix.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "drawingClusters": [[0.1, 0.18, 0.9, 0.46]],
+                "imageRegions": [],
+                "blocks": [
+                    {
+                        "blockId": "p1-b1",
+                        "text": "Appendix B Additional Results",
+                        "bboxNormalized": [0.1, 0.08, 0.5, 0.11],
+                        "fontSizeMax": 12,
+                        "bold": True,
+                    },
+                    {
+                        "blockId": "p1-b2",
+                        "text": "Embedded legend",
+                        "bboxNormalized": [0.3, 0.25, 0.5, 0.28],
+                        "fontSizeMax": 6,
+                        "bold": False,
+                    },
+                    {
+                        "blockId": "p1-b3",
+                        "text": "Figure B.1: Additional experiment results.",
+                        "bboxNormalized": [0.1, 0.48, 0.9, 0.51],
+                        "fontSizeMax": 9,
+                        "bold": False,
+                    },
+                    {
+                        "blockId": "p1-b4",
+                        "text": "As shown in Figure B.1, the result is stable.",
+                        "bboxNormalized": [0.1, 0.55, 0.9, 0.59],
+                        "fontSizeMax": 10,
+                        "bold": False,
+                    },
+                ],
+            }
+        ],
+    }
+    result = analyze_layout_deterministic(evidence, tmp_path / "structure.json")
+    visual = result["pages"][0]["visualObjects"][0]
+    assignments = {
+        value["blockId"]: value for value in result["pages"][0]["blockAssignments"]
+    }
+    assert visual["label"] == "Figure B.1"
+    assert assignments["p1-b3"]["role"] == "caption"
+    assert assignments["p1-b4"]["objectReferences"] == ["Figure B.1"]
+
+
+def test_deterministic_structure_escalates_unresolved_caption(tmp_path: Path):
+    evidence = {
+        "version": 4,
+        "sourceFile": "missing-visual.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "drawingClusters": [],
+                "imageRegions": [],
+                "blocks": [
+                    {
+                        "blockId": "p1-b1",
+                        "text": "Figure C.2: Missing body.",
+                        "bboxNormalized": [0.1, 0.5, 0.9, 0.53],
+                        "fontSizeMax": 9,
+                        "bold": False,
+                    }
+                ],
+            }
+        ],
+    }
+    result = analyze_layout_deterministic(evidence, tmp_path / "structure.json")
+    assert result["analysis"]["uncertainPages"] == [1]
+    assert any("Figure C.2" in warning for warning in result["warnings"])
+
+
+def test_deterministic_structure_escalates_unlabelled_drawing_group(tmp_path: Path):
+    evidence = {
+        "version": 4,
+        "sourceFile": "unlabelled.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "drawingClusters": [
+                    [0.22, 0.42, 0.34, 0.44],
+                    [0.11, 0.46, 0.46, 0.49],
+                ],
+                "imageRegions": [],
+                "blocks": [
+                    {
+                        "blockId": "p1-b1",
+                        "text": "A paragraph before an unlabelled diagram with enough prose to establish the body font size.",
+                        "bboxNormalized": [0.1, 0.2, 0.46, 0.35],
+                        "fontSizeMax": 10,
+                        "bold": False,
+                    }
+                ],
+            }
+        ],
+    }
+    result = analyze_layout_deterministic(evidence, tmp_path / "structure.json")
+    assert result["analysis"]["uncertainPages"] == [1]
+    assert any("unassociated visual region" in warning for warning in result["warnings"])
+
+
 def test_structure_evaluation_reports_role_and_visual_accuracy(tmp_path: Path):
     evidence, structure, _ = sample_semantic_inputs()
     candidate = json.loads(json.dumps(structure))

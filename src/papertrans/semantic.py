@@ -248,7 +248,11 @@ def build_semantic_document(
         section["content"].sort(key=lambda value: (value["position"], value["type"] != "visual"))
 
     title_entries = front.get("title", [])
-    title = title_entries[0]["original"] if title_entries else Path(evidence["sourceFile"]).stem
+    title = (
+        _join_source_parts([entry["original"] for entry in title_entries])
+        if title_entries
+        else Path(evidence["sourceFile"]).stem
+    )
     known_affiliations = sorted(
         {entry["original"] for entry in front.get("affiliation", []) if entry["original"]},
         key=len,
@@ -269,17 +273,21 @@ def build_semantic_document(
         "kind": "title",
         "original": title,
         "japanese": "",
-        "sourceBlockIds": [title_entries[0]["blockId"]] if title_entries else [],
+        "sourceBlockIds": [entry["blockId"] for entry in title_entries],
         "pages": [1],
         "citations": [],
         "objectReferences": [],
         "preservedTerms": [],
-        "warnings": title_entries[0].get("warnings", []) if title_entries else [],
+        "warnings": [
+            warning for entry in title_entries for warning in entry.get("warnings", [])
+        ],
     }
     return {
         "version": 3,
         "sourceFile": evidence["sourceFile"],
-        "pageCount": evidence["pageCount"],
+        "pageCount": len(structure["pages"]),
+        "sourcePageCount": evidence["pageCount"],
+        "partial": len(structure["pages"]) < int(evidence["pageCount"]),
         "status": "structured",
         "model": {
             "structure": structure.get("model", {}).get("name", "gpt-5.6-sol"),
@@ -308,9 +316,15 @@ def build_semantic_document(
 
 def merge_semantic_translations(document: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
     previous_units = {unit["id"]: unit for unit in iter_translatable_units(previous)}
+    previous_by_original: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for previous_unit in iter_translatable_units(previous):
+        previous_by_original[str(previous_unit.get("original", ""))].append(previous_unit)
     copied = 0
     for unit in iter_translatable_units(document):
         old = previous_units.get(unit["id"])
+        if not old or old.get("original") != unit.get("original"):
+            exact_matches = previous_by_original.get(str(unit.get("original", "")), [])
+            old = exact_matches[0] if len(exact_matches) == 1 else None
         if not old or old.get("original") != unit.get("original") or not old.get("japanese", "").strip():
             continue
         unit["japanese"] = old["japanese"]

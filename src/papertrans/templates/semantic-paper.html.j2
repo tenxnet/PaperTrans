@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
   <title>{{ document.title.japanese or document.title.original }} - PaperTrans</title>
   <style>
     :root{color-scheme:light;--bg:#f3f1ec;--paper:#fffefb;--ink:#20242b;--muted:#68707b;--line:#dcdedc;--blue:#2457a6;--soft:#f5f7fa;--warn:#8b5a00}
@@ -25,7 +26,7 @@
   <div class="shell">
     <main>
       <header class="paper-head">
-        <div class="eyebrow">Japanese academic translation · {{ document.pageCount }} pages</div>
+        <div class="eyebrow">Japanese academic translation{% if document.partial %} preview · {{ document.pageCount }} of {{ document.sourcePageCount }} pages{% else %} · {{ document.pageCount }} pages{% endif %}</div>
         <h1>{{ document.title.japanese or document.title.original }}</h1>
         {% if document.title.japanese %}<p class="source-title">{{ document.title.original }}</p>{% endif %}
         {% if document.frontMatter.authors %}<p class="authors">{% for author in document.frontMatter.authors %}{{ author.original }}{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}

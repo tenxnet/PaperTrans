@@ -36,11 +36,18 @@ def _font_evidence(block: dict[str, Any]) -> dict[str, Any]:
     fonts: list[str] = []
     bold = False
     italic = False
+    character_count = 0
+    math_character_count = 0
     for line in block.get("lines", []):
         for span in line.get("spans", []):
             size = float(span.get("size", 0))
             font = str(span.get("font", ""))
             flags = int(span.get("flags", 0))
+            text = str(span.get("text", ""))
+            visible_characters = len(text.strip())
+            character_count += visible_characters
+            if any(token in font.lower() for token in ("cmmi", "cmsy", "cmex", "math", "symbol")):
+                math_character_count += visible_characters
             sizes.append(size)
             if font and font not in fonts:
                 fonts.append(font)
@@ -53,6 +60,9 @@ def _font_evidence(block: dict[str, Any]) -> dict[str, Any]:
         "fonts": fonts[:6],
         "bold": bold,
         "italic": italic,
+        "mathCharacterRatio": round(
+            math_character_count / character_count if character_count else 0.0, 4
+        ),
     }
 
 

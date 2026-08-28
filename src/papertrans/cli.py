@@ -100,6 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     hybrid_structure.add_argument("--confidence-threshold", type=float, default=0.7)
     hybrid_structure.add_argument("--review-page", type=int, action="append", dest="review_pages")
     hybrid_structure.add_argument("--max-review-pages", type=int)
+    hybrid_structure.add_argument("--workers", type=int, default=3)
     hybrid_structure.add_argument("--model", default="gpt-5.6-sol")
     hybrid_structure.add_argument("--reasoning-effort", default="high")
     hybrid_structure.add_argument("--metrics", type=Path)
@@ -137,6 +138,12 @@ def _parser() -> argparse.ArgumentParser:
     semantic_pipeline.add_argument("--slug", required=True)
     semantic_pipeline.add_argument("--output-root", type=Path, default=Path("output"))
     semantic_pipeline.add_argument("--repo-root", type=Path, default=Path.cwd())
+    semantic_pipeline.add_argument(
+        "--structure-mode", choices=("hybrid", "llm"), default="hybrid"
+    )
+    semantic_pipeline.add_argument("--structure-confidence-threshold", type=float, default=0.7)
+    semantic_pipeline.add_argument("--max-structure-review-pages", type=int)
+    semantic_pipeline.add_argument("--structure-review-workers", type=int, default=3)
     semantic_pipeline.add_argument("--structure-batch-size", type=int, default=2)
     semantic_pipeline.add_argument("--structure-model", default="gpt-5.6-sol")
     semantic_pipeline.add_argument("--structure-reasoning-effort", default="high")
@@ -279,6 +286,7 @@ def main() -> None:
             confidence_threshold=args.confidence_threshold,
             explicit_pages=args.review_pages,
             max_review_pages=args.max_review_pages,
+            max_workers=args.workers,
             model=args.model,
             reasoning_effort=args.reasoning_effort,
             metrics_path=args.metrics,
@@ -373,16 +381,37 @@ def main() -> None:
             utc_now(),
             {"pages": evidence["pageCount"], "blocks": sum(len(page["blocks"]) for page in evidence["pages"])},
         )
-        structured = analyze_layout(
-            evidence,
-            work_dir,
-            structure_path,
-            repo_root,
-            batch_size=args.structure_batch_size,
-            model=args.structure_model,
-            reasoning_effort=args.structure_reasoning_effort,
-            metrics_path=metrics_path,
-        )
+        if args.structure_mode == "hybrid":
+            baseline_path = work_dir / "structure-baseline.json"
+            baseline = analyze_layout_deterministic(
+                evidence,
+                baseline_path,
+                metrics_path=metrics_path,
+            )
+            structured = refine_structure_with_llm(
+                evidence,
+                baseline,
+                work_dir,
+                structure_path,
+                repo_root,
+                confidence_threshold=args.structure_confidence_threshold,
+                max_review_pages=args.max_structure_review_pages,
+                max_workers=args.structure_review_workers,
+                model=args.structure_model,
+                reasoning_effort=args.structure_reasoning_effort,
+                metrics_path=metrics_path,
+            )
+        else:
+            structured = analyze_layout(
+                evidence,
+                work_dir,
+                structure_path,
+                repo_root,
+                batch_size=args.structure_batch_size,
+                model=args.structure_model,
+                reasoning_effort=args.structure_reasoning_effort,
+                metrics_path=metrics_path,
+            )
         visual_started = utc_now()
         objects = render_visual_objects(args.source, structured, work_dir / "assets")
         visuals_path.write_text(json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8")

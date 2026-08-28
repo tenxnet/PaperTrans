@@ -24,8 +24,13 @@ SPECIAL_HEADINGS = {
 NUMBERED_HEADING = re.compile(r"^((?:[1-9]\d*)(?:\.[1-9]?\d*){0,5})[.)]?\s+(.+)$")
 APPENDIX_HEADING = re.compile(r"^Appendix\s+([A-Z](?:\.\d+)*)[.)]?\s+(.+)$", re.IGNORECASE)
 BARE_APPENDIX_HEADING = re.compile(r"^([A-Z](?:\.\d+)*)[.)]?\s+([A-Z][A-Za-z].+)$")
+OBJECT_LABEL = r"((?:[A-Z]\.)?\d+(?:[.\-][A-Za-z0-9]+)*)"
 CAPTION = re.compile(
-    r"^\s*(Figure|Fig\.?|Table|Algorithm)\s*([A-Z]?\d+(?:[.\-][A-Za-z0-9]+)*)\s*[:.\-]?\s*",
+    rf"^\s*(Figure|Fig\.?|Table|Algorithm)\s*{OBJECT_LABEL}\s*([:.\-])?\s*",
+    re.IGNORECASE,
+)
+CAPTION_SEARCH = re.compile(
+    rf"\b(Figure|Fig\.?|Table|Algorithm)\s*{OBJECT_LABEL}\s*([:.\-])?\s*",
     re.IGNORECASE,
 )
 NUMERIC_CITATION = re.compile(r"\[(?:\d+[a-z]?(?:\s*[-,;]\s*\d+[a-z]?)*|\d+\s*(?:–|—)\s*\d+)\]")
@@ -33,7 +38,7 @@ AUTHOR_YEAR_CITATION = re.compile(
     r"\((?:[A-Z][A-Za-z'’\-]+(?:\s+et\s+al\.)?(?:\s+and\s+[A-Z][A-Za-z'’\-]+)?\s*,?\s*(?:19|20)\d{2}[a-z]?(?:\s*;\s*)?)+\)"
 )
 OBJECT_REFERENCE = re.compile(
-    r"\b(?:Figure|Fig\.?|Table|Algorithm|Equation|Eq\.?)\s*\(?[A-Z]?\d+(?:[.\-][A-Za-z0-9]+)*\)?",
+    rf"\b(?:Figure|Fig\.?|Table|Algorithm|Equation|Eq\.?)\s*\(?{OBJECT_LABEL}\)?",
     re.IGNORECASE,
 )
 PAGE_NUMBER = re.compile(r"^(?:page\s+)?\d{1,4}$", re.IGNORECASE)
@@ -183,6 +188,8 @@ def _visual_score(
         return -1.0
     above_gap = caption[1] - candidate[3]
     below_gap = candidate[1] - caption[3]
+    if kind == "figure" and -0.015 <= above_gap <= 0.75:
+        return 2.0 + overlap - max(0.0, above_gap)
     if kind == "table":
         primary_gap, secondary_gap = below_gap, above_gap
     else:
@@ -192,6 +199,20 @@ def _visual_score(
     if -0.015 <= secondary_gap <= 0.12:
         return 0.8 + overlap - max(0.0, secondary_gap) * 5
     return -1.0
+
+
+def _caption_match(block: dict[str, Any], body_font: float) -> re.Match[str] | None:
+    text = str(block["text"])
+    match = CAPTION.match(text)
+    if match is None and re.match(r"^\s*\([a-z]\)\s+", text, re.IGNORECASE):
+        match = CAPTION_SEARCH.search(text)
+    if match is None:
+        return None
+    kind = match.group(1).lower().rstrip(".")
+    delimiter = match.group(3)
+    if kind == "algorithm" or delimiter or float(block.get("fontSizeMax", body_font)) <= body_font * 0.96:
+        return match
+    return None
 
 
 def _fallback_visual_rect(
@@ -207,7 +228,8 @@ def _fallback_visual_rect(
         if block["blockId"] == caption_block["blockId"]:
             continue
         rect = _rect(block["bboxNormalized"])
-        small = float(block.get("fontSizeMax", body_font)) <= body_font * 0.82
+        font_factor = 0.96 if kind == "algorithm" else 0.88 if kind == "figure" else 0.82
+        small = float(block.get("fontSizeMax", body_font)) <= body_font * font_factor
         horizontal = _intersection_area((caption[0], 0, caption[2], 1), rect) > 0
         if not (small and horizontal):
             continue
@@ -229,13 +251,15 @@ def _detect_visuals(
     page: dict[str, Any],
     body_font: float,
     previous_anchor: str | None,
-) -> tuple[list[dict[str, Any]], set[str]]:
+) -> tuple[list[dict[str, Any]], set[str], list[str]]:
     candidates = _visual_candidates(page)
+    used_candidates: set[tuple[float, float, float, float]] = set()
     visuals: list[dict[str, Any]] = []
     visual_block_ids: set[str] = set()
+    unresolved_labels: list[str] = []
     prior_visible = previous_anchor
     for block in page["blocks"]:
-        caption_match = CAPTION.match(str(block["text"]))
+        caption_match = _caption_match(block, body_font)
         if not caption_match:
             if not any(_contains_center(candidate, _rect(block["bboxNormalized"])) for candidate in candidates):
                 prior_visible = block["blockId"]
@@ -246,18 +270,40 @@ def _detect_visuals(
         label = f"{label_prefix} {caption_match.group(2)}"
         caption_rect = _rect(block["bboxNormalized"])
         ranked = sorted(
-            ((_visual_score(kind, caption_rect, candidate), candidate) for candidate in candidates),
+            (
+                (_visual_score(kind, caption_rect, candidate), candidate)
+                for candidate in candidates
+                if candidate not in used_candidates
+            ),
             key=lambda item: item[0],
             reverse=True,
         )
         warnings: list[str] = []
         if ranked and ranked[0][0] >= 0:
-            rect = ranked[0][1]
+            plausible = [candidate for score, candidate in ranked if score >= 0]
+            if kind in {"figure", "table"}:
+                rect = _union(plausible)
+                if kind == "figure":
+                    text_region = _fallback_visual_rect(page, block, kind, body_font)
+                    if text_region is not None:
+                        rect = _union([rect, text_region])
+                    width = rect[2] - rect[0]
+                    horizontal_pad = 0.004 if width >= 0.7 else 0.018
+                    rect = (
+                        max(0.0, rect[0] - horizontal_pad),
+                        max(0.0, rect[1] - 0.018),
+                        min(1.0, rect[2] + horizontal_pad),
+                        min(caption_rect[1] - 0.004, rect[3] + 0.025),
+                    )
+            else:
+                rect = ranked[0][1]
+                plausible = [ranked[0][1]]
+            used_candidates.update(plausible)
             confidence = 0.9 if ranked[0][0] >= 1.5 else 0.72
         else:
             fallback = _fallback_visual_rect(page, block, kind, body_font)
             if fallback is None:
-                warnings.append(f"No reliable original {kind} body region was found near {label}.")
+                unresolved_labels.append(label)
                 continue
             rect = fallback
             if kind == "table" and rect[2] - rect[0] >= 0.5:
@@ -285,7 +331,30 @@ def _detect_visuals(
             ):
                 visual_block_ids.add(candidate_block["blockId"])
         prior_visible = block["blockId"]
-    return visuals, visual_block_ids
+    represented_regions = [_rect(visual["bboxNormalized"]) for visual in visuals]
+    unrepresented = [
+        candidate
+        for candidate in candidates
+        if not any(
+            _intersection_area(candidate, represented) / max(_area(candidate), 1e-9) >= 0.55
+            for represented in represented_regions
+        )
+    ]
+    orphan_region = any(_area(candidate) >= 0.035 for candidate in unrepresented)
+    if not orphan_region:
+        for index, left in enumerate(unrepresented):
+            for right in unrepresented[index + 1 :]:
+                combined = _union([left, right])
+                horizontal_overlap = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+                horizontal_overlap /= max(0.02, min(left[2] - left[0], right[2] - right[0]))
+                if horizontal_overlap >= 0.35 and combined[3] - combined[1] <= 0.16 and _area(combined) >= 0.018:
+                    orphan_region = True
+                    break
+            if orphan_region:
+                break
+    if orphan_region:
+        unresolved_labels.append("unassociated visual region")
+    return visuals, visual_block_ids, list(dict.fromkeys(unresolved_labels))
 
 
 def _looks_like_equation(block: dict[str, Any], body_font: float) -> bool:
@@ -308,9 +377,13 @@ def _looks_like_equation(block: dict[str, Any], body_font: float) -> bool:
         for font in block.get("fonts", [])
         for token in ("cmmi", "cmsy", "cmex", "math", "symbol")
     )
+    math_ratio = float(block.get("mathCharacterRatio", 0))
     control_glyph = any(ord(character) < 32 for character in text)
     return centered and word_count <= 8 and float(block.get("fontSizeMax", body_font)) <= body_font * 1.15 and (
-        (has_operator and (equation_number or symbol_count >= 2)) or math_font or control_glyph
+        (has_operator and (equation_number or symbol_count >= 2))
+        or math_font
+        or math_ratio >= 0.28
+        or control_glyph
     )
 
 
@@ -325,6 +398,20 @@ def _detect_equation_groups(
         for block in page["blocks"]
         if block["blockId"] not in excluded_ids and _looks_like_equation(block, body_font)
     ]
+    candidates.sort(key=lambda block: (float(block["bboxNormalized"][1]), float(block["bboxNormalized"][0])))
+    candidate_source_ids = {
+        str(block.get("sourceBlockId") or block["blockId"])
+        for block in candidates
+    }
+    for block in page["blocks"]:
+        source_id = str(block.get("sourceBlockId") or block["blockId"])
+        if (
+            block not in candidates
+            and source_id in candidate_source_ids
+            and len(str(block.get("text", "")).strip()) <= 24
+            and block["blockId"] not in excluded_ids
+        ):
+            candidates.append(block)
     candidates.sort(key=lambda block: (float(block["bboxNormalized"][1]), float(block["bboxNormalized"][0])))
     groups: list[list[dict[str, Any]]] = []
     for block in candidates:
@@ -404,7 +491,9 @@ def analyze_layout_deterministic(
 
     for page in pages:
         page_number = int(page["pageNumber"])
-        visuals, visual_block_ids = _detect_visuals(page, body_font, last_visible_block_id)
+        visuals, visual_block_ids, unresolved_visuals = _detect_visuals(
+            page, body_font, last_visible_block_id
+        )
         equation_visuals, equation_block_ids = _detect_equation_groups(
             page, body_font, visual_block_ids, last_visible_block_id
         )
@@ -417,7 +506,11 @@ def analyze_layout_deterministic(
                 for block in page["blocks"]
                 if (
                     (heading := _heading(block, body_font)) is not None
-                    and heading[2] >= 0.9
+                    and (
+                        heading[0] is not None
+                        or re.sub(r"\s+", " ", str(block["text"])).strip().rstrip(":").lower()
+                        in SPECIAL_HEADINGS
+                    )
                     and block["blockId"] not in visual_block_ids
                 )
             ),
@@ -425,6 +518,7 @@ def analyze_layout_deterministic(
         )
         seen_title = False
         seen_author = False
+        visible_body_count = 0
 
         for reading_order, block in enumerate(page["blocks"], start=1):
             block_id = str(block["blockId"])
@@ -548,14 +642,25 @@ def analyze_layout_deterministic(
                                 previous_text
                                 and previous_text[-1] not in ".!?;:)]}”’"
                             )
-                            page_continuation = previous_body["pageNumber"] != page_number and reading_order <= 3
+                            page_continuation = (
+                                previous_body["pageNumber"] != page_number and visible_body_count == 0
+                            )
                             same_page_continuation = (
                                 previous_body["pageNumber"] == page_number
                                 and abs(float(previous_body["rect"][0]) - rect[0]) < 0.03
                                 and float(previous_body["rect"][3]) <= rect[1]
                                 and rect[1] - float(previous_body["rect"][3]) < 0.025
                             )
-                            if grammatical_continuation and (page_continuation or same_page_continuation):
+                            column_continuation = (
+                                previous_body["pageNumber"] == page_number
+                                and float(previous_body["rect"][0]) < 0.5
+                                and rect[0] >= 0.5
+                                and float(previous_body["rect"][3]) >= 0.82
+                                and rect[1] <= 0.72
+                            )
+                            if grammatical_continuation and (
+                                page_continuation or same_page_continuation or column_continuation
+                            ):
                                 paragraph_id = previous_body["paragraphId"]
                                 continues_from = previous_body["blockId"]
                                 confidence = min(confidence, 0.74)
@@ -578,6 +683,7 @@ def analyze_layout_deterministic(
             if not hidden and role not in {"caption", "heading", "equation", "metadata"}:
                 last_visible_block_id = block_id
             if not hidden and role in {"abstract", "paragraph", "list_item", "footnote"}:
+                visible_body_count += 1
                 previous_body = {
                     "blockId": block_id,
                     "paragraphId": paragraph_id,
@@ -588,6 +694,12 @@ def analyze_layout_deterministic(
 
         confidences = [float(value["confidence"]) for value in assignments if not value["hidden"]]
         confidences.extend(float(value["confidence"]) for value in visuals)
+        if unresolved_visuals:
+            confidences.append(0.0)
+            warnings.append(
+                f"Page {page_number}: unresolved original visual objects: "
+                + ", ".join(unresolved_visuals)
+            )
         page_confidences[page_number] = min(confidences, default=1.0)
         result_pages.append(
             {
