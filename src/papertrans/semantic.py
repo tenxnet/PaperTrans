@@ -281,7 +281,11 @@ def build_semantic_document(
         "sourceFile": evidence["sourceFile"],
         "pageCount": evidence["pageCount"],
         "status": "structured",
-        "model": {"structure": "gpt-5.6-sol", "translation": None, "reasoningEffort": "high"},
+        "model": {
+            "structure": structure.get("model", {}).get("name", "gpt-5.6-sol"),
+            "translation": None,
+            "reasoningEffort": structure.get("model", {}).get("reasoningEffort", "high"),
+        },
         "title": title_unit,
         "frontMatter": {
             "authors": front.get("author", []),

@@ -1,6 +1,10 @@
 import json
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import papertrans.semantic_translate as semantic_translation
 from papertrans.semantic import build_semantic_document, iter_translatable_units
 from papertrans.semantic_render import render_semantic_document
 from papertrans.semantic_translate import _command, _validate_result
@@ -139,6 +143,52 @@ def test_semantic_translation_rejects_missing_units():
         assert "missing" in str(error)
     else:
         raise AssertionError("missing unit was accepted")
+
+
+def test_semantic_translation_runs_chunks_in_parallel_and_records_metrics(tmp_path: Path, monkeypatch):
+    document = build_semantic_document(*sample_semantic_inputs())
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    def fake_run(command, input, **kwargs):
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.03)
+        payload = json.loads(input)
+        result = {
+            "translations": [
+                {
+                    "blockId": block["blockId"],
+                    "japanese": block["text"],
+                    "preservedTerms": [],
+                    "warnings": [],
+                }
+                for block in payload["blocks"]
+            ]
+        }
+        with lock:
+            active -= 1
+        return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
+
+    monkeypatch.setattr(semantic_translation.subprocess, "run", fake_run)
+    metrics_path = tmp_path / "metrics.json"
+    semantic_translation.translate_semantic_document(
+        document,
+        tmp_path / "document.json",
+        tmp_path,
+        tmp_path / "cache",
+        max_characters=1,
+        max_workers=3,
+        metrics_path=metrics_path,
+    )
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))["stages"]["semantic_translation"]
+    assert maximum_active >= 2
+    assert metrics["details"]["workers"] == 3
+    assert metrics["details"]["modelCalls"] == 4
+    assert metrics["details"]["translatedUnits"] == 4
 
 
 def test_structure_validation_rejects_missing_blocks():

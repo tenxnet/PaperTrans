@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .extract import extract_document
 from .io import load_document
+from .metrics import record_stage, utc_now
 from .render import create_bundle, render_document
 from .semantic import (
     build_semantic_document,
@@ -52,6 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     layout_extract.add_argument("source", type=Path)
     layout_extract.add_argument("--work-dir", type=Path, required=True)
     layout_extract.add_argument("--output", type=Path, required=True)
+    layout_extract.add_argument("--metrics", type=Path)
 
     structure = subparsers.add_parser("structure", help="Analyze PDF semantics with page vision and Codex")
     structure.add_argument("evidence", type=Path)
@@ -62,6 +64,9 @@ def _parser() -> argparse.ArgumentParser:
     structure.add_argument("--max-pages", type=int)
     structure.add_argument("--source-pdf", type=Path)
     structure.add_argument("--assets-dir", type=Path)
+    structure.add_argument("--model", default="gpt-5.6-sol")
+    structure.add_argument("--reasoning-effort", default="high")
+    structure.add_argument("--metrics", type=Path)
 
     semantic_build = subparsers.add_parser("semantic-build", help="Build chapter and paragraph document semantics")
     semantic_build.add_argument("evidence", type=Path)
@@ -69,12 +74,17 @@ def _parser() -> argparse.ArgumentParser:
     semantic_build.add_argument("visual_objects", type=Path)
     semantic_build.add_argument("--output", type=Path, required=True)
     semantic_build.add_argument("--previous", type=Path)
+    semantic_build.add_argument("--metrics", type=Path)
 
     semantic_translate = subparsers.add_parser("semantic-translate", help="Translate reconstructed semantic paragraphs")
     semantic_translate.add_argument("document", type=Path)
     semantic_translate.add_argument("--repo-root", type=Path, default=Path.cwd())
     semantic_translate.add_argument("--cache-dir", type=Path, required=True)
     semantic_translate.add_argument("--max-characters", type=int, default=11000)
+    semantic_translate.add_argument("--workers", type=int, default=3)
+    semantic_translate.add_argument("--model", default="gpt-5.6-sol")
+    semantic_translate.add_argument("--reasoning-effort", default="high")
+    semantic_translate.add_argument("--metrics", type=Path)
 
     semantic_render = subparsers.add_parser("semantic-render", help="Render chapter-structured HTML")
     semantic_render.add_argument("document", type=Path)
@@ -82,6 +92,23 @@ def _parser() -> argparse.ArgumentParser:
     semantic_render.add_argument("--output-dir", type=Path, required=True)
     semantic_render.add_argument("--source-pdf", type=Path)
     semantic_render.add_argument("--zip", type=Path)
+    semantic_render.add_argument("--metrics", type=Path)
+
+    semantic_pipeline = subparsers.add_parser(
+        "semantic-pipeline", help="Run the measured semantic PDF-to-HTML pipeline"
+    )
+    semantic_pipeline.add_argument("source", type=Path)
+    semantic_pipeline.add_argument("--slug", required=True)
+    semantic_pipeline.add_argument("--output-root", type=Path, default=Path("output"))
+    semantic_pipeline.add_argument("--repo-root", type=Path, default=Path.cwd())
+    semantic_pipeline.add_argument("--structure-batch-size", type=int, default=2)
+    semantic_pipeline.add_argument("--structure-model", default="gpt-5.6-sol")
+    semantic_pipeline.add_argument("--structure-reasoning-effort", default="high")
+    semantic_pipeline.add_argument("--translation-model", default="gpt-5.6-sol")
+    semantic_pipeline.add_argument("--translation-reasoning-effort", default="high")
+    semantic_pipeline.add_argument("--translation-workers", type=int, default=3)
+    semantic_pipeline.add_argument("--max-characters", type=int, default=9000)
+    semantic_pipeline.add_argument("--skip-translation", action="store_true")
     return parser
 
 
@@ -112,7 +139,15 @@ def main() -> None:
         return
 
     if args.command == "layout-extract":
+        started = utc_now()
         evidence = extract_layout_evidence(args.source, args.work_dir, args.output)
+        record_stage(
+            args.metrics,
+            "layout_extraction",
+            started,
+            utc_now(),
+            {"pages": evidence["pageCount"], "blocks": sum(len(page["blocks"]) for page in evidence["pages"])},
+        )
         print(json.dumps({"pages": evidence["pageCount"], "output": str(args.output)}))
         return
 
@@ -125,13 +160,24 @@ def main() -> None:
             args.repo_root.resolve(),
             batch_size=args.batch_size,
             max_pages=args.max_pages,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            metrics_path=args.metrics,
         )
         if args.source_pdf and args.assets_dir:
+            visual_started = utc_now()
             objects = render_visual_objects(args.source_pdf, structured, args.assets_dir)
             (args.output.parent / "visual-objects.json").write_text(
                 json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             write_visual_qa(objects, args.output.parent / "visual-qa.html")
+            record_stage(
+                args.metrics,
+                "visual_extraction",
+                visual_started,
+                utc_now(),
+                {"visualObjects": len(objects)},
+            )
         print(
             json.dumps(
                 {
@@ -144,6 +190,7 @@ def main() -> None:
         return
 
     if args.command == "semantic-build":
+        started = utc_now()
         previous = load_semantic_document(args.previous) if args.previous and args.previous.exists() else None
         document = build_semantic_document(
             json.loads(args.evidence.read_text(encoding="utf-8")),
@@ -156,6 +203,13 @@ def main() -> None:
         unit_count = sum(
             1 for section in document["sections"] for item in section["content"] if item["type"] == "unit"
         )
+        record_stage(
+            args.metrics,
+            "semantic_build",
+            started,
+            utc_now(),
+            {"sections": len(document["sections"]), "units": unit_count},
+        )
         print(json.dumps({"sections": len(document["sections"]), "units": unit_count}))
         return
 
@@ -167,16 +221,124 @@ def main() -> None:
             args.repo_root.resolve(),
             args.cache_dir,
             max_characters=args.max_characters,
+            max_workers=args.workers,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            metrics_path=args.metrics,
         )
         print(json.dumps({"status": document["status"], "model": document["model"]["translation"]}))
         return
 
     if args.command == "semantic-render":
+        started = utc_now()
         document = load_semantic_document(args.document)
         index = render_semantic_document(document, args.work_dir, args.output_dir, args.source_pdf)
         if args.zip:
             create_bundle(args.output_dir, args.zip)
+        record_stage(
+            args.metrics,
+            "html_render",
+            started,
+            utc_now(),
+            {"html": str(index), "zip": str(args.zip) if args.zip else None},
+        )
         print(index)
+        return
+
+    if args.command == "semantic-pipeline":
+        repo_root = args.repo_root.resolve()
+        output_root = args.output_root.resolve()
+        paper_root = output_root / args.slug
+        work_dir = paper_root / "work"
+        evidence_path = work_dir / "layout-evidence.json"
+        structure_path = work_dir / "structure.json"
+        visuals_path = work_dir / "visual-objects.json"
+        semantic_path = work_dir / "semantic-document.json"
+        translation_cache = work_dir / "semantic-translations"
+        publication_dir = paper_root / "html"
+        bundle_path = paper_root / f"{args.slug}-html.zip"
+        metrics_path = paper_root / "run-metrics.json"
+
+        started = utc_now()
+        evidence = extract_layout_evidence(args.source, work_dir, evidence_path)
+        record_stage(
+            metrics_path,
+            "layout_extraction",
+            started,
+            utc_now(),
+            {"pages": evidence["pageCount"], "blocks": sum(len(page["blocks"]) for page in evidence["pages"])},
+        )
+        structured = analyze_layout(
+            evidence,
+            work_dir,
+            structure_path,
+            repo_root,
+            batch_size=args.structure_batch_size,
+            model=args.structure_model,
+            reasoning_effort=args.structure_reasoning_effort,
+            metrics_path=metrics_path,
+        )
+        visual_started = utc_now()
+        objects = render_visual_objects(args.source, structured, work_dir / "assets")
+        visuals_path.write_text(json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_visual_qa(objects, work_dir / "visual-qa.html")
+        record_stage(
+            metrics_path,
+            "visual_extraction",
+            visual_started,
+            utc_now(),
+            {"visualObjects": len(objects)},
+        )
+
+        build_started = utc_now()
+        previous = load_semantic_document(semantic_path) if semantic_path.exists() else None
+        document = build_semantic_document(evidence, structured, objects)
+        if previous:
+            merge_semantic_translations(document, previous)
+        save_semantic_document(document, semantic_path)
+        unit_count = sum(
+            1 for section in document["sections"] for item in section["content"] if item["type"] == "unit"
+        )
+        record_stage(
+            metrics_path,
+            "semantic_build",
+            build_started,
+            utc_now(),
+            {"sections": len(document["sections"]), "units": unit_count},
+        )
+        if not args.skip_translation:
+            document = translate_semantic_document(
+                document,
+                semantic_path,
+                repo_root,
+                translation_cache,
+                max_characters=args.max_characters,
+                max_workers=args.translation_workers,
+                model=args.translation_model,
+                reasoning_effort=args.translation_reasoning_effort,
+                metrics_path=metrics_path,
+            )
+        render_started = utc_now()
+        index = render_semantic_document(document, work_dir, publication_dir, args.source)
+        create_bundle(publication_dir, bundle_path)
+        record_stage(
+            metrics_path,
+            "html_render",
+            render_started,
+            utc_now(),
+            {"html": str(index), "zip": str(bundle_path)},
+        )
+        print(
+            json.dumps(
+                {
+                    "html": str(index),
+                    "bundle": str(bundle_path),
+                    "metrics": str(metrics_path),
+                    "status": document["status"],
+                },
+                ensure_ascii=False,
+            )
+        )
         return
 
     if args.command == "pipeline":

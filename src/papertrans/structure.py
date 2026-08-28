@@ -5,12 +5,15 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from html import escape
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pymupdf as fitz
+
+from .metrics import record_stage, utc_now
 
 
 def _clean_text(value: str) -> str:
@@ -115,7 +118,13 @@ def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> 
     return result
 
 
-def _structure_command(repo_root: Path, schema: Path, images: list[Path]) -> list[str]:
+def _structure_command(
+    repo_root: Path,
+    schema: Path,
+    images: list[Path],
+    model: str = "gpt-5.6-sol",
+    reasoning_effort: str = "high",
+) -> list[str]:
     codex_bin = os.environ.get("PAPERTRANS_CODEX_BIN", "codex")
     command = [
         codex_bin,
@@ -126,9 +135,9 @@ def _structure_command(repo_root: Path, schema: Path, images: list[Path]) -> lis
         "--sandbox",
         "read-only",
         "-m",
-        "gpt-5.6-sol",
+        model,
         "-c",
-        'model_reasoning_effort="high"',
+        f'model_reasoning_effort="{reasoning_effort}"',
     ]
     for image in images:
         command.extend(["-i", str(image)])
@@ -202,7 +211,11 @@ def analyze_layout(
     batch_size: int = 2,
     max_pages: int | None = None,
     retries: int = 2,
+    model: str = "gpt-5.6-sol",
+    reasoning_effort: str = "high",
+    metrics_path: Path | None = None,
 ) -> dict[str, Any]:
+    stage_started: datetime = utc_now()
     schema = repo_root / ".agents/skills/academic-paper-structure/references/structure-output.schema.json"
     pages = evidence["pages"][:max_pages] if max_pages else evidence["pages"]
     structure_dir = work_dir / "structure-batches"
@@ -211,6 +224,7 @@ def analyze_layout(
     combined_sections: dict[str, dict[str, Any]] = {}
     combined_warnings: list[str] = []
     previous_context: dict[str, Any] = {"sections": [], "tailAssignments": []}
+    stats = {"modelCalls": 0, "cacheHits": 0, "retries": 0, "splitBatches": 0}
 
     def updated_context(context: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
         section_values: dict[str, dict[str, Any]] = {
@@ -226,10 +240,12 @@ def analyze_layout(
     def run_batch(batch: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
         first_page = batch[0]["pageNumber"]
         last_page = batch[-1]["pageNumber"]
-        batch_path = structure_dir / f"pages-{first_page:03d}-{last_page:03d}.json"
+        cache_model = re.sub(r"[^a-zA-Z0-9]+", "-", f"{model}-{reasoning_effort}").strip("-")
+        batch_path = structure_dir / f"pages-{first_page:03d}-{last_page:03d}-{cache_model}.json"
         if batch_path.exists():
             cached = json.loads(batch_path.read_text(encoding="utf-8"))
             validate_structure_batch(batch, cached)
+            stats["cacheHits"] += 1
             print(f"Reused structure pages {first_page}-{last_page}", file=sys.stderr, flush=True)
             return cached
 
@@ -251,9 +267,16 @@ def analyze_layout(
         timeout_seconds = 600 if len(batch) == 1 else 240
         last_error: Exception | None = None
         for attempt in range(attempts):
+            stats["modelCalls"] += 1
             try:
                 process = subprocess.run(
-                    _structure_command(repo_root, schema, images),
+                    _structure_command(
+                        repo_root,
+                        schema,
+                        images,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                    ),
                     input=json.dumps(payload, ensure_ascii=False),
                     text=True,
                     capture_output=True,
@@ -270,6 +293,7 @@ def analyze_layout(
             except Exception as error:
                 last_error = error
                 if attempt + 1 < attempts:
+                    stats["retries"] += 1
                     print(
                         f"Retrying structure page {first_page}: {str(error)[-500:]}",
                         file=sys.stderr,
@@ -277,6 +301,7 @@ def analyze_layout(
                     )
 
         if len(batch) > 1:
+            stats["splitBatches"] += 1
             print(
                 f"Splitting slow/invalid batch {first_page}-{last_page} into single pages",
                 file=sys.stderr,
@@ -316,12 +341,29 @@ def analyze_layout(
     combined = {
         "version": 2,
         "sourceFile": evidence["sourceFile"],
+        "model": {"name": model, "reasoningEffort": reasoning_effort},
         "pages": combined_pages,
         "sections": list(combined_sections.values()),
         "warnings": combined_warnings,
     }
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
+    stage_ended = utc_now()
+    record_stage(
+        metrics_path,
+        "semantic_structure",
+        stage_started,
+        stage_ended,
+        {
+            "model": model,
+            "reasoningEffort": reasoning_effort,
+            "pages": len(pages),
+            "batchSize": batch_size,
+            "sections": len(combined_sections),
+            "visualObjects": sum(len(page["visualObjects"]) for page in combined_pages),
+            **stats,
+        },
+    )
     return combined
 
 
