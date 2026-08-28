@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import papertrans.semantic_translate as semantic_translation
+from papertrans.deterministic_structure import analyze_layout_deterministic, evaluate_structure
 from papertrans.semantic import build_semantic_document, iter_translatable_units
 from papertrans.semantic_render import render_semantic_document
 from papertrans.semantic_translate import _command, _validate_result
@@ -229,3 +230,76 @@ def test_structure_validation_accepts_previous_page_visual_anchor():
         ]
     }
     validate_structure_batch(pages, result, allowed_anchor_ids={"p1-b39"})
+
+
+def test_deterministic_structure_hides_visual_text_and_keeps_caption(tmp_path: Path):
+    evidence = {
+        "version": 3,
+        "sourceFile": "paper.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "drawingClusters": [[0.52, 0.2, 0.9, 0.5]],
+                "imageRegions": [],
+                "blocks": [
+                    {
+                        "blockId": "p1-b1",
+                        "text": "A Useful Paper",
+                        "bboxNormalized": [0.2, 0.05, 0.8, 0.08],
+                        "fontSizeMax": 16,
+                        "bold": True,
+                    },
+                    {
+                        "blockId": "p1-b2",
+                        "text": "1 Introduction",
+                        "bboxNormalized": [0.1, 0.15, 0.35, 0.18],
+                        "fontSizeMax": 12,
+                        "bold": True,
+                    },
+                    {
+                        "blockId": "p1-b3",
+                        "text": "The body paragraph contains enough words to establish the normal body font for this synthetic paper fixture.",
+                        "bboxNormalized": [0.1, 0.2, 0.45, 0.4],
+                        "fontSizeMax": 10,
+                        "bold": False,
+                    },
+                    {
+                        "blockId": "p1-b4",
+                        "text": "Embedded chart label",
+                        "bboxNormalized": [0.6, 0.3, 0.75, 0.33],
+                        "fontSizeMax": 5,
+                        "bold": False,
+                    },
+                    {
+                        "blockId": "p1-b5",
+                        "text": "Figure 1: Original caption.",
+                        "bboxNormalized": [0.52, 0.51, 0.9, 0.54],
+                        "fontSizeMax": 9,
+                        "bold": False,
+                    },
+                ],
+            }
+        ],
+    }
+    output = tmp_path / "structure.json"
+    result = analyze_layout_deterministic(evidence, output)
+    assignments = {
+        value["blockId"]: value for value in result["pages"][0]["blockAssignments"]
+    }
+    assert assignments["p1-b2"]["role"] == "heading"
+    assert assignments["p1-b4"]["role"] == "noise"
+    assert assignments["p1-b4"]["hidden"] is True
+    assert assignments["p1-b5"]["role"] == "caption"
+    assert result["pages"][0]["visualObjects"][0]["label"] == "Figure 1"
+    assert output.exists()
+
+
+def test_structure_evaluation_reports_role_and_visual_accuracy(tmp_path: Path):
+    evidence, structure, _ = sample_semantic_inputs()
+    candidate = json.loads(json.dumps(structure))
+    candidate["pages"][0]["blockAssignments"][0]["role"] = "paragraph"
+    metrics = evaluate_structure(structure, candidate)
+    assert metrics["blocks"]["coverage"] == 1
+    assert metrics["blocks"]["roleAccuracy"] == 7 / 8
+    assert metrics["headings"]["f1"] == 1

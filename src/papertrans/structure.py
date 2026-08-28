@@ -55,6 +55,15 @@ def _font_evidence(block: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalized_rect(rect: fitz.Rect, page_rect: fitz.Rect) -> list[float]:
+    return [
+        round(rect.x0 / page_rect.width, 5),
+        round(rect.y0 / page_rect.height, 5),
+        round(rect.x1 / page_rect.width, 5),
+        round(rect.y1 / page_rect.height, 5),
+    ]
+
+
 def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> dict[str, Any]:
     """Extract exact text geometry without making semantic layout decisions."""
     source = source.resolve()
@@ -70,8 +79,14 @@ def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> 
         pixmap.save(pages_dir / image_name, jpg_quality=90)
         raw_blocks = page.get_text("dict", sort=False).get("blocks", [])
         blocks: list[dict[str, Any]] = []
+        image_regions: list[list[float]] = []
         text_index = 0
         for raw_block in raw_blocks:
+            if raw_block.get("type") == 1 and raw_block.get("bbox"):
+                image_regions.append(
+                    _normalized_rect(fitz.Rect(raw_block["bbox"]), page.rect)
+                )
+                continue
             if raw_block.get("type") != 0:
                 continue
             text = _block_text(raw_block)
@@ -84,12 +99,7 @@ def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> 
                     "blockId": f"p{page_number}-b{text_index}",
                     "text": text,
                     "bboxPdf": [x0, y0, x1, y1],
-                    "bboxNormalized": [
-                        round(x0 / page.rect.width, 5),
-                        round(y0 / page.rect.height, 5),
-                        round(x1 / page.rect.width, 5),
-                        round(y1 / page.rect.height, 5),
-                    ],
+                    "bboxNormalized": _normalized_rect(fitz.Rect(x0, y0, x1, y1), page.rect),
                     "lineCount": len(raw_block.get("lines", [])),
                     **_font_evidence(raw_block),
                 }
@@ -102,13 +112,19 @@ def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> 
                 "image": f"layout-pages/{image_name}",
                 "imageWidth": pixmap.width,
                 "imageHeight": pixmap.height,
+                "drawingClusters": [
+                    _normalized_rect(rect, page.rect)
+                    for rect in page.cluster_drawings()
+                    if rect.width > 2 and rect.height > 2
+                ],
+                "imageRegions": image_regions,
                 "blocks": blocks,
             }
         )
 
     pdf.close()
     result = {
-        "version": 2,
+        "version": 3,
         "sourceFile": source.name,
         "pageCount": len(page_values),
         "pages": page_values,

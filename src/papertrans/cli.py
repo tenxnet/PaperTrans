@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .deterministic_structure import analyze_layout_deterministic, evaluate_structure
 from .extract import extract_document
 from .io import load_document
 from .metrics import record_stage, utc_now
@@ -67,6 +68,24 @@ def _parser() -> argparse.ArgumentParser:
     structure.add_argument("--model", default="gpt-5.6-sol")
     structure.add_argument("--reasoning-effort", default="high")
     structure.add_argument("--metrics", type=Path)
+
+    deterministic_structure = subparsers.add_parser(
+        "deterministic-structure",
+        help="Build a fast structure proposal from PDF geometry without an LLM",
+    )
+    deterministic_structure.add_argument("evidence", type=Path)
+    deterministic_structure.add_argument("--output", type=Path, required=True)
+    deterministic_structure.add_argument("--max-pages", type=int)
+    deterministic_structure.add_argument("--source-pdf", type=Path)
+    deterministic_structure.add_argument("--assets-dir", type=Path)
+    deterministic_structure.add_argument("--metrics", type=Path)
+
+    structure_evaluate = subparsers.add_parser(
+        "structure-evaluate", help="Compare a structure proposal with a reviewed structure file"
+    )
+    structure_evaluate.add_argument("gold", type=Path)
+    structure_evaluate.add_argument("candidate", type=Path)
+    structure_evaluate.add_argument("--output", type=Path)
 
     semantic_build = subparsers.add_parser("semantic-build", help="Build chapter and paragraph document semantics")
     semantic_build.add_argument("evidence", type=Path)
@@ -187,6 +206,50 @@ def main() -> None:
                 }
             )
         )
+        return
+
+    if args.command == "deterministic-structure":
+        evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
+        structured = analyze_layout_deterministic(
+            evidence,
+            args.output,
+            max_pages=args.max_pages,
+            metrics_path=args.metrics,
+        )
+        if args.source_pdf and args.assets_dir:
+            visual_started = utc_now()
+            objects = render_visual_objects(args.source_pdf, structured, args.assets_dir)
+            visual_path = args.output.parent / "visual-objects-deterministic.json"
+            visual_path.write_text(json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_visual_qa(objects, args.output.parent / "visual-qa-deterministic.html")
+            record_stage(
+                args.metrics,
+                "deterministic_visual_extraction",
+                visual_started,
+                utc_now(),
+                {"visualObjects": len(objects)},
+            )
+        print(
+            json.dumps(
+                {
+                    "pages": len(structured["pages"]),
+                    "sections": len(structured["sections"]),
+                    "visualObjects": sum(len(page["visualObjects"]) for page in structured["pages"]),
+                    "uncertainPages": structured["analysis"]["uncertainPages"],
+                }
+            )
+        )
+        return
+
+    if args.command == "structure-evaluate":
+        result = evaluate_structure(
+            json.loads(args.gold.read_text(encoding="utf-8")),
+            json.loads(args.candidate.read_text(encoding="utf-8")),
+        )
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(result, ensure_ascii=False))
         return
 
     if args.command == "semantic-build":
