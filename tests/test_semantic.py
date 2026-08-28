@@ -6,10 +6,12 @@ from types import SimpleNamespace
 
 import papertrans.semantic_translate as semantic_translation
 from papertrans.deterministic_structure import analyze_layout_deterministic, evaluate_structure
+from papertrans.hybrid_structure import _stable_cache_payload, select_review_pages
 from papertrans.semantic import build_semantic_document, iter_translatable_units
 from papertrans.semantic_render import render_semantic_document
 from papertrans.semantic_translate import _command, _validate_result
 from papertrans.structure import validate_structure_batch
+from papertrans.structure import _segment_text_block
 
 
 def sample_semantic_inputs():
@@ -303,3 +305,64 @@ def test_structure_evaluation_reports_role_and_visual_accuracy(tmp_path: Path):
     assert metrics["blocks"]["coverage"] == 1
     assert metrics["blocks"]["roleAccuracy"] == 7 / 8
     assert metrics["headings"]["f1"] == 1
+
+
+def test_layout_extraction_splits_mixed_body_heading_and_equation_lines():
+    def line(text, bbox, font="Times-Regular", flags=4):
+        return {
+            "bbox": bbox,
+            "spans": [{"text": text, "bbox": bbox, "font": font, "size": 10.0, "flags": flags}],
+        }
+
+    raw = {
+        "type": 0,
+        "bbox": [10, 10, 190, 70],
+        "lines": [
+            line("Previous paragraph.", [10, 10, 100, 20]),
+            line("3.2", [10, 25, 30, 35], "Times-Medium", 20),
+            line("Threat Model", [40, 25, 100, 35], "Times-Medium", 20),
+            line("x = y + z", [40, 40, 100, 48], "CMMI10", 6),
+            line("Following prose.", [10, 55, 100, 65]),
+        ],
+    }
+    segments = _segment_text_block(raw)
+    assert [segment["lines"][0]["spans"][0]["text"] for segment in segments] == [
+        "Previous paragraph.",
+        "3.2",
+        "x = y + z",
+        "Following prose.",
+    ]
+
+
+def test_hybrid_review_selects_only_low_confidence_pages():
+    baseline = {
+        "pages": [{"pageNumber": 1}, {"pageNumber": 2}, {"pageNumber": 3}],
+        "analysis": {"pageConfidence": {"1": 0.92, "2": 0.52, "3": 0.68}},
+    }
+    assert select_review_pages(baseline, confidence_threshold=0.7) == [2, 3]
+    assert select_review_pages(baseline, explicit_pages=[3, 9]) == [3]
+    assert select_review_pages(baseline, confidence_threshold=0.7, max_review_pages=1) == [2]
+
+
+def test_hybrid_cache_ignores_confidence_only_changes():
+    payload = {
+        "pages": [{"pageNumber": 1, "blocks": [{"blockId": "p1-b1", "text": "Body"}]}],
+        "deterministicProposal": {
+            "pageNumber": 1,
+            "blockAssignments": [
+                {
+                    "blockId": "p1-b1",
+                    "role": "paragraph",
+                    "sectionId": "sec-1",
+                    "paragraphId": "para-1",
+                    "hidden": False,
+                    "confidence": 0.6,
+                }
+            ],
+            "visualObjects": [],
+        },
+        "previousContext": {"sections": [], "tailAssignments": []},
+    }
+    before = _stable_cache_payload(payload)
+    payload["deterministicProposal"]["blockAssignments"][0]["confidence"] = 0.95
+    assert _stable_cache_payload(payload) == before

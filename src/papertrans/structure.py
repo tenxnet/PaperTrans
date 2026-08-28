@@ -9,6 +9,7 @@ from datetime import datetime
 from html import escape
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 import pymupdf as fitz
@@ -64,6 +65,169 @@ def _normalized_rect(rect: fitz.Rect, page_rect: fitz.Rect) -> list[float]:
     ]
 
 
+_SECTION_NUMBER_LINE = re.compile(r"^(?:[1-9]\d*)(?:\.[1-9]?\d*){0,5}$")
+_SECTION_WITH_TITLE_LINE = re.compile(r"^(?:[1-9]\d*)(?:\.[1-9]?\d*){0,5}[.)]?\s+\S+")
+_SPECIAL_SECTION_LINE = re.compile(
+    r"^(?:Abstract|References|Bibliography|Acknowledg(?:e)?ments?|Appendix(?:\s+[A-Z](?:\.\d+)*)?)$",
+    re.IGNORECASE,
+)
+
+
+def _line_text(line: dict[str, Any]) -> str:
+    return _clean_text("".join(str(span.get("text", "")) for span in line.get("spans", [])))
+
+
+def _line_rect(line: dict[str, Any]) -> fitz.Rect:
+    if line.get("bbox"):
+        return fitz.Rect(line["bbox"])
+    spans = [fitz.Rect(span["bbox"]) for span in line.get("spans", []) if span.get("bbox")]
+    return fitz.Rect(
+        min(rect.x0 for rect in spans),
+        min(rect.y0 for rect in spans),
+        max(rect.x1 for rect in spans),
+        max(rect.y1 for rect in spans),
+    )
+
+
+def _line_bold_ratio(line: dict[str, Any]) -> float:
+    bold_characters = 0
+    characters = 0
+    for span in line.get("spans", []):
+        text = str(span.get("text", ""))
+        count = len(text.strip())
+        if not count:
+            continue
+        characters += count
+        font = str(span.get("font", "")).lower()
+        if "bold" in font or "medi" in font or int(span.get("flags", 0)) & 16:
+            bold_characters += count
+    return bold_characters / characters if characters else 0.0
+
+
+def _line_math_ratio(line: dict[str, Any]) -> float:
+    math_characters = 0
+    characters = 0
+    for span in line.get("spans", []):
+        text = str(span.get("text", ""))
+        count = len(text.strip())
+        if not count:
+            continue
+        characters += count
+        font = str(span.get("font", "")).lower()
+        if any(token in font for token in ("cmmi", "cmsy", "cmex", "math", "symbol")):
+            math_characters += count
+    return math_characters / characters if characters else 0.0
+
+
+def _is_display_equation_line(line: dict[str, Any], typical_height: float) -> bool:
+    text = _line_text(line)
+    rect = _line_rect(line)
+    operators = len(re.findall(r"[=<>≤≥∑∏∫√±×÷∂∇]|arg\s*(?:max|min)", text))
+    control_glyph = any(ord(character) < 32 for character in text)
+    return (
+        (_line_math_ratio(line) >= 0.58 and (operators > 0 or rect.height < typical_height * 0.9))
+        or control_glyph
+    )
+
+
+def _is_heading_line(line: dict[str, Any]) -> bool:
+    text = _line_text(line)
+    return bool(
+        _SPECIAL_SECTION_LINE.match(text)
+        or (_SECTION_WITH_TITLE_LINE.match(text) and _line_bold_ratio(line) >= 0.55)
+    )
+
+
+def _paragraph_break(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    base_x: float,
+    typical_height: float,
+) -> bool:
+    previous_text = _line_text(previous).rstrip()
+    current_text = _line_text(current).lstrip()
+    previous_rect = _line_rect(previous)
+    current_rect = _line_rect(current)
+    vertical_gap = current_rect.y0 - previous_rect.y1
+    indented = current_rect.x0 - base_x >= max(4.5, typical_height * 0.42)
+    explicit_item = bool(re.match(r"^(?:\([a-z0-9]+\)|[•▪◦‣])\s*", current_text, re.IGNORECASE))
+    completed = previous_text.endswith((".", "!", "?", ")", "]", "”", "’"))
+    return (completed and indented) or (completed and explicit_item) or vertical_gap > typical_height * 0.65
+
+
+def _segment_text_block(raw_block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split mixed PDF blocks at verified heading and paragraph boundaries."""
+    lines = [line for line in raw_block.get("lines", []) if _line_text(line)]
+    if len(lines) <= 1:
+        return [raw_block]
+    rects = [_line_rect(line) for line in lines]
+    base_x = min(rect.x0 for rect in rects)
+    typical_height = median(rect.height for rect in rects)
+    segments: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            segments.append(current)
+            current = []
+
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        text = _line_text(line)
+        if _is_display_equation_line(line, typical_height):
+            flush()
+            equation_lines = [line]
+            index += 1
+            while index < len(lines) and _is_display_equation_line(lines[index], typical_height):
+                equation_lines.append(lines[index])
+                index += 1
+            segments.append(equation_lines)
+            continue
+        number_only = bool(_SECTION_NUMBER_LINE.match(text) and _line_bold_ratio(line) >= 0.55)
+        followed_by_title = (
+            number_only
+            and index + 1 < len(lines)
+            and _line_bold_ratio(lines[index + 1]) >= 0.55
+            and len(_line_text(lines[index + 1])) <= 120
+        )
+        if followed_by_title:
+            flush()
+            segments.append([line, lines[index + 1]])
+            index += 2
+            continue
+        if _is_heading_line(line):
+            flush()
+            segments.append([line])
+            index += 1
+            continue
+        if current and _paragraph_break(current[-1], line, base_x, typical_height):
+            flush()
+        current.append(line)
+        index += 1
+    flush()
+    if len(segments) == 1:
+        return [raw_block]
+
+    values: list[dict[str, Any]] = []
+    for segment in segments:
+        segment_rects = [_line_rect(line) for line in segment]
+        values.append(
+            {
+                **raw_block,
+                "bbox": (
+                    min(rect.x0 for rect in segment_rects),
+                    min(rect.y0 for rect in segment_rects),
+                    max(rect.x1 for rect in segment_rects),
+                    max(rect.y1 for rect in segment_rects),
+                ),
+                "lines": segment,
+            }
+        )
+    return values
+
+
 def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> dict[str, Any]:
     """Extract exact text geometry without making semantic layout decisions."""
     source = source.resolve()
@@ -89,21 +253,26 @@ def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> 
                 continue
             if raw_block.get("type") != 0:
                 continue
-            text = _block_text(raw_block)
-            if not text:
-                continue
             text_index += 1
-            x0, y0, x1, y1 = [round(float(value), 2) for value in raw_block["bbox"]]
-            blocks.append(
-                {
-                    "blockId": f"p{page_number}-b{text_index}",
-                    "text": text,
-                    "bboxPdf": [x0, y0, x1, y1],
-                    "bboxNormalized": _normalized_rect(fitz.Rect(x0, y0, x1, y1), page.rect),
-                    "lineCount": len(raw_block.get("lines", [])),
-                    **_font_evidence(raw_block),
-                }
-            )
+            source_block_id = f"p{page_number}-b{text_index}"
+            segments = _segment_text_block(raw_block)
+            for segment_index, segment in enumerate(segments, start=1):
+                text = _block_text(segment)
+                if not text:
+                    continue
+                x0, y0, x1, y1 = [round(float(value), 2) for value in segment["bbox"]]
+                block_id = source_block_id if segment_index == 1 else f"{source_block_id}-s{segment_index}"
+                blocks.append(
+                    {
+                        "blockId": block_id,
+                        "sourceBlockId": source_block_id,
+                        "text": text,
+                        "bboxPdf": [x0, y0, x1, y1],
+                        "bboxNormalized": _normalized_rect(fitz.Rect(x0, y0, x1, y1), page.rect),
+                        "lineCount": len(segment.get("lines", [])),
+                        **_font_evidence(segment),
+                    }
+                )
         page_values.append(
             {
                 "pageNumber": page_number,
@@ -124,7 +293,7 @@ def extract_layout_evidence(source: Path, work_dir: Path, output_json: Path) -> 
 
     pdf.close()
     result = {
-        "version": 3,
+        "version": 4,
         "sourceFile": source.name,
         "pageCount": len(page_values),
         "pages": page_values,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .deterministic_structure import analyze_layout_deterministic, evaluate_structure
 from .extract import extract_document
+from .hybrid_structure import refine_structure_with_llm
 from .io import load_document
 from .metrics import record_stage, utc_now
 from .render import create_bundle, render_document
@@ -86,6 +87,22 @@ def _parser() -> argparse.ArgumentParser:
     structure_evaluate.add_argument("gold", type=Path)
     structure_evaluate.add_argument("candidate", type=Path)
     structure_evaluate.add_argument("--output", type=Path)
+
+    hybrid_structure = subparsers.add_parser(
+        "hybrid-structure",
+        help="Review only low-confidence deterministic pages with Codex",
+    )
+    hybrid_structure.add_argument("evidence", type=Path)
+    hybrid_structure.add_argument("baseline", type=Path)
+    hybrid_structure.add_argument("--work-dir", type=Path, required=True)
+    hybrid_structure.add_argument("--output", type=Path, required=True)
+    hybrid_structure.add_argument("--repo-root", type=Path, default=Path.cwd())
+    hybrid_structure.add_argument("--confidence-threshold", type=float, default=0.7)
+    hybrid_structure.add_argument("--review-page", type=int, action="append", dest="review_pages")
+    hybrid_structure.add_argument("--max-review-pages", type=int)
+    hybrid_structure.add_argument("--model", default="gpt-5.6-sol")
+    hybrid_structure.add_argument("--reasoning-effort", default="high")
+    hybrid_structure.add_argument("--metrics", type=Path)
 
     semantic_build = subparsers.add_parser("semantic-build", help="Build chapter and paragraph document semantics")
     semantic_build.add_argument("evidence", type=Path)
@@ -250,6 +267,31 @@ def main() -> None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(result, ensure_ascii=False))
+        return
+
+    if args.command == "hybrid-structure":
+        combined = refine_structure_with_llm(
+            json.loads(args.evidence.read_text(encoding="utf-8")),
+            json.loads(args.baseline.read_text(encoding="utf-8")),
+            args.work_dir,
+            args.output,
+            args.repo_root.resolve(),
+            confidence_threshold=args.confidence_threshold,
+            explicit_pages=args.review_pages,
+            max_review_pages=args.max_review_pages,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            metrics_path=args.metrics,
+        )
+        print(
+            json.dumps(
+                {
+                    "reviewedPages": combined["analysis"].get("reviewedPages", []),
+                    "unresolvedPages": combined["analysis"].get("unresolvedPages", []),
+                    "output": str(args.output),
+                }
+            )
+        )
         return
 
     if args.command == "semantic-build":
