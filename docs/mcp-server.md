@@ -36,7 +36,7 @@ Only connect clients that you trust with those papers and translations. PaperTra
 ## Start locally
 
 ```bash
-uv sync --extra chatgpt --extra test
+uv sync --extra mcp
 .venv/bin/papertrans-mcp \
   --transport streamable-http \
   --host 127.0.0.1 \
@@ -47,11 +47,11 @@ The endpoint is `http://127.0.0.1:8000/mcp`. Configuration can also be supplied 
 
 The Web UI checks only whether the local MCP port is listening. It cannot verify a tunnel or an external client connection.
 
-## Connect ChatGPT
+## Connect a client
 
-ChatGPT requires a public HTTPS MCP endpoint. Use OpenAI's Secure MCP Tunnel for local development, or deploy the server behind authentication and HTTPS. Then enable Developer mode in ChatGPT and register the resulting `/mcp` URL. Availability may depend on account or workspace policy.
+A local MCP client can connect directly to `http://127.0.0.1:8000/mcp`. ChatGPT connects through OpenAI Secure MCP Tunnel; the local server itself remains on loopback. Follow the bilingual [MCP client setup guide](mcp-client-setup.md) for both paths.
 
-PaperTrans cannot start a ChatGPT conversation. After preparing a job in the Web UI, copy its worker request and send it in the connected conversation.
+PaperTrans cannot start a client conversation. After preparing a job in the Web UI, copy its worker request and send it to the connected client.
 
 ## Exposed tools
 

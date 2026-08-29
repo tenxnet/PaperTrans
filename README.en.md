@@ -29,7 +29,7 @@ Papers, translations, and library state stay on the local machine and are exclud
 ```bash
 git clone https://github.com/tenxnet/PaperTrans.git
 cd PaperTrans
-uv sync --extra chatgpt --extra test
+uv sync --extra mcp
 pnpm install --frozen-lockfile
 ```
 
@@ -45,17 +45,18 @@ Start the web app in another terminal:
 pnpm dev --hostname 127.0.0.1
 ```
 
-Open `http://127.0.0.1:3000` and register an arXiv ID under **New translation**. PaperTrans prepares official arXiv HTML and stable translation chunks for a connected MCP client. Add `--port 3100` to the web command if you need a different port.
+Before creating the first job, connect a client with the [MCP client setup guide](docs/mcp-client-setup.md). A local MCP client can use the URL above directly; ChatGPT uses Secure MCP Tunnel.
 
-## Translation methods
+Open `http://127.0.0.1:3000` and register an arXiv ID under **New translation**. Copy the displayed **Worker request** into the connected client; PaperTrans then persists progress and artifacts. Add `--port 3100` to the web command if you need a different port.
 
-| Method | v0.1 status | Tunnel | Billing or quota |
-| --- | --- | --- | --- |
-| MCP translation worker | Supported v0.1 path | Depends on client | MCP client usage |
-| Codex CLI | Experimental development path | Not required | Codex usage |
-| OpenAI API | Not implemented | Not required | API usage billing |
+## Choose an MCP client
 
-The Web UI manages MCP status, job preparation, progress, and artifacts. Model selection belongs to the MCP client. ChatGPT connections require a Secure MCP Tunnel. See [MCP translation server](docs/mcp-server.md) for setup and the trust boundary.
+| Client | Connection | Tunnel |
+| --- | --- | --- |
+| Local MCP client | Connect directly to `http://127.0.0.1:8000/mcp` | Not required |
+| ChatGPT | Connect through OpenAI Secure MCP Tunnel | Required |
+
+The Web UI manages job preparation, progress, and artifacts. Model selection and usage limits belong to the MCP client.
 
 ## Scope
 
@@ -76,14 +77,11 @@ The Web UI manages MCP status, job preparation, progress, and artifacts. Model s
 
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [MCP translation server](docs/mcp-server.md)
-- [Experimental PDF pipeline](docs/pdf-pipeline.md)
-- [Dependency license audit](docs/dependency-licenses.md)
-- [Security policy](SECURITY.md)
+- [MCP client setup](docs/mcp-client-setup.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Documentation index](docs/README.md)
+- [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
-- [OSS release checklist](docs/oss-release-checklist.md)
 
 ## Development and validation
 

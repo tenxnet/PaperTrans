@@ -11,6 +11,7 @@ This checklist tracks the remaining work before making PaperTrans public as a v0
 - [x] Add reproducible Python and Node validation in GitHub Actions.
 - [x] Add contribution guidance, a code of conduct, issue forms, and a pull-request template.
 - [x] Document official arXiv HTML plus MCP translation as the supported v1 path; mark PDF and Codex CLI paths experimental.
+- [x] Document MCP client registration for direct local clients and ChatGPT through Secure MCP Tunnel.
 - [x] Document copyright responsibility and the need to verify generated translations.
 - [x] Review the complete Git history for credentials and accidentally committed papers before changing repository visibility (2026-08-30; no candidates found by filename, blob-size, PDF/archive, or common-secret-pattern checks).
 - [x] Review installed and declared dependency licenses and record known copyleft/data-license obligations in `docs/dependency-licenses.md` (2026-08-30).

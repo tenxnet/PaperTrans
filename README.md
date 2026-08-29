@@ -29,7 +29,7 @@ PaperTransは、学術論文の構造、MathML数式、図、表、引用、相�
 ```bash
 git clone https://github.com/tenxnet/PaperTrans.git
 cd PaperTrans
-uv sync --extra chatgpt --extra test
+uv sync --extra mcp
 pnpm install --frozen-lockfile
 ```
 
@@ -45,17 +45,18 @@ pnpm install --frozen-lockfile
 pnpm dev --hostname 127.0.0.1
 ```
 
-`http://127.0.0.1:3000`を開き、「新しい翻訳」からarXiv IDを登録します。PaperTransが公式arXiv HTMLと翻訳チャンクを準備し、接続済みのMCPクライアントが翻訳を進めます。ポートを変更する場合は、起動コマンドの末尾に`--port 3100`を追加してください。
+最初のジョブを作る前に、[MCPクライアント登録ガイド](docs/mcp-client-setup.md)に従ってクライアントを接続します。ローカルMCPクライアントは上記URLへ直接接続でき、ChatGPTはSecure MCP Tunnelを使います。
 
-## 翻訳方法
+`http://127.0.0.1:3000`を開き、「新しい翻訳」からarXiv IDを登録してください。表示された「ワーカーへの依頼」をコピーして接続済みクライアントへ送ると、PaperTransが進捗と成果物を保存します。ポートを変更する場合は、Web起動コマンドの末尾に`--port 3100`を追加します。
 
-| 方法 | v0.1での位置付け | Tunnel | 費用・利用枠 |
-| --- | --- | --- | --- |
-| MCP翻訳ワーカー | v0.1の標準経路 | クライアントによる | MCPクライアント側の利用枠 |
-| Codex CLI | 開発・検証用の実験経路 | 不要 | Codex利用枠 |
-| OpenAI API | 未実装 | 不要 | API従量課金 |
+## MCPクライアントを選ぶ
 
-Web UIはMCP接続状態、ジョブ準備、進捗、成果物を管理します。使用モデルはMCPクライアント側で選択します。ChatGPTから接続する場合はSecure MCP Tunnelが必要です。詳しくは[MCP翻訳サーバー](docs/mcp-server.md)を参照してください。
+| クライアント | 接続方法 | Tunnel |
+| --- | --- | --- |
+| ローカルMCPクライアント | `http://127.0.0.1:8000/mcp`へ直接接続 | 不要 |
+| ChatGPT | OpenAI Secure MCP Tunnel経由 | 必要 |
+
+Web UIはジョブ準備、進捗、成果物を管理します。使用モデルと利用枠はMCPクライアント側の設定に従います。
 
 ## 対象範囲
 
@@ -76,14 +77,11 @@ Web UIはMCP接続状態、ジョブ準備、進捗、成果物を管理しま�
 
 ## ドキュメント
 
-- [ドキュメント索引](docs/README.md)
-- [MCP翻訳サーバー](docs/mcp-server.md)
-- [実験的PDFパイプライン](docs/pdf-pipeline.md)
-- [依存ライセンス監査](docs/dependency-licenses.md)
-- [セキュリティポリシー](SECURITY.md)
+- [MCPクライアント登録](docs/mcp-client-setup.md)
 - [トラブルシューティング](docs/troubleshooting.md)
+- [ドキュメント索引](docs/README.md)
+- [セキュリティポリシー](SECURITY.md)
 - [コントリビューション](CONTRIBUTING.md)
-- [OSSリリースチェックリスト](docs/oss-release-checklist.md)
 
 ## 開発と検証
 

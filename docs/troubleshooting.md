@@ -10,19 +10,19 @@ pnpm dev --hostname 127.0.0.1 --port 3100
 
 Then open `http://127.0.0.1:3100`.
 
-## ChatGPT Connector shows that MCP is stopped
+## The Web UI says that MCP is stopped
 
 Start the MCP server separately:
 
 ```bash
-uv sync --extra chatgpt --extra test
+uv sync --extra mcp
 .venv/bin/papertrans-mcp \
   --transport streamable-http \
   --host 127.0.0.1 \
   --port 8000
 ```
 
-The Web UI checks only whether the local MCP port is listening. It cannot verify the Secure MCP Tunnel or the Connector registration inside ChatGPT.
+The Web UI checks only whether the local MCP port is listening. It cannot verify a client registration or Secure MCP Tunnel.
 
 ## ChatGPT cannot reach PaperTrans
 
@@ -30,7 +30,9 @@ Confirm all three layers:
 
 1. The local MCP server is running at `http://127.0.0.1:8000/mcp`.
 2. Secure MCP Tunnel is running with the configured PaperTrans profile.
-3. The Connector exists in the intended ChatGPT workspace.
+3. The developer-mode app exists in the intended ChatGPT workspace.
+
+Run `tunnel-client doctor --profile papertrans-local --explain` and keep `tunnel-client run --profile papertrans-local` active. If the Tunnel is not listed in ChatGPT, confirm its workspace association and `Read + Use` permissions. See [MCP client setup](mcp-client-setup.md).
 
 Do not expose the unauthenticated local MCP server directly to the internet. Review the data boundary in [MCP translation server](mcp-server.md) before starting a tunnel.
 
