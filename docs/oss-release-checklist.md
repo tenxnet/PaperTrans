@@ -14,11 +14,11 @@ This checklist tracks the remaining work before making PaperTrans public as a v0
 - [x] Document copyright responsibility and the need to verify generated translations.
 - [x] Review the complete Git history for credentials and accidentally committed papers before changing repository visibility (2026-08-30; no candidates found by filename, blob-size, PDF/archive, or common-secret-pattern checks).
 - [x] Review installed and declared dependency licenses and record known copyleft/data-license obligations in `docs/dependency-licenses.md` (2026-08-30).
-- [ ] Run CI successfully from a clean clone.
+- [x] Run CI successfully from a clean GitHub checkout on `main` ([CI run 33266533245](https://github.com/tenxnet/PaperTrans/actions/runs/33266533245), 2026-08-30).
 
 ## Recommended for the first tagged release
 
-- [ ] Choose the public release branch and merge the current feature branch through a reviewed pull request.
+- [x] Establish `main` as the public release branch and GitHub default branch.
 - [ ] Create a `v0.1.0` tag and short release notes with known limitations.
 - [ ] Add a small redistributable fixture or synthetic demo instead of a third-party paper.
 - [ ] Add screenshots that contain no private paths, credentials, or copyrighted full-paper content.
