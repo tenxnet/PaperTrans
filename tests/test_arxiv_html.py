@@ -6,7 +6,10 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from papertrans.arxiv_html import (
+    _asset_url_candidates,
     _citation_metadata,
+    _decode_local_images,
+    _download_assets,
     _parse_codex_jsonl,
     _repair_section_hierarchy,
     _section_chunks,
@@ -64,6 +67,68 @@ def test_reads_authors_and_publication_date_from_arxiv_html_fallbacks():
         ],
         "publishedAt": "17 Nov 2025",
     }
+
+
+def test_arxiv_asset_urls_support_native_and_document_directory_forms():
+    base = "https://arxiv.org/html/2405.20947v5"
+    assert _asset_url_candidates(base, "2405.20947v5/x1.png") == [
+        "https://arxiv.org/html/2405.20947v5/x1.png"
+    ]
+    assert _asset_url_candidates(base, "x1.png") == [
+        "https://arxiv.org/html/x1.png",
+        "https://arxiv.org/html/2405.20947v5/x1.png",
+    ]
+
+
+def test_asset_download_falls_back_to_arxiv_document_directory(monkeypatch, tmp_path: Path):
+    requested: list[str] = []
+
+    def fake_request(url: str, timeout: int = 60):
+        requested.append(url)
+        if url == "https://arxiv.org/html/x1.png":
+            raise OSError("404")
+        return b"png", url, "image/png"
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    soup = BeautifulSoup('<article><img src="x1.png"></article>', "html.parser")
+    article = soup.article
+    assert article is not None
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+    assert requested == [
+        "https://arxiv.org/html/x1.png",
+        "https://arxiv.org/html/2405.20947v5/x1.png",
+    ]
+    assert result["failures"] == []
+    assert result["downloaded"][0]["url"] == "https://arxiv.org/html/2405.20947v5/x1.png"
+    assert article.img is not None
+    assert str(article.img["src"]).startswith("assets/")
+
+
+def test_local_image_decode_qa_rejects_corrupt_images(tmp_path: Path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "broken.png").write_bytes(b"not an image")
+    result = _decode_local_images(tmp_path, ["assets/broken.png"])
+    assert result["engine"] == "PyMuPDF"
+    assert result["checked"] == 0
+    assert result["failures"][0]["asset"] == "assets/broken.png"
+
+
+def test_local_image_decode_qa_accepts_renderable_svg(tmp_path: Path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "figure.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="8">'
+        '<rect width="10" height="8" fill="blue"/></svg>',
+        encoding="utf-8",
+    )
+    result = _decode_local_images(tmp_path, ["assets/figure.svg"])
+    assert result == {"engine": "PyMuPDF", "checked": 1, "failures": []}
 
 
 def test_tokenizer_protects_math_citations_and_cross_references():

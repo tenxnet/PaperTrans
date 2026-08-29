@@ -17,6 +17,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+import pymupdf
 from bs4 import BeautifulSoup, NavigableString, Tag
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
@@ -146,6 +147,40 @@ def _safe_asset_name(url: str) -> str:
     return f"{digest}-{safe}"
 
 
+def _asset_url_candidates(base_url: str, raw_url: str) -> list[str]:
+    """Return standards-based and arXiv-directory fallback asset URLs."""
+    standard_url = urllib.parse.urljoin(base_url, raw_url)
+    candidates = [standard_url]
+    parsed = urllib.parse.urlparse(raw_url)
+    if parsed.scheme or parsed.netloc or raw_url.startswith(("/", "#")):
+        return candidates
+
+    base_path = urllib.parse.urlparse(base_url).path.rstrip("/")
+    document_segment = base_path.rsplit("/", 1)[-1]
+    raw_path = parsed.path.lstrip("./")
+    if raw_path == document_segment or raw_path.startswith(f"{document_segment}/"):
+        return candidates
+
+    directory_url = urllib.parse.urljoin(f"{base_url.rstrip('/')}/", raw_url)
+    if directory_url not in candidates:
+        candidates.append(directory_url)
+    return candidates
+
+
+def _request_asset_bytes(
+    base_url: str,
+    raw_url: str,
+) -> tuple[bytes, str, str | None]:
+    errors: list[str] = []
+    for candidate in _asset_url_candidates(base_url, raw_url):
+        try:
+            payload, final_url, content_type = _request_bytes(candidate)
+            return payload, final_url, content_type
+        except Exception as error:
+            errors.append(f"{candidate}: {error}")
+    raise RuntimeError("; ".join(errors))
+
+
 def _localize_css_file(
     css_url: str,
     destination: Path,
@@ -256,11 +291,10 @@ def _download_assets(
         raw_url = str(tag.get(attribute, ""))
         if not raw_url or raw_url.startswith("data:"):
             continue
-        asset_url = urllib.parse.urljoin(base_url, raw_url)
-        filename = _safe_asset_name(asset_url)
-        destination = assets_dir / filename
         try:
-            payload, _, content_type = _request_bytes(asset_url)
+            payload, asset_url, content_type = _request_asset_bytes(base_url, raw_url)
+            filename = _safe_asset_name(asset_url)
+            destination = assets_dir / filename
             destination.write_bytes(payload)
             downloaded.append(
                 {
@@ -281,8 +315,38 @@ def _download_assets(
             else:
                 tag[attribute] = f"assets/{filename}"
         except Exception as error:
-            failures.append({"url": asset_url, "error": str(error)})
+            failures.append({"url": raw_url, "error": str(error)})
     return {"downloaded": downloaded, "failures": failures}
+
+
+def _decode_local_images(output_dir: Path, assets: list[str]) -> dict[str, Any]:
+    root = output_dir.resolve()
+    failures: list[dict[str, str]] = []
+    checked = 0
+    for asset in sorted(set(assets)):
+        path = (output_dir / asset).resolve()
+        try:
+            path.relative_to(root)
+            if not path.is_file():
+                continue
+            with pymupdf.open(path) as image:
+                if image.page_count < 1:
+                    raise ValueError("image has no renderable page")
+                page = image[0]
+                if page.rect.width <= 0 or page.rect.height <= 0:
+                    raise ValueError("image has no intrinsic dimensions")
+                scale = min(1.0, 64.0 / max(page.rect.width, page.rect.height))
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+                if pixmap.width <= 0 or pixmap.height <= 0:
+                    raise ValueError("image decoded to zero dimensions")
+            checked += 1
+        except Exception as error:
+            failures.append({"asset": asset, "error": str(error)})
+    return {
+        "engine": "PyMuPDF",
+        "checked": checked,
+        "failures": failures,
+    }
 
 
 def _find_resolved_id(soup: BeautifulSoup, requested: str) -> str:
@@ -1351,7 +1415,8 @@ def render_arxiv_html_document(
         asset for asset in qa["localAssets"] if not (output_dir / asset).exists()
     ]
     qa["missingLocalAssets"] = missing_files
-    if missing_files:
+    qa["imageDecode"] = _decode_local_images(output_dir, qa["localAssets"])
+    if missing_files or qa["imageDecode"]["failures"]:
         qa["status"] = "failed"
     (output_dir / "qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
     if qa["status"] != "passed":
