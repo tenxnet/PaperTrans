@@ -348,7 +348,6 @@ def write_semantic_pdf_qa(
         for assignment in page.get("blockAssignments", [])
         if assignment.get("visualCaptionCandidate")
         and not assignment.get("associatedVisualCaption")
-        and not assignment.get("hidden")
         and assignment.get("blockId")
     )
     evidence_blocks_by_page = {

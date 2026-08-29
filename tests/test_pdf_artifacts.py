@@ -411,7 +411,7 @@ def test_pdf_qa_rejects_caption_conflicts_and_visible_visual_overlap(
                         {
                             "blockId": "orphan-caption",
                             "role": "paragraph",
-                            "hidden": False,
+                            "hidden": True,
                             "visualCaptionCandidate": True,
                             "associatedVisualCaption": False,
                         },

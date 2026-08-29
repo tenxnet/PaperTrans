@@ -26,6 +26,10 @@ def _join_source_parts(parts: list[str]) -> str:
             result = result[:-1] + value
         elif result.count("[") > result.count("]") and re.match(r"^\d", value):
             result += value
+        elif value and all(
+            character in "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾" for character in value
+        ):
+            result += value
         elif value[:1] in ".,;:!?)]}" or result[-1:] in "([{/—":
             result += value
         else:

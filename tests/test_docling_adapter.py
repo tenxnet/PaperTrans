@@ -261,6 +261,28 @@ def _rendered_visuals(evidence: dict, structure: dict) -> list[dict]:
     return values
 
 
+def _bottom_left_provenance(
+    page_number: int,
+    bbox_normalized: tuple[float, float, float, float],
+    *,
+    width: float = 600,
+    height: float = 800,
+    text_length: int = 0,
+) -> dict:
+    x0, y0, x1, y1 = bbox_normalized
+    return {
+        "page_no": page_number,
+        "bbox": {
+            "l": x0 * width,
+            "t": (1 - y0) * height,
+            "r": x1 * width,
+            "b": (1 - y1) * height,
+            "coord_origin": "BOTTOMLEFT",
+        },
+        "charspan": [0, text_length],
+    }
+
+
 def test_maps_native_docling_graph_to_existing_ir_without_markdown() -> None:
     evidence, structure = docling_document_to_ir(
         sample_docling_document(), source_file="requested.pdf"
@@ -610,6 +632,124 @@ def test_caption_assignment_repairs_wrong_owner_by_kind_and_geometry() -> None:
     assert len(caption_ids) == len(set(caption_ids))
 
 
+def test_caption_alignment_is_global_monotone_and_geometry_can_override_owner() -> None:
+    table_visuals = [
+        {
+            "ref": f"#/tables/{index}",
+            "pageNumber": 6,
+            "kind": "table",
+            "order": 10 + index * 2,
+            "bboxNormalized": bbox,
+        }
+        for index, bbox in enumerate(
+            (
+                [0.14, 0.089, 0.41, 0.264],
+                [0.095, 0.320, 0.454, 0.492],
+                [0.098, 0.536, 0.451, 0.648],
+            )
+        )
+    ]
+    table_captions = [
+        {
+            "ref": f"#/texts/{index}",
+            "blockId": f"caption-{index}",
+            "text": f"Table {index + 3}. Results.",
+            "pageNumber": 6,
+            "order": 11 + index * 2,
+            "segmentIndex": 1,
+            "bboxNormalized": bbox,
+            "visualCaptionCandidate": False,
+        }
+        for index, bbox in enumerate(
+            (
+                [0.082, 0.271, 0.468, 0.309],
+                [0.082, 0.500, 0.468, 0.524],
+                [0.082, 0.655, 0.468, 0.679],
+            )
+        )
+    ]
+    table_owners = {
+        "#/texts/1": {"#/tables/1"},
+        "#/texts/2": {"#/tables/2"},
+    }
+
+    table_pairs = adapter._align_visual_captions(
+        table_captions, table_visuals, table_owners
+    )
+
+    assert [
+        (caption["ref"], visual["ref"]) for caption, visual in table_pairs
+    ] == [
+        ("#/texts/0", "#/tables/0"),
+        ("#/texts/1", "#/tables/1"),
+        ("#/texts/2", "#/tables/2"),
+    ]
+
+    figure_visuals = [
+        {
+            "ref": "#/pictures/5",
+            "pageNumber": 8,
+            "kind": "figure",
+            "order": 30,
+            "bboxNormalized": [0.16, 0.09, 0.81, 0.218],
+        },
+        {
+            "ref": "#/pictures/6",
+            "pageNumber": 8,
+            "kind": "figure",
+            "order": 40,
+            "bboxNormalized": [0.10, 0.267, 0.45, 0.415],
+        },
+    ]
+    figure_captions = [
+        {
+            "ref": "#/texts/353",
+            "blockId": "figure-6-caption",
+            "text": "Figure 6. Training curves.",
+            "pageNumber": 8,
+            "order": 41,
+            "segmentIndex": 1,
+            "bboxNormalized": [0.10, 0.225, 0.88, 0.250],
+            "visualCaptionCandidate": False,
+        },
+        {
+            "ref": "#/texts/386",
+            "blockId": "figure-7-caption",
+            "text": "Figure 7. Layer responses.",
+            "pageNumber": 8,
+            "order": 50,
+            "segmentIndex": 1,
+            "bboxNormalized": [0.10, 0.420, 0.45, 0.445],
+            "visualCaptionCandidate": False,
+        },
+    ]
+
+    figure_pairs = adapter._align_visual_captions(
+        figure_captions,
+        figure_visuals,
+        {"#/texts/353": {"#/pictures/6"}},
+    )
+
+    assert [
+        (caption["ref"], visual["ref"]) for caption, visual in figure_pairs
+    ] == [
+        ("#/texts/353", "#/pictures/5"),
+        ("#/texts/386", "#/pictures/6"),
+    ]
+
+    distant_caption = {
+        **figure_captions[0],
+        "ref": "#/texts/far",
+        "blockId": "far-caption",
+        "bboxNormalized": [0.10, 0.80, 0.45, 0.83],
+    }
+    assert adapter._align_visual_captions(
+        [distant_caption],
+        [figure_visuals[0]],
+        {"#/texts/far": {"#/pictures/5"}},
+    ) == []
+
+
 def test_reassembles_same_line_caption_fragments() -> None:
     document = sample_docling_document()
     document["pictures"][0]["captions"] = []
@@ -662,6 +802,148 @@ def test_reassembles_same_line_caption_fragments() -> None:
         visual for visual in semantic["visualObjects"] if visual["kind"] == "figure"
     )
     assert rendered_figure["caption"] == "Figure 1. Split caption text."
+
+
+def test_attaches_only_nearby_explicit_caption_continuations() -> None:
+    document = sample_docling_document()
+    document["pictures"][0]["captions"] = [
+        {"$ref": "#/texts/11"},
+        {"$ref": "#/texts/12"},
+        {"$ref": "#/texts/13"},
+    ]
+    continuation = "Second exact caption line."
+    distant_internal_title = "Unrelated title at the opposite visual boundary"
+    panel_label = "(b) Inception feature space nearest neighbors"
+    for index, text, bbox in (
+        (11, continuation, (0.15, 0.735, 0.55, 0.755)),
+        (12, distant_internal_title, (0.25, 0.39, 0.75, 0.41)),
+        (13, panel_label, (0.25, 0.755, 0.65, 0.775)),
+    ):
+        document["texts"].append(
+            {
+                "self_ref": f"#/texts/{index}",
+                "parent": {"$ref": "#/pictures/0"},
+                "label": "caption",
+                "orig": text,
+                "text": text,
+                "prov": [
+                    _bottom_left_provenance(
+                        1, bbox, text_length=len(text)
+                    )
+                ],
+            }
+        )
+
+    evidence, structure = docling_document_to_ir(document)
+    figure = next(
+        visual
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+        if visual["kind"] == "figure"
+    )
+
+    assert figure["captionBlockIds"] == ["dl-texts-3", "dl-texts-11"]
+    assignments = _assignments(structure)
+    assert assignments["dl-texts-11"]["associatedVisualCaption"] is True
+    assert assignments["dl-texts-12"]["associatedVisualCaption"] is False
+    assert assignments["dl-texts-13"]["associatedVisualCaption"] is False
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    rendered_figure = next(
+        visual for visual in semantic["visualObjects"] if visual["kind"] == "figure"
+    )
+    assert rendered_figure["caption"].endswith(continuation)
+    assert distant_internal_title not in rendered_figure["caption"]
+    assert panel_label not in rendered_figure["caption"]
+
+
+def test_orders_caption_by_geometry_recovers_superscript_and_rejects_tall_body() -> None:
+    document = sample_docling_document()
+    picture = document["pictures"][0]
+    picture["captions"] = []
+    picture["prov"] = [
+        _bottom_left_provenance(1, (0.10, 0.20, 0.80, 0.70))
+    ]
+
+    label = document["texts"][3]
+    label["orig"] = label["text"] = "Figure 23."
+    label["prov"] = [
+        _bottom_left_provenance(
+            1, (0.15, 0.695, 0.21, 0.705), text_length=len("Figure 23.")
+        )
+    ]
+
+    fragments = (
+        (11, "2", (0.70, 0.691, 0.71, 0.698), "#/pictures/0"),
+        (
+            12,
+            "Convolutional samples finetuned on",
+            (0.22, 0.695, 0.65, 0.705),
+            "#/body",
+        ),
+        (13, "512", (0.65, 0.695, 0.70, 0.705), "#/body"),
+        (14, "images.", (0.715, 0.695, 0.78, 0.705), "#/body"),
+        (
+            15,
+            "This is neighboring body prose. " * 30,
+            (0.01, 0.67, 0.14, 0.73),
+            "#/body",
+        ),
+    )
+    for index, text, bbox, parent in fragments:
+        document["texts"].append(
+            {
+                "self_ref": f"#/texts/{index}",
+                "parent": {"$ref": parent},
+                "label": "text",
+                "orig": text,
+                "text": text,
+                "prov": [
+                    _bottom_left_provenance(
+                        1, bbox, text_length=len(text)
+                    )
+                ],
+            }
+        )
+    picture["children"] = [{"$ref": "#/texts/11"}]
+    children = document["groups"][0]["children"]
+    caption_index = children.index({"$ref": "#/texts/3"})
+    children[caption_index + 1 : caption_index + 1] = [
+        {"$ref": "#/texts/12"},
+        {"$ref": "#/texts/13"},
+        {"$ref": "#/texts/14"},
+        {"$ref": "#/texts/15"},
+    ]
+
+    evidence, structure = docling_document_to_ir(document)
+    figure = next(
+        visual
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+        if visual["kind"] == "figure"
+    )
+
+    assert figure["captionBlockIds"] == [
+        "dl-texts-3",
+        "dl-texts-12",
+        "dl-texts-13",
+        "dl-texts-11",
+        "dl-texts-14",
+    ]
+    assert figure["bboxNormalized"][3] == pytest.approx(0.691)
+    assignments = _assignments(structure)
+    assert assignments["dl-texts-15"]["associatedVisualCaption"] is False
+    assert assignments["dl-texts-15"]["role"] == "paragraph"
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    rendered_figure = next(
+        visual for visual in semantic["visualObjects"] if visual["kind"] == "figure"
+    )
+    assert rendered_figure["caption"] == (
+        "Figure 23. Convolutional samples finetuned on 512² images."
+    )
 
 
 def test_suppresses_only_visual_segments_and_bbox_boundary_overlap() -> None:

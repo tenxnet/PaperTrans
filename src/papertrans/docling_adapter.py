@@ -987,6 +987,320 @@ def _object_label_kind(text: str) -> str | None:
     return "equation"
 
 
+def _align_visual_captions(
+    caption_records: list[dict[str, Any]],
+    visual_entries: list[dict[str, Any]],
+    explicit_caption_owners: dict[str, set[str]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Return a maximum-score, order-preserving caption/visual alignment.
+
+    Docling's body graph usually places each visual immediately before its
+    caption.  Purely greedy geometry can nevertheless shift a whole run of
+    tables when a caption is a few points closer to the next table.  Aligning
+    each page/kind sequence globally preserves that graph order while still
+    allowing unlabeled visuals and orphan captions to be skipped.
+
+    Explicit ownership is supporting evidence rather than a hard constraint:
+    some real documents attach Figure 6 to the Figure 7 picture.  A small bonus
+    repairs ambiguous table boundaries without overpowering a clear geometric
+    match.  An explicit same-page/same-kind edge is also retained as a guarded
+    fallback when Docling's crop already contains the caption.
+    """
+
+    grouped_captions: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for record in caption_records:
+        kind = _object_label_kind(record["text"])
+        if kind is not None:
+            grouped_captions.setdefault((record["pageNumber"], kind), []).append(
+                record
+            )
+    grouped_visuals: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for visual_entry in visual_entries:
+        grouped_visuals.setdefault(
+            (visual_entry["pageNumber"], visual_entry["kind"]), []
+        ).append(visual_entry)
+
+    aligned: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for group_key in sorted(set(grouped_captions) & set(grouped_visuals)):
+        captions = sorted(
+            grouped_captions[group_key],
+            key=lambda value: (int(value["order"]), int(value["segmentIndex"])),
+        )
+        visuals = sorted(
+            grouped_visuals[group_key], key=lambda value: int(value["order"])
+        )
+        edges: dict[tuple[int, int], tuple[float, int, int]] = {}
+        for caption_index, record in enumerate(captions):
+            caption_bbox = tuple(
+                float(value) for value in record["bboxNormalized"]
+            )
+            for visual_index, visual_entry in enumerate(visuals):
+                visual_bbox = tuple(
+                    float(value) for value in visual_entry["bboxNormalized"]
+                )
+                geometry_score = visual_caption_score(
+                    group_key[1], caption_bbox, visual_bbox
+                )
+                explicit = int(
+                    visual_entry["ref"]
+                    in explicit_caption_owners.get(record["ref"], set())
+                )
+                if geometry_score < 0 and not (
+                    explicit
+                    and _explicit_caption_fallback_plausible(
+                        caption_bbox, visual_bbox
+                    )
+                ):
+                    continue
+                record["visualCaptionCandidate"] = True
+                # Explicit fallback remains positive so an overlapping caption
+                # can complete an otherwise monotone run.  The 0.18 ownership
+                # bonus is smaller than the observed Figure 6 geometry margin.
+                utility = (geometry_score if geometry_score >= 0 else 2.25) + (
+                    0.18 if explicit else 0.0
+                )
+                order_distance = abs(
+                    int(record["order"]) - int(visual_entry["order"])
+                )
+                edges[(caption_index, visual_index)] = (
+                    utility,
+                    explicit,
+                    order_distance,
+                )
+
+        # Each state stores a lexicographic quality key and matched index pairs.
+        # Score dominates; then prefer more evidence, explicit support, and a
+        # shorter graph distance.  Skips carry zero cost.
+        empty_state: tuple[
+            tuple[float, int, int, int], tuple[tuple[int, int], ...]
+        ] = ((0.0, 0, 0, 0), ())
+        states = [
+            [empty_state for _visual in range(len(visuals) + 1)]
+            for _caption in range(len(captions) + 1)
+        ]
+        for caption_count in range(len(captions) + 1):
+            for visual_count in range(len(visuals) + 1):
+                if caption_count == 0 and visual_count == 0:
+                    continue
+                options: list[
+                    tuple[
+                        tuple[float, int, int, int],
+                        tuple[tuple[int, int], ...],
+                    ]
+                ] = []
+                if caption_count:
+                    options.append(states[caption_count - 1][visual_count])
+                if visual_count:
+                    options.append(states[caption_count][visual_count - 1])
+                edge = edges.get((caption_count - 1, visual_count - 1))
+                if caption_count and visual_count and edge is not None:
+                    previous_key, previous_pairs = states[caption_count - 1][
+                        visual_count - 1
+                    ]
+                    utility, explicit, order_distance = edge
+                    options.append(
+                        (
+                            (
+                                round(previous_key[0] + utility, 12),
+                                previous_key[1] + 1,
+                                previous_key[2] + explicit,
+                                previous_key[3] - order_distance,
+                            ),
+                            previous_pairs
+                            + ((caption_count - 1, visual_count - 1),),
+                        )
+                    )
+                states[caption_count][visual_count] = max(
+                    options, key=lambda value: value[0]
+                )
+        for caption_index, visual_index in states[-1][-1][1]:
+            aligned.append((captions[caption_index], visuals[visual_index]))
+    return aligned
+
+
+def _explicit_caption_fallback_plausible(
+    caption_bbox: tuple[float, float, float, float],
+    visual_bbox: tuple[float, float, float, float],
+) -> bool:
+    """Accept an explicit fallback only at an overlapping/near crop edge."""
+
+    horizontal_overlap = max(
+        0.0,
+        min(caption_bbox[2], visual_bbox[2])
+        - max(caption_bbox[0], visual_bbox[0]),
+    )
+    minimum_width = max(
+        1e-9,
+        min(
+            caption_bbox[2] - caption_bbox[0],
+            visual_bbox[2] - visual_bbox[0],
+        ),
+    )
+    if horizontal_overlap / minimum_width < 0.15:
+        return False
+    vertical_gap = max(
+        0.0,
+        max(caption_bbox[1], visual_bbox[1])
+        - min(caption_bbox[3], visual_bbox[3]),
+    )
+    if vertical_gap > 0.035:
+        return False
+    if vertical_gap > 0:
+        return True
+    boundary_distance = min(
+        abs(caption_bbox[1] - visual_bbox[1]),
+        abs(caption_bbox[1] - visual_bbox[3]),
+        abs(caption_bbox[3] - visual_bbox[1]),
+        abs(caption_bbox[3] - visual_bbox[3]),
+    )
+    return boundary_distance <= 0.035
+
+
+def _caption_same_line_vertical(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    left_bbox = left["bboxNormalized"]
+    right_bbox = right["bboxNormalized"]
+    overlap = max(
+        0.0, min(left_bbox[3], right_bbox[3]) - max(left_bbox[1], right_bbox[1])
+    )
+    minimum_height = max(
+        1e-9,
+        min(left_bbox[3] - left_bbox[1], right_bbox[3] - right_bbox[1]),
+    )
+    center_distance = abs(
+        (left_bbox[1] + left_bbox[3]) / 2
+        - (right_bbox[1] + right_bbox[3]) / 2
+    )
+    return overlap / minimum_height >= 0.35 and center_distance <= 0.012
+
+
+def _caption_line_groups(
+    records: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group fragments into visual text lines, then order each line by x."""
+
+    lines: list[list[dict[str, Any]]] = []
+    for record in sorted(
+        records,
+        key=lambda value: (
+            (value["bboxNormalized"][1] + value["bboxNormalized"][3]) / 2,
+            value["bboxNormalized"][0],
+            int(value["order"]),
+        ),
+    ):
+        matching_line = next(
+            (
+                line
+                for line in lines
+                if any(_caption_same_line_vertical(record, value) for value in line)
+            ),
+            None,
+        )
+        if matching_line is None:
+            lines.append([record])
+        else:
+            matching_line.append(record)
+    for line in lines:
+        line.sort(
+            key=lambda value: (
+                value["bboxNormalized"][0],
+                value["bboxNormalized"][1],
+                int(value["order"]),
+            )
+        )
+    lines.sort(
+        key=lambda line: (
+            min(value["bboxNormalized"][1] for value in line),
+            min(value["bboxNormalized"][0] for value in line),
+        )
+    )
+    return lines
+
+
+_SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _normalize_caption_superscripts(line: list[dict[str, Any]]) -> None:
+    """Recover only isolated, geometrically unambiguous superscript digits."""
+
+    for index in range(1, len(line) - 1):
+        record = line[index]
+        text = record["text"].strip()
+        if len(text) != 1 or text not in "0123456789":
+            continue
+        previous = line[index - 1]
+        following = line[index + 1]
+        if not previous["text"].rstrip()[-1:].isalnum() or not following[
+            "text"
+        ].lstrip()[:1].isalpha():
+            continue
+        bbox = record["bboxNormalized"]
+        previous_bbox = previous["bboxNormalized"]
+        following_bbox = following["bboxNormalized"]
+        horizontal_gap_before = max(0.0, bbox[0] - previous_bbox[2])
+        horizontal_gap_after = max(0.0, following_bbox[0] - bbox[2])
+        if horizontal_gap_before > 0.012 or horizontal_gap_after > 0.012:
+            continue
+        height = bbox[3] - bbox[1]
+        neighbor_height = min(
+            previous_bbox[3] - previous_bbox[1],
+            following_bbox[3] - following_bbox[1],
+        )
+        center = (bbox[1] + bbox[3]) / 2
+        neighbor_center = (
+            (previous_bbox[1] + previous_bbox[3]) / 2
+            + (following_bbox[1] + following_bbox[3]) / 2
+        ) / 2
+        if (
+            height > neighbor_height * 0.85
+            or neighbor_center - center < max(0.0015, neighbor_height * 0.18)
+        ):
+            continue
+        record["text"] = text.translate(_SUPERSCRIPT_DIGITS)
+        record["warnings"].append(
+            "An isolated elevated caption digit was normalized to its Unicode superscript form."
+        )
+
+
+def _caption_fragment_connected(
+    candidate: dict[str, Any], existing: dict[str, Any]
+) -> bool:
+    candidate_bbox = candidate["bboxNormalized"]
+    existing_bbox = existing["bboxNormalized"]
+    horizontal_gap = max(
+        0.0,
+        max(candidate_bbox[0], existing_bbox[0])
+        - min(candidate_bbox[2], existing_bbox[2]),
+    )
+    vertical_gap = max(
+        0.0,
+        max(candidate_bbox[1], existing_bbox[1])
+        - min(candidate_bbox[3], existing_bbox[3]),
+    )
+    horizontal_overlap = max(
+        0.0,
+        min(candidate_bbox[2], existing_bbox[2])
+        - max(candidate_bbox[0], existing_bbox[0]),
+    )
+    minimum_width = max(
+        1e-9,
+        min(
+            candidate_bbox[2] - candidate_bbox[0],
+            existing_bbox[2] - existing_bbox[0],
+        ),
+    )
+    return vertical_gap <= 0.035 and (
+        horizontal_gap <= 0.035 or horizontal_overlap / minimum_width >= 0.15
+    )
+
+
+def _rectangle_intersection_area(left: list[float], right: list[float]) -> float:
+    return max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
+        0.0, min(left[3], right[3]) - max(left[1], right[1])
+    )
+
+
 def _source_name(document: Mapping[str, Any], source_file: str | Path | None) -> str:
     if source_file is not None:
         return Path(source_file).name
@@ -1482,37 +1796,6 @@ def docling_document_to_ir(
         return not remainder or remainder[0] in ":.-–—"
 
     caption_records = [record for record in records if is_caption_record(record)]
-    caption_edges: list[tuple[float, int, int, dict[str, Any], dict[str, Any]]] = []
-    for record in caption_records:
-        caption_kind = _object_label_kind(record["text"])
-        assert caption_kind is not None
-        for visual_entry in visual_entries:
-            if (
-                visual_entry["pageNumber"] != record["pageNumber"]
-                or visual_entry["kind"] != caption_kind
-            ):
-                continue
-            score = visual_caption_score(
-                caption_kind,
-                tuple(float(value) for value in record["bboxNormalized"]),
-                tuple(float(value) for value in visual_entry["bboxNormalized"]),
-            )
-            if score < 0:
-                continue
-            record["visualCaptionCandidate"] = True
-            explicit_match = int(
-                visual_entry["ref"] in explicit_caption_owners.get(record["ref"], set())
-            )
-            caption_edges.append(
-                (
-                    score,
-                    explicit_match,
-                    -abs(int(record["order"]) - int(visual_entry["order"])),
-                    record,
-                    visual_entry,
-                )
-            )
-
     assigned_caption_records: dict[str, list[dict[str, Any]]] = {
         visual_entry["ref"]: [] for visual_entry in visual_entries
     }
@@ -1548,34 +1831,10 @@ def docling_document_to_ir(
                         {"captionRef": record["ref"], "visualRef": visual_ref}
                     )
 
-    caption_edges.sort(key=lambda value: value[:3], reverse=True)
-    for _score, _explicit, _order_distance, record, visual_entry in caption_edges:
-        if (
-            record["blockId"] in claimed_caption_blocks
-            or visual_entry["ref"] in claimed_caption_visuals
-        ):
-            continue
+    for record, visual_entry in _align_visual_captions(
+        caption_records, visual_entries, explicit_caption_owners
+    ):
         assign_caption(record, visual_entry, primary=True)
-
-    for record in caption_records:
-        if record["blockId"] in claimed_caption_blocks:
-            continue
-        caption_kind = _object_label_kind(record["text"])
-        explicit_entries = [
-            visual_entry
-            for visual_entry in visual_entries
-            if visual_entry["ref"] in explicit_caption_owners.get(record["ref"], set())
-            and visual_entry["pageNumber"] == record["pageNumber"]
-            and visual_entry["kind"] == caption_kind
-            and visual_entry["ref"] not in claimed_caption_visuals
-        ]
-        if explicit_entries:
-            record["visualCaptionCandidate"] = True
-            explicit_entry = min(
-                explicit_entries,
-                key=lambda value: abs(int(record["order"]) - int(value["order"])),
-            )
-            assign_caption(record, explicit_entry, primary=True)
 
     for visual_entry in visual_entries:
         visual_ref = visual_entry["ref"]
@@ -1612,29 +1871,71 @@ def docling_document_to_ir(
             ranked_fallbacks[0][1]["visualCaptionCandidate"] = True
             assign_caption(ranked_fallbacks[0][1], visual_entry, primary=True)
 
+    # A primary label may be outside the visual graph while later caption lines
+    # are explicit children.  Attach only caption-labeled, same-owner fragments
+    # that form a short geometric chain from the primary caption.  This retains
+    # multiline captions without pulling in unrelated text elsewhere in a large
+    # picture (for example an internal title at the opposite visual boundary).
+    for visual_entry in visual_entries:
+        visual_ref = visual_entry["ref"]
+        line_records = list(assigned_caption_records[visual_ref])
+        if not line_records:
+            continue
+        explicit_records = list(
+            dict.fromkeys(
+                record["blockId"]
+                for caption_ref in visual_entry["explicitCaptionRefs"]
+                for block_id in ref_to_block_ids.get(caption_ref, [])
+                if (record := block_by_id[block_id])["pageNumber"]
+                == visual_entry["pageNumber"]
+                and record["collection"] == "texts"
+                and _label(record["item"]) == "caption"
+                and _object_label_kind(record["text"]) is None
+                and not re.match(r"^\s*\([a-z]\)\s+", record["text"], re.IGNORECASE)
+            )
+        )
+        candidates = [block_by_id[block_id] for block_id in explicit_records]
+        changed = True
+        while changed:
+            changed = False
+            for record in candidates:
+                if (
+                    record["blockId"] in claimed_caption_blocks
+                    or record["furniture"]
+                    or not record["bboxValid"]
+                    or not any(
+                        _caption_fragment_connected(record, value)
+                        for value in line_records
+                    )
+                ):
+                    continue
+                if any(
+                    _rectangle_intersection_area(
+                        record["bboxNormalized"], existing["bboxNormalized"]
+                    )
+                    > 0
+                    and not _caption_same_line_vertical(record, existing)
+                    and len(record["text"]) >= 40
+                    and len(existing["text"]) >= 40
+                    for existing in line_records
+                ):
+                    visual_entry["warnings"].append(
+                        "Overlapping multiline caption fragments require source-PDF "
+                        "line refinement to recover exact interleaving."
+                    )
+                record["visualCaptionCandidate"] = True
+                assign_caption(record, visual_entry, primary=False)
+                line_records.append(record)
+                changed = True
+
     def shares_caption_line(left: dict[str, Any], right: dict[str, Any]) -> bool:
         left_bbox = left["bboxNormalized"]
         right_bbox = right["bboxNormalized"]
-        overlap = max(
-            0.0, min(left_bbox[3], right_bbox[3]) - max(left_bbox[1], right_bbox[1])
-        )
-        minimum_height = max(
-            1e-9,
-            min(left_bbox[3] - left_bbox[1], right_bbox[3] - right_bbox[1]),
-        )
         horizontal_gap = max(
             0.0,
             max(left_bbox[0], right_bbox[0]) - min(left_bbox[2], right_bbox[2]),
         )
-        center_distance = abs(
-            (left_bbox[1] + left_bbox[3]) / 2
-            - (right_bbox[1] + right_bbox[3]) / 2
-        )
-        return (
-            overlap / minimum_height >= 0.5
-            and center_distance <= 0.008
-            and horizontal_gap <= 0.02
-        )
+        return _caption_same_line_vertical(left, right) and horizontal_gap <= 0.02
 
     for visual_entry in visual_entries:
         visual_ref = visual_entry["ref"]
@@ -1645,12 +1946,25 @@ def docling_document_to_ir(
         while changed:
             changed = False
             for record in page_records[visual_entry["pageNumber"]]:
+                reference_height = max(
+                    value["bboxNormalized"][3] - value["bboxNormalized"][1]
+                    for value in line_records
+                )
+                record_height = (
+                    record["bboxNormalized"][3] - record["bboxNormalized"][1]
+                )
+                maximum_text_length = max(
+                    320, sum(len(value["text"]) for value in line_records) * 2
+                )
                 if (
                     record["blockId"] in claimed_caption_blocks
                     or record["furniture"]
                     or record["collection"] != "texts"
+                    or not record["bboxValid"]
                     or _object_label_kind(record["text"]) is not None
                     or abs(int(record["order"]) - int(line_records[0]["order"])) > 12
+                    or record_height > max(0.04, reference_height * 1.35)
+                    or len(record["text"]) > maximum_text_length
                     or not any(shares_caption_line(record, value) for value in line_records)
                 ):
                     continue
@@ -1691,6 +2005,61 @@ def docling_document_to_ir(
                     max(visual_bbox[3], record_bbox[3]),
                 ]
 
+        caption_lines = _caption_line_groups(
+            assigned_caption_records[visual_ref]
+        )
+        for line in caption_lines:
+            _normalize_caption_superscripts(line)
+        caption_values = [record for line in caption_lines for record in line]
+
+        # If Docling's visual boundary only nicks an external caption, clip the
+        # crop back to that boundary.  Requiring horizontal support, a <= 0.02
+        # overlap, and extension to the outside edge avoids cutting labels that
+        # genuinely belong inside a diagram.
+        for caption_record in caption_values:
+            caption_bbox = caption_record["bboxNormalized"]
+            horizontal_overlap = max(
+                0.0,
+                min(visual_bbox[2], caption_bbox[2])
+                - max(visual_bbox[0], caption_bbox[0]),
+            )
+            minimum_width = max(
+                1e-9,
+                min(
+                    visual_bbox[2] - visual_bbox[0],
+                    caption_bbox[2] - caption_bbox[0],
+                ),
+            )
+            if horizontal_overlap / minimum_width < 0.25:
+                continue
+            visual_midpoint = (visual_bbox[1] + visual_bbox[3]) / 2
+            caption_midpoint = (caption_bbox[1] + caption_bbox[3]) / 2
+            bottom_overlap = visual_bbox[3] - caption_bbox[1]
+            top_overlap = caption_bbox[3] - visual_bbox[1]
+            clipped = False
+            if (
+                caption_midpoint >= visual_midpoint
+                and 0 < bottom_overlap <= 0.02
+                and caption_bbox[3] >= visual_bbox[3] - 0.002
+                and caption_bbox[1] > visual_bbox[1] + 0.005
+            ):
+                visual_bbox[3] = caption_bbox[1]
+                clipped = True
+            elif (
+                caption_midpoint <= visual_midpoint
+                and 0 < top_overlap <= 0.02
+                and caption_bbox[1] <= visual_bbox[1] + 0.002
+                and caption_bbox[3] < visual_bbox[3] - 0.005
+            ):
+                visual_bbox[1] = caption_bbox[3]
+                clipped = True
+            if clipped:
+                warning = (
+                    "Visual crop was clipped at a minimally overlapping external caption boundary."
+                )
+                if warning not in visual_entry["warnings"]:
+                    visual_entry["warnings"].append(warning)
+
         same_page_candidates = [
             record
             for record in records
@@ -1726,10 +2095,6 @@ def docling_document_to_ir(
                 if values
             ),
             None,
-        )
-        caption_values = sorted(
-            assigned_caption_records[visual_ref],
-            key=lambda value: (value["order"], value["segmentIndex"]),
         )
         visuals_by_page[page_number].append(
             {
