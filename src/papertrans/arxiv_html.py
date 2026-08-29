@@ -673,6 +673,7 @@ def _translation_command(
         str(repo_root),
         "exec",
         "--ephemeral",
+        "--json",
         "--sandbox",
         "read-only",
         "-m",
@@ -690,6 +691,46 @@ def _translation_command(
             "schema-conforming JSON."
         ),
     ]
+
+
+TOKEN_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _empty_token_usage() -> dict[str, int]:
+    return {field: 0 for field in (*TOKEN_USAGE_FIELDS, "total_tokens")}
+
+
+def _add_token_usage(total: dict[str, int], usage: dict[str, Any]) -> None:
+    for field in TOKEN_USAGE_FIELDS:
+        total[field] += int(usage.get(field, 0) or 0)
+    total["total_tokens"] = total["input_tokens"] + total["output_tokens"]
+
+
+def _parse_codex_jsonl(stdout: str) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    final_text: str | None = None
+    usage = _empty_token_usage()
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                final_text = item["text"]
+        elif event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+            _add_token_usage(usage, event["usage"])
+    result = _parse_result(final_text) if final_text is not None else None
+    return result, usage
 
 
 def _validate_translations(units: list[dict[str, Any]], result: dict[str, Any]) -> None:
@@ -737,6 +778,7 @@ def _translate_html_chunk(
     cache_hit = False
     model_calls = 0
     retries_used = 0
+    token_usage = _empty_token_usage()
     if cache_path.exists():
         try:
             result = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -766,9 +808,13 @@ def _translate_html_chunk(
                     check=False,
                     timeout=900,
                 )
+                parsed_result, call_usage = _parse_codex_jsonl(process.stdout)
+                _add_token_usage(token_usage, call_usage)
                 if process.returncode != 0:
                     raise RuntimeError(process.stderr.strip()[-4000:] or f"Codex exited with {process.returncode}")
-                result = _parse_result(process.stdout)
+                if parsed_result is None:
+                    raise RuntimeError("Codex JSONL did not contain a final agent message")
+                result = parsed_result
                 _validate_translations(units, result)
                 temporary = cache_path.with_suffix(".json.tmp")
                 temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -788,6 +834,7 @@ def _translate_html_chunk(
         "result": result,
         "cacheHit": cache_hit,
         "modelCalls": model_calls,
+        "tokenUsage": token_usage,
         "retries": retries_used,
         "durationSeconds": round(perf_counter() - started, 3),
         "characters": sum(len(unit["translationSource"]) for unit in units),
@@ -861,6 +908,10 @@ def translate_arxiv_html_document(
             "workers": workers,
             "chunks": len(chunks),
             "modelCalls": sum(item["modelCalls"] for item in chunk_metrics),
+            "tokenUsage": {
+                field: sum(item["tokenUsage"][field] for item in chunk_metrics)
+                for field in (*TOKEN_USAGE_FIELDS, "total_tokens")
+            },
             "cacheHits": sum(1 for item in chunk_metrics if item["cacheHit"]),
             "retries": sum(item["retries"] for item in chunk_metrics),
             "translatedUnits": sum(item["unitCount"] for item in chunk_metrics),

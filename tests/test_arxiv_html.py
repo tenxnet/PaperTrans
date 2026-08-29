@@ -6,6 +6,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from papertrans.arxiv_html import (
+    _parse_codex_jsonl,
     _section_chunks,
     _tokenize_node,
     _validate_rendered_html,
@@ -110,6 +111,45 @@ def test_chunks_split_only_sections_that_exceed_the_budget():
     ]
     chunks = _section_chunks(units, 20)
     assert [[unit["sectionId"] for unit in chunk] for chunk in chunks] == [["S1"], ["S1", "S2"]]
+
+
+def test_parses_codex_jsonl_result_and_token_usage():
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": '{"translations": []}',
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 25,
+                        "cache_write_input_tokens": 5,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 7,
+                    },
+                }
+            ),
+        ]
+    )
+    result, usage = _parse_codex_jsonl(stdout)
+    assert result == {"translations": []}
+    assert usage == {
+        "input_tokens": 100,
+        "cached_input_tokens": 25,
+        "cache_write_input_tokens": 5,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 7,
+        "total_tokens": 120,
+    }
 
 
 def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
