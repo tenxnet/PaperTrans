@@ -11,7 +11,8 @@
 - `.agents/skills/academic-paper-translator/`のSkillを指定してCodex CLIで節単位翻訳
 - blockId、引用、DOI、保護語、翻訳量を検査し、失敗したチャンクだけ再試行
 - 日本語本文、章・段落単位の原文、警告、原文PDFを含むオフラインHTML/ZIP生成
-- Next.js画面で生成HTMLを閲覧し、追加PDFの取込とバックグラウンド翻訳を開始
+- Next.jsのローカルライブラリで翻訳済み論文、進捗、QA、タグを一覧管理
+- タイトル・arXiv ID・タグの検索、状態フィルター、Offline ZIP取得、アプリ内HTML閲覧
 
 ## セットアップ
 
@@ -63,6 +64,17 @@ pnpm dev
 
 `http://127.0.0.1:3000`を開きます。ポートが使用中なら`pnpm dev --port 3100`のように変更できます。
 
+Webアプリは`output/*/work/chatgpt-job.json`を自動検出するため、既存のChatGPT翻訳ジョブは追加操作なしでライブラリへ表示されます。論文を選ぶと、次の情報と操作を1画面で利用できます。
+
+- 翻訳チャンクの進捗と完了状態
+- 図、表、数式、参考文献の構造QA
+- 翻訳HTMLの埋め込み閲覧と別タブ表示
+- Offline ZIPのダウンロード
+- ローカルタグの追加・削除とタグ絞り込み
+- arXiv原文へのリンク
+
+タグは`data/library.json`へ保存され、論文、翻訳、タグはいずれもGitへ追加されません。V1のUIは公式arXiv HTML経路を対象にしており、PDF取込APIとPDFパイプラインは実験機能です。
+
 ## ChatGPTを翻訳ワーカーとして使う（実験機能）
 
 PaperTransをMCPサーバーとして起動すると、ChatGPTは章単位の翻訳だけを担当し、PaperTransが取得、ジョブ状態、保護トークン検査、HTML/ZIP生成、視覚要素QAを管理します。ローカルのCodex SkillはChatGPTへ直接読み込ませず、同じ重要規則をMCPサーバーの指示と各ツールのスキーマで強制します。
@@ -86,6 +98,8 @@ uv sync --extra chatgpt --extra test
 途中で会話が止まっても、`list_translation_jobs`と`get_translation_status`から再開できます。状態は`output/<job-id>/work/chatgpt-job.json`、チャンク成果は`work/chatgpt-translations/`、完成物は`html/index.html`と`<job-id>-html.zip`へ保存されます。Webアプリをポート3100で動かしている場合、完成HTMLは`http://127.0.0.1:3100/api/artifacts/<job-id>/index.html`から閲覧できます。
 
 ChatGPT会話のトークン使用量はローカルMCPサーバーへ通知されないため、PaperTrans側では取得できません。PaperTransが記録するのはチャンク数、文字数、状態、時刻、成果物、QA結果です。
+
+Webアプリの「新しい翻訳」から、arXiv IDを含むChatGPT向け依頼文をコピーできます。翻訳中のジョブがある場合、ライブラリ画面は進捗を定期的に再読込します。
 
 ## 検証
 
