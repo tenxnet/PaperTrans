@@ -2,7 +2,7 @@
 
 [日本語](README.md) | English
 
-> **Pre-release preview (v0.1)** — The supported v1 input is official arXiv HTML. The ChatGPT MCP worker and PDF processing remain experimental.
+> **Pre-release preview (v0.1)** — The supported v1 path prepares official arXiv HTML through the local MCP server and uses a connected MCP client to translate it into Japanese. PDF processing and the Codex CLI path remain experimental.
 
 PaperTrans is a local-first academic paper translation workspace. It translates prose into Japanese while preserving document structure, MathML equations, figures, tables, citations, cross-references, identifiers, and bibliography entries.
 
@@ -11,7 +11,7 @@ PaperTrans is a local-first academic paper translation workspace. It translates 
 - Acquire and sanitize official arXiv HTML from an arXiv ID.
 - Split only translatable prose into stable semantic units.
 - Preserve equations, figures, tables, citation links, DOIs, and protected terms.
-- Translate with Codex CLI or the experimental ChatGPT Connector.
+- Use a connected MCP client as the translation worker.
 - Validate block identity and protected tokens before rendering.
 - Manage search, tags, unread state, and favorites in a local library.
 - Read papers inside the app with a navigable section outline.
@@ -71,13 +71,15 @@ The Web UI manages MCP status, job preparation, progress, and artifacts. Model s
 - Bind the web app and MCP server to `127.0.0.1`.
 - Never expose the unauthenticated MCP server directly to the public internet.
 - You are responsible for checking the source paper's license and applicable law before using or sharing a translation.
-- Generated translations and structural QA can be wrong. Verify important claims and citations against the source paper.
+- Outputs are AI/MCP-generated machine translations. Translation and structural QA can be wrong, so always verify the source paper before research use or citation.
+- To avoid unnecessary load on arXiv, acquire one paper at a time and leave a reasonable interval between consecutive requests. Reuse an already prepared job for the same paper.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
 - [MCP translation server](docs/mcp-server.md)
 - [Experimental PDF pipeline](docs/pdf-pipeline.md)
+- [Dependency license audit](docs/dependency-licenses.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)
 - [OSS release checklist](docs/oss-release-checklist.md)
