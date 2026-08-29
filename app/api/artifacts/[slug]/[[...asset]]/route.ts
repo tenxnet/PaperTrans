@@ -16,11 +16,11 @@ const TYPES: Record<string, string> = {
 };
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ slug: string; asset?: string[] }> },
 ) {
   const { slug, asset } = await context.params;
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(slug)) {
     return NextResponse.json({ error: "invalid slug" }, { status: 400 });
   }
   const publicationRoot = path.resolve(process.cwd(), "output", slug, "html");
@@ -31,7 +31,15 @@ export async function GET(
   try {
     if (!(await stat(requested)).isFile()) throw new Error("not a file");
     const body = await readFile(requested);
-    return new NextResponse(body, {
+    const isEmbeddedHtml = path.extname(requested).toLowerCase() === ".html"
+      && new URL(request.url).searchParams.get("embed") === "1";
+    const responseBody = isEmbeddedHtml
+      ? body.toString("utf8").replace(
+        "</head>",
+        "<style data-papertrans-embed>.ptx-topbar{display:none!important}html{scroll-padding-top:20px!important}.ptx-shell{padding-top:20px!important}</style></head>",
+      )
+      : body;
+    return new NextResponse(responseBody, {
       headers: {
         "content-type": TYPES[path.extname(requested).toLowerCase()] ?? "application/octet-stream",
         "cache-control": "no-store",
