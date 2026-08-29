@@ -209,4 +209,10 @@ def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
     assert qa["status"] == "passed"
     assert len([math for math in rendered.find_all("math") if not math.find_parent("details")]) == 1
     assert rendered.find("a", href="#bib.b1") is not None
+    layout_css = rendered.style.get_text() if rendered.style is not None else ""
+    assert "grid-template-columns:minmax(0,1fr)" in layout_css
+    assert ".ptx-main .ltx_table{max-width:100%;overflow-x:auto" in layout_css
+    assert ".ptx-main .ltx_equationgroup" in layout_css
+    assert "@media(max-width:1200px)" in layout_css
+    assert "width:max-content;min-width:100%" not in layout_css
     assert json.loads((output / "qa.json").read_text())["status"] == "passed"
