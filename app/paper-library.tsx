@@ -20,7 +20,7 @@ import {
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { PaperStatus, PaperSummary } from "@/lib/paper-library";
 
-type Filter = "all" | "completed" | "active" | "review";
+type Filter = "all" | "active" | "review";
 type Sort = "updated" | "title" | "arxiv";
 
 const STATUS_LABEL: Record<PaperStatus, string> = {
@@ -80,7 +80,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const selected = papers.find((paper) => paper.slug === selectedSlug) ?? null;
   const counts = useMemo(() => ({
     all: papers.length,
-    completed: papers.filter((paper) => paper.status === "completed").length,
     active: papers.filter(isActive).length,
     review: papers.filter(needsReview).length,
   }), [papers]);
@@ -97,7 +96,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     const needle = query.trim().toLocaleLowerCase("ja");
     return papers
       .filter((paper) => {
-        if (filter === "completed" && paper.status !== "completed") return false;
         if (filter === "active" && !isActive(paper)) return false;
         if (filter === "review" && !needsReview(paper)) return false;
         if (tagFilter && !paper.tags.includes(tagFilter)) return false;
@@ -214,16 +212,25 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
           <button className={filter === "all" && !tagFilter ? "nav-item active" : "nav-item"} onClick={() => setNavigation("all")}>
             <FileText aria-hidden="true" /><span>すべての論文</span><b>{counts.all}</b>
           </button>
-          <button className={filter === "completed" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("completed")}>
-            <CheckCircle aria-hidden="true" /><span>翻訳完了</span><b>{counts.completed}</b>
-          </button>
           <button className={filter === "active" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("active")}>
             <SpinnerGap aria-hidden="true" /><span>翻訳中</span><b>{counts.active}</b>
           </button>
-          <button className={filter === "review" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("review")}>
-            <WarningCircle aria-hidden="true" /><span>要確認</span><b>{counts.review}</b>
-          </button>
         </nav>
+
+        {counts.review > 0 && (
+          <section className="sidebar-notices" aria-label="お知らせ">
+            <p className="nav-heading">お知らせ</p>
+            <button
+              className={filter === "review" ? "review-notice active" : "review-notice"}
+              type="button"
+              onClick={() => setNavigation("review")}
+            >
+              <WarningCircle weight="fill" aria-hidden="true" />
+              <span><strong>確認が必要です</strong><small>{counts.review}件の論文に問題があります</small></span>
+              <b>{counts.review}</b>
+            </button>
+          </section>
+        )}
 
         <div className="tag-nav">
           <p className="nav-heading"><span>タグ</span><Tag aria-hidden="true" /></p>
@@ -356,7 +363,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <div className="library-heading">
               <div>
                 <p className="eyebrow">LOCAL PAPER LIBRARY</p>
-                <h1>{tagFilter ? `# ${tagFilter}` : filter === "all" ? "論文ライブラリ" : STATUS_LABEL[filter === "active" ? "translating" : filter === "review" ? "needs_review" : "completed"]}</h1>
+                <h1>{tagFilter ? `# ${tagFilter}` : filter === "active" ? "翻訳中" : filter === "review" ? "要確認" : "論文ライブラリ"}</h1>
                 <p>{visiblePapers.length}件の論文を表示しています</p>
               </div>
               <label className="sort-control"><FunnelSimple aria-hidden="true" /><span>並べ替え</span>

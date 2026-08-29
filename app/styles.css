@@ -49,6 +49,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .nav-item span, .tag-filter span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .nav-item b, .tag-filter b { color: var(--faint); font-size: 11px; font-weight: 500; }
 .nav-item.active b, .tag-filter.active b { color: var(--blue); }
+.sidebar-notices { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.review-notice { width: 100%; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 10px 9px; color: var(--amber); text-align: left; background: var(--amber-soft); border: 1px solid #efd7ad; border-radius: 7px; cursor: pointer; }
+.review-notice:hover, .review-notice.active { color: #825015; background: #ffedce; border-color: #dfbd80; }
+.review-notice > svg { width: 17px; height: 17px; }
+.review-notice > span { display: grid; gap: 2px; min-width: 0; }
+.review-notice strong { color: currentColor; font-size: 12px; font-weight: 650; }
+.review-notice small { overflow: hidden; color: #8b6a3e; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.review-notice b { min-width: 18px; color: currentColor; font-size: 11px; text-align: right; }
 .tag-nav { padding: 16px 0; }
 .tag-filter { grid-template-columns: minmax(0, 1fr) auto; min-height: 32px; padding-left: 13px; }
 .tag-filter span::before { content: ""; display: inline-block; width: 5px; height: 5px; margin: 0 9px 2px 0; border: 1px solid currentColor; border-radius: 50%; }
@@ -187,7 +195,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .app-shell { display: block; }
   .sidebar { position: static; width: 100%; height: auto; padding: 12px 14px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 12px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding: 0; font-size: 18px; }
-  .request-card, .tag-nav, .sidebar-footer { display: none; }
+  .request-card, .sidebar-notices, .tag-nav, .sidebar-footer { display: none; }
   .sidebar nav { display: flex; justify-content: flex-end; gap: 3px; padding: 0; border: 0; }
   .nav-heading, .nav-item svg, .nav-item b { display: none; }
   .nav-item { width: auto; min-height: 32px; display: block; padding: 7px 9px; }
