@@ -83,6 +83,61 @@ def _sanitize_tree(root: Tag) -> None:
             del tag.attrs["href"]
 
 
+def _citation_metadata(soup: BeautifulSoup) -> dict[str, Any]:
+    authors: list[str] = []
+    published_at: str | None = None
+    date_names = {
+        "citation_date",
+        "citation_publication_date",
+        "citation_online_date",
+        "dc.date",
+    }
+    for meta in soup.find_all("meta"):
+        name = str(meta.get("name", "")).strip().lower()
+        content = str(meta.get("content", "")).strip()
+        if not content:
+            continue
+        if name == "citation_author" and content not in authors:
+            authors.append(content)
+        elif published_at is None and name in date_names:
+            published_at = content
+
+    if not authors:
+        for person in soup.select(".ltx_authors .ltx_personname"):
+            styled_names = [
+                node.get_text(" ", strip=True)
+                for node in person.select(":scope > .ltx_text")
+            ]
+            candidates = styled_names or [
+                " ".join(
+                    str(child).strip()
+                    for child in person.children
+                    if isinstance(child, NavigableString) and str(child).strip()
+                )
+            ]
+            for candidate in candidates:
+                if not candidate or candidate.startswith("["):
+                    continue
+                candidate = re.sub(
+                    r"(?<=[a-zà-öø-ÿ])(?=[A-ZÀ-ÖØ-Þ])", ",", candidate
+                )
+                names = [value.strip() for value in candidate.split(",")]
+                for name in names:
+                    if name and name not in authors:
+                        authors.append(name)
+
+    if published_at is None:
+        watermark = soup.find(id="watermark-tr")
+        if watermark is not None:
+            date_match = re.search(
+                r"\b(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})\b",
+                watermark.get_text(" ", strip=True),
+            )
+            if date_match:
+                published_at = date_match.group(1)
+    return {"authors": authors, "publishedAt": published_at}
+
+
 def _safe_asset_name(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     basename = Path(parsed.path).name or "asset"
@@ -371,6 +426,7 @@ def acquire_official_arxiv_html(
     _sanitize_tree(article)
     resolved = _find_resolved_id(soup, requested)
     title = article.find("h1", class_="ltx_title_document")
+    citation_metadata = _citation_metadata(soup)
     section_count = len(article.find_all("section"))
     paragraph_count = len(article.find_all("p", class_="ltx_p"))
     figure_count = len(article.find_all("figure", class_="ltx_figure"))
@@ -457,6 +513,7 @@ def acquire_official_arxiv_html(
         "license": (soup.find(id="license-tr") or {}).get_text(" ", strip=True)
         if soup.find(id="license-tr")
         else None,
+        "metadata": citation_metadata,
         "validation": {
             "status": validation,
             "title": title.get_text(" ", strip=True) if title else "",

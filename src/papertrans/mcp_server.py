@@ -29,6 +29,8 @@ class PaperInfo(BaseModel):
     resolvedArxivId: str
     title: str
     sourceUrl: str
+    authors: list[str] = Field(default_factory=list)
+    publishedAt: str | None = None
 
 
 class ChunkProgress(BaseModel):

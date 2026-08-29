@@ -7,12 +7,12 @@ import {
   CheckCircle,
   ChatCircleDots,
   ClockCounterClockwise,
-  DownloadSimple,
   FileText,
   FunnelSimple,
   MagnifyingGlass,
   Plus,
   SpinnerGap,
+  Star,
   Tag,
   WarningCircle,
   X,
@@ -20,8 +20,9 @@ import {
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { PaperStatus, PaperSummary } from "@/lib/paper-library";
 
-type Filter = "all" | "active" | "review";
-type Sort = "updated" | "title" | "arxiv";
+type Filter = "all" | "active" | "review" | "unread" | "favorites";
+type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
+type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
 
 const STATUS_LABEL: Record<PaperStatus, string> = {
   prepared: "準備済み",
@@ -50,6 +51,20 @@ function formatDate(value: string) {
   }).format(date);
 }
 
+function formatPaperDate(value: string | null) {
+  if (!value) return "—";
+  return new Intl.DateTimeFormat("ja-JP", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(new Date(value));
+}
+
+function authorLabel(paper: PaperSummary) {
+  if (!paper.authors.length) return "著者情報なし";
+  return paper.authors.length > 1 ? `${paper.authors[0]} ほか` : paper.authors[0];
+}
+
 function progressPercent(paper: PaperSummary) {
   if (!paper.progress.total) return paper.status === "completed" ? 100 : 0;
   return Math.round((paper.progress.completed / paper.progress.total) * 100);
@@ -71,7 +86,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [sort, setSort] = useState<Sort>("updated");
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [tagDraft, setTagDraft] = useState("");
-  const [tagSaving, setTagSaving] = useState(false);
+  const [librarySaving, setLibrarySaving] = useState(false);
   const [notice, setNotice] = useState("");
   const [showRequest, setShowRequest] = useState(false);
   const [arxivDraft, setArxivDraft] = useState("");
@@ -82,6 +97,8 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     all: papers.length,
     active: papers.filter(isActive).length,
     review: papers.filter(needsReview).length,
+    unread: papers.filter((paper) => !paper.isRead).length,
+    favorites: papers.filter((paper) => paper.favorite).length,
   }), [papers]);
 
   const tags = useMemo(() => {
@@ -98,14 +115,19 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       .filter((paper) => {
         if (filter === "active" && !isActive(paper)) return false;
         if (filter === "review" && !needsReview(paper)) return false;
+        if (filter === "unread" && paper.isRead) return false;
+        if (filter === "favorites" && !paper.favorite) return false;
         if (tagFilter && !paper.tags.includes(tagFilter)) return false;
         if (!needle) return true;
-        return [paper.title, paper.requestedArxivId, paper.resolvedArxivId, ...paper.tags]
+        return [paper.title, ...paper.authors, paper.requestedArxivId, paper.resolvedArxivId, ...paper.tags]
           .some((value) => value.toLocaleLowerCase("ja").includes(needle));
       })
       .sort((a, b) => {
         if (sort === "title") return a.title.localeCompare(b.title, "en");
-        if (sort === "arxiv") return b.resolvedArxivId.localeCompare(a.resolvedArxivId, "en");
+        if (sort === "author") return authorLabel(a).localeCompare(authorLabel(b), "en");
+        if (sort === "tag") return (a.tags[0] ?? "\uffff").localeCompare(b.tags[0] ?? "\uffff", "ja");
+        if (sort === "added") return Date.parse(b.createdAt) - Date.parse(a.createdAt);
+        if (sort === "published") return Date.parse(b.publishedAt ?? "1970-01-01") - Date.parse(a.publishedAt ?? "1970-01-01");
         return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
       });
   }, [papers, query, filter, tagFilter, sort]);
@@ -143,26 +165,44 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selectedSlug, showRequest]);
 
-  async function persistTags(slug: string, nextTags: string[]) {
-    setTagSaving(true);
-    setNotice("");
+  async function persistLibraryState(
+    slug: string,
+    patch: LibraryPatch,
+    successMessage: string,
+    silent = false,
+  ) {
+    setLibrarySaving(true);
+    if (!silent) setNotice("");
     try {
-      const response = await fetch(`/api/papers/${encodeURIComponent(slug)}/tags`, {
+      const response = await fetch(`/api/papers/${encodeURIComponent(slug)}/library`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ tags: nextTags }),
+        body: JSON.stringify(patch),
       });
-      const body = (await response.json()) as { tags?: string[]; error?: string };
-      if (!response.ok || !body.tags) throw new Error(body.error ?? "タグを保存できませんでした");
+      const body = (await response.json()) as {
+        tags?: string[];
+        isRead?: boolean;
+        favorite?: boolean;
+        error?: string;
+      };
+      if (!response.ok || !body.tags || typeof body.isRead !== "boolean" || typeof body.favorite !== "boolean") {
+        throw new Error(body.error ?? "ライブラリ情報を保存できませんでした");
+      }
       setPapers((current) => current.map((paper) => (
-        paper.slug === slug ? { ...paper, tags: body.tags ?? [] } : paper
+        paper.slug === slug
+          ? { ...paper, tags: body.tags ?? [], isRead: body.isRead ?? false, favorite: body.favorite ?? false }
+          : paper
       )));
-      setNotice("タグを保存しました");
+      if (!silent) setNotice(successMessage);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "タグを保存できませんでした");
+      setNotice(error instanceof Error ? error.message : "ライブラリ情報を保存できませんでした");
     } finally {
-      setTagSaving(false);
+      setLibrarySaving(false);
     }
+  }
+
+  function persistTags(slug: string, nextTags: string[]) {
+    return persistLibraryState(slug, { tags: nextTags }, "タグを保存しました");
   }
 
   function addTag(event: FormEvent) {
@@ -194,6 +234,13 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     setSelectedSlug(null);
   }
 
+  function openPaper(paper: PaperSummary) {
+    setSelectedSlug(paper.slug);
+    if (!paper.isRead) {
+      void persistLibraryState(paper.slug, { isRead: true }, "", true);
+    }
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -211,6 +258,12 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
           <p className="nav-heading">ライブラリ</p>
           <button className={filter === "all" && !tagFilter ? "nav-item active" : "nav-item"} onClick={() => setNavigation("all")}>
             <FileText aria-hidden="true" /><span>すべての論文</span><b>{counts.all}</b>
+          </button>
+          <button className={filter === "unread" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("unread")}>
+            <BookOpenText aria-hidden="true" /><span>未読</span><b>{counts.unread}</b>
+          </button>
+          <button className={filter === "favorites" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("favorites")}>
+            <Star weight="fill" aria-hidden="true" /><span>お気に入り</span><b>{counts.favorites}</b>
           </button>
           <button className={filter === "active" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("active")}>
             <SpinnerGap aria-hidden="true" /><span>翻訳中</span><b>{counts.active}</b>
@@ -259,7 +312,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
               ref={searchRef}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="タイトル、arXiv ID、タグを検索…"
+              placeholder="タイトル、著者、arXiv ID、タグを検索…"
               aria-label="論文を検索"
             />
             <kbd>⌘ K</kbd>
@@ -287,11 +340,24 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <h1>{selected.title}</h1>
                 </div>
                 <div className="reader-actions">
-                  {selected.downloadUrl && (
-                    <a className="secondary-button" href={selected.downloadUrl}>
-                      <DownloadSimple aria-hidden="true" />ZIP
-                    </a>
-                  )}
+                  <button
+                    className={selected.favorite ? "secondary-button active" : "secondary-button"}
+                    type="button"
+                    disabled={librarySaving}
+                    aria-pressed={selected.favorite}
+                    onClick={() => void persistLibraryState(selected.slug, { favorite: !selected.favorite }, selected.favorite ? "お気に入りから外しました" : "お気に入りに追加しました")}
+                  >
+                    <Star weight={selected.favorite ? "fill" : "regular"} aria-hidden="true" />
+                    {selected.favorite ? "お気に入り" : "お気に入りに追加"}
+                  </button>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={librarySaving}
+                    onClick={() => void persistLibraryState(selected.slug, { isRead: !selected.isRead }, selected.isRead ? "未読に戻しました" : "既読にしました")}
+                  >
+                    <BookOpenText aria-hidden="true" />{selected.isRead ? "未読に戻す" : "既読にする"}
+                  </button>
                   {selected.artifactUrl && (
                     <a className="primary-button" href={selected.artifactUrl} target="_blank" rel="noreferrer">
                       <ArrowSquareOut aria-hidden="true" />別タブで開く
@@ -337,14 +403,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 <p className="inspector-label">タグ</p>
                 <div className="paper-tags">
                   {selected.tags.map((tag) => (
-                    <button key={tag} className="tag-chip removable" disabled={tagSaving} onClick={() => void persistTags(selected.slug, selected.tags.filter((item) => item !== tag))}>
+                    <button key={tag} className="tag-chip removable" disabled={librarySaving} onClick={() => void persistTags(selected.slug, selected.tags.filter((item) => item !== tag))}>
                       {tag}<X aria-hidden="true" />
                     </button>
                   ))}
                 </div>
                 <form className="tag-form" onSubmit={addTag}>
                   <input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="タグを追加" maxLength={32} />
-                  <button type="submit" disabled={tagSaving || !tagDraft.trim()} title="タグを追加"><Plus aria-hidden="true" /></button>
+                  <button type="submit" disabled={librarySaving || !tagDraft.trim()} title="タグを追加"><Plus aria-hidden="true" /></button>
                 </form>
               </section>
 
@@ -352,6 +418,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 <p className="inspector-label">論文情報</p>
                 <dl>
                   <div><dt>Provider</dt><dd>{selected.provider}</dd></div>
+                  <div><dt>著者</dt><dd>{selected.authors.join(" / ") || "—"}</dd></div>
+                  <div><dt>公開日</dt><dd>{formatPaperDate(selected.publishedAt)}</dd></div>
+                  <div><dt>追加日</dt><dd>{formatPaperDate(selected.createdAt)}</dd></div>
                   <div><dt>更新</dt><dd>{formatDate(selected.updatedAt)}</dd></div>
                 </dl>
                 {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">arXiv原文を開く<ArrowSquareOut /></a>}
@@ -363,14 +432,17 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <div className="library-heading">
               <div>
                 <p className="eyebrow">LOCAL PAPER LIBRARY</p>
-                <h1>{tagFilter ? `# ${tagFilter}` : filter === "active" ? "翻訳中" : filter === "review" ? "要確認" : "論文ライブラリ"}</h1>
+                <h1>{tagFilter ? `# ${tagFilter}` : filter === "active" ? "翻訳中" : filter === "review" ? "要確認" : filter === "unread" ? "未読の論文" : filter === "favorites" ? "お気に入り" : "論文ライブラリ"}</h1>
                 <p>{visiblePapers.length}件の論文を表示しています</p>
               </div>
               <label className="sort-control"><FunnelSimple aria-hidden="true" /><span>並べ替え</span>
                 <select value={sort} onChange={(event) => setSort(event.target.value as Sort)}>
                   <option value="updated">更新が新しい順</option>
+                  <option value="added">追加が新しい順</option>
+                  <option value="published">公開が新しい順</option>
+                  <option value="author">著者名順</option>
                   <option value="title">タイトル順</option>
-                  <option value="arxiv">arXiv ID順</option>
+                  <option value="tag">タグ順</option>
                 </select>
               </label>
             </div>
@@ -378,7 +450,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <div className="paper-list" role="list">
               {visiblePapers.map((paper) => (
                 <article key={paper.slug} className="paper-row" role="listitem">
-                  <button className="paper-open" type="button" onClick={() => setSelectedSlug(paper.slug)} aria-label={`${paper.title}を開く`}>
+                  <button className="paper-open" type="button" onClick={() => openPaper(paper)} aria-label={`${paper.title}を開く`}>
                     <span className="paper-type"><FileText weight="duotone" aria-hidden="true" /></span>
                     <span className="paper-copy">
                       <span className="paper-kicker">
@@ -386,9 +458,11 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                         <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{STATUS_LABEL[paper.status]}</span>
                       </span>
                       <strong>{paper.title}</strong>
+                      <span className="paper-authors">{authorLabel(paper)}</span>
                       <span className="paper-subline">
                         <span>{paper.progress.completed}/{paper.progress.total} チャンク</span>
-                        <span>更新 {formatDate(paper.updatedAt)}</span>
+                        <span>公開 {formatPaperDate(paper.publishedAt)}</span>
+                        <span>追加 {formatPaperDate(paper.createdAt)}</span>
                         {paper.qa.status === "passed" && <span>QA通過</span>}
                       </span>
                       {paper.tags.length > 0 && <span className="paper-tag-row">{paper.tags.map((tag) => <span className="tag-chip" key={tag}>{tag}</span>)}</span>}
@@ -396,7 +470,27 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     <span className="row-progress"><span style={{ width: `${progressPercent(paper)}%` }} /></span>
                   </button>
                   <div className="row-actions">
-                    {paper.downloadUrl && <a href={paper.downloadUrl} title="Offline ZIPをダウンロード"><DownloadSimple aria-hidden="true" /></a>}
+                    <button
+                      type="button"
+                      aria-label="タグを編集"
+                      onClick={() => setSelectedSlug(paper.slug)}
+                    ><Tag aria-hidden="true" /></button>
+                    <button
+                      className={paper.favorite ? "active favorite" : ""}
+                      type="button"
+                      disabled={librarySaving}
+                      aria-label={paper.favorite ? "お気に入りから外す" : "お気に入りに追加"}
+                      aria-pressed={paper.favorite}
+                      onClick={() => void persistLibraryState(paper.slug, { favorite: !paper.favorite }, paper.favorite ? "お気に入りから外しました" : "お気に入りに追加しました")}
+                    ><Star weight={paper.favorite ? "fill" : "regular"} aria-hidden="true" /></button>
+                    <button
+                      className={paper.isRead ? "active" : ""}
+                      type="button"
+                      disabled={librarySaving}
+                      aria-label={paper.isRead ? "未読に戻す" : "既読にする"}
+                      aria-pressed={paper.isRead}
+                      onClick={() => void persistLibraryState(paper.slug, { isRead: !paper.isRead }, paper.isRead ? "未読に戻しました" : "既読にしました")}
+                    ><BookOpenText aria-hidden="true" /></button>
                     {paper.artifactUrl && <a href={paper.artifactUrl} target="_blank" rel="noreferrer" title="別タブで開く"><ArrowSquareOut aria-hidden="true" /></a>}
                   </div>
                 </article>

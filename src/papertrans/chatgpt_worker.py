@@ -163,6 +163,8 @@ class ChatGPTTranslationStore:
                 "resolvedArxivId": acquisition["resolvedArxivId"],
                 "title": acquisition["validation"]["title"],
                 "sourceUrl": acquisition["sourceUrl"],
+                "authors": list(acquisition.get("metadata", {}).get("authors", [])),
+                "publishedAt": acquisition.get("metadata", {}).get("publishedAt"),
             },
             "settings": {"maxCharacters": max_characters},
             "chunks": [

@@ -6,6 +6,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from papertrans.arxiv_html import (
+    _citation_metadata,
     _parse_codex_jsonl,
     _repair_section_hierarchy,
     _section_chunks,
@@ -37,6 +38,32 @@ FIXTURE = """
 def test_normalizes_arxiv_urls_and_versions():
     assert normalize_arxiv_id("https://arxiv.org/abs/2508.19843") == "2508.19843"
     assert normalize_arxiv_id("arXiv:2508.19843v3") == "2508.19843v3"
+
+
+def test_reads_authors_and_publication_date_from_arxiv_html_fallbacks():
+    soup = BeautifulSoup(
+        """
+        <div id="watermark-tr">arXiv:2508.19843v3 [cs.CR] 17 Nov 2025</div>
+        <div class="ltx_authors">
+          <span class="ltx_personname">Ada Lovelace, Alan Turing</span>
+          <span class="ltx_personname"><span class="ltx_text">Grace Hopper</span><span class="ltx_text">Edsger Dijkstra</span></span>
+          <span class="ltx_personname">Andreas TerzisFlorian Tramèr<span class="ltx_note">1 footnotemark</span></span>
+          <span class="ltx_personname">[0.5em] OpenAI</span>
+        </div>
+        """,
+        "html.parser",
+    )
+    assert _citation_metadata(soup) == {
+        "authors": [
+            "Ada Lovelace",
+            "Alan Turing",
+            "Grace Hopper",
+            "Edsger Dijkstra",
+            "Andreas Terzis",
+            "Florian Tramèr",
+        ],
+        "publishedAt": "17 Nov 2025",
+    }
 
 
 def test_tokenizer_protects_math_citations_and_cross_references():

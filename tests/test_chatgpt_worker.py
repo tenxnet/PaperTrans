@@ -46,6 +46,10 @@ def _fake_acquire(
         "sourceUrl": f"https://arxiv.org/html/{arxiv_id}v1",
         "sourceSha256": "0" * 64,
         "license": "CC BY 4.0",
+        "metadata": {
+            "authors": ["Ada Lovelace", "Alan Turing"],
+            "publishedAt": "17 Nov 2025",
+        },
         "validation": {
             "status": "passed",
             "title": "A Stateful Translation Test",
@@ -85,6 +89,8 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     prepared = store.prepare("2508.19843", "paper-chatgpt", max_characters=1000)
     assert prepared["status"] == "prepared"
     assert prepared["chunks"] == {"completed": 0, "total": 2, "remaining": 2}
+    assert prepared["paper"]["authors"] == ["Ada Lovelace", "Alan Turing"]
+    assert prepared["paper"]["publishedAt"] == "17 Nov 2025"
 
     first = store.next_chunk("paper-chatgpt")
     assert first["chunkId"] == "chunk-001"
