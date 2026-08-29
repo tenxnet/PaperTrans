@@ -1,6 +1,7 @@
 .DS_Store
 .next/
 node_modules/
+.pnpm-store/
 .venv/
 __pycache__/
 *.py[cod]
