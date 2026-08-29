@@ -79,8 +79,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .locale-control { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
 .locale-control > span { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .locale-control select { height: 36px; padding: 0 24px 0 9px; color: #4f5863; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; font-size: 11px; cursor: pointer; }
-.icon-button, .row-actions a, .row-actions button, .modal-close { width: 36px; height: 36px; display: grid; place-items: center; color: #5d6672; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
-.icon-button:hover, .row-actions a:hover, .row-actions button:hover, .modal-close:hover { color: var(--blue); border-color: #adc0e1; background: var(--blue-soft); }
+.icon-button, .row-actions button, .modal-close { width: 36px; height: 36px; display: grid; place-items: center; color: #5d6672; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
+.icon-button:hover, .row-actions button:hover, .modal-close:hover { color: var(--blue); border-color: #adc0e1; background: var(--blue-soft); }
 .icon-button svg, .row-actions svg { width: 18px; height: 18px; }
 .primary-button, .secondary-button { min-height: 37px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 13px; color: white; text-decoration: none; background: var(--blue); border: 1px solid var(--blue); border-radius: 7px; cursor: pointer; font-size: 12px; font-weight: 600; }
 .primary-button:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
@@ -120,7 +120,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .row-progress { position: absolute; right: 0; bottom: 0; left: 0; height: 2px; background: transparent; }
 .row-progress > span { display: block; height: 100%; background: #5f87cd; }
 .row-actions { display: flex; align-items: center; gap: 6px; padding: 0 18px 0 5px; }
-.row-actions a, .row-actions button { width: 32px; height: 32px; padding: 0; text-decoration: none; }
+.row-actions button { width: 32px; height: 32px; padding: 0; }
 .row-actions button.active { color: var(--blue); background: var(--blue-soft); border-color: #adc0e1; }
 .row-actions button.favorite { color: var(--amber); background: var(--amber-soft); border-color: #dfbd80; }
 .empty-state { padding: 72px 24px; text-align: center; }

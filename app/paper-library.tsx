@@ -380,11 +380,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   >
                     <BookOpenText aria-hidden="true" />{selected.isRead ? text.markUnread : text.markRead}
                   </button>
-                  {selected.artifactUrl && (
-                    <a className="primary-button" href={selected.artifactUrl} target="_blank" rel="noreferrer">
-                      <ArrowSquareOut aria-hidden="true" />{text.openNewTab}
-                    </a>
-                  )}
                 </div>
               </div>
               {selected.artifactUrl ? (
@@ -487,7 +482,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                       aria-pressed={paper.isRead}
                       onClick={() => void persistLibraryState(paper.slug, { isRead: !paper.isRead }, paper.isRead ? text.markedUnread : text.markedRead)}
                     ><BookOpenText aria-hidden="true" /></button>
-                    {paper.artifactUrl && <a href={paper.artifactUrl} target="_blank" rel="noreferrer" title={text.openNewTab}><ArrowSquareOut aria-hidden="true" /></a>}
                   </div>
                 </article>
               ))}
