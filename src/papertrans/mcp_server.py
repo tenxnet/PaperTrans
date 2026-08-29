@@ -136,7 +136,7 @@ def _store() -> MCPTranslationStore:
 
 server = MCPServer(
     name="papertrans",
-    title="PaperTrans ChatGPT Translation Worker",
+    title="PaperTrans Translation Worker",
     description="Translate official arXiv HTML into validated Japanese HTML while PaperTrans persists state.",
     instructions=SERVER_INSTRUCTIONS,
     version="0.1.0",
@@ -172,7 +172,7 @@ def prepare_arxiv_translation(
 
 @server.tool(
     title="List translation jobs",
-    description="List resumable ChatGPT translation jobs and their artifact status in PaperTrans.",
+    description="List resumable MCP translation jobs and their artifact status in PaperTrans.",
     annotations=ToolAnnotations(
         read_only_hint=True,
         destructive_hint=False,
@@ -182,7 +182,7 @@ def prepare_arxiv_translation(
     structured_output=True,
 )
 def list_translation_jobs() -> JobList:
-    """List all persisted ChatGPT worker jobs."""
+    """List all persisted MCP translation jobs."""
     return JobList(jobs=[JobSummary.model_validate(job) for job in _store().list_jobs()])
 
 
@@ -207,7 +207,7 @@ def get_translation_status(job_id: str) -> JobStatus:
 @server.tool(
     title="Get translation chunk",
     description=(
-        "Return the next untranslated semantic chunk for ChatGPT to translate. Translate every block "
+        "Return the next untranslated semantic chunk for the MCP client to translate. Translate every block "
         "internally, preserve every PTX placeholder exactly, and then call save_translation_chunk. "
         "Omit chunk_id to obtain the next pending chunk; pass it only to inspect a specific chunk."
     ),
@@ -271,7 +271,7 @@ def finalize_translation_html(job_id: str) -> FinalizeResult:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the PaperTrans MCP server for ChatGPT")
+    parser = argparse.ArgumentParser(description="Run the PaperTrans translation MCP server")
     parser.add_argument(
         "--transport",
         choices=("stdio", "sse", "streamable-http"),

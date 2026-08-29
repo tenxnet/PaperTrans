@@ -25,7 +25,7 @@ SUPPORTED_TARGET_LANGUAGES = {DEFAULT_TARGET_LANGUAGE}
 
 
 class TranslationJobError(RuntimeError):
-    """Raised when a persisted ChatGPT translation job cannot be advanced safely."""
+    """Raised when a persisted MCP translation job cannot be advanced safely."""
 
 
 def _now() -> str:
@@ -151,7 +151,7 @@ class MCPTranslationStore:
             return self._summary(manifest, paths)
         if paths["root"].exists() and any(paths["root"].iterdir()):
             raise TranslationJobError(
-                f"output directory already exists without a ChatGPT job manifest: {paths['root']}"
+                f"output directory already exists without an MCP job manifest: {paths['root']}"
             )
 
         paths["work"].mkdir(parents=True, exist_ok=True)
