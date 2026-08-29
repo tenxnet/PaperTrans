@@ -141,7 +141,18 @@ def build_semantic_document(
         raw_title = raw_blocks[title_block_id]["text"].strip()
         display_title = raw_title
         if value.get("number"):
-            number_match = re.search(rf"(?:^|\s){re.escape(str(value['number']))}\s+", raw_title)
+            escaped_number = re.escape(str(value["number"]))
+            number_match = re.match(
+                rf"^\s*{escaped_number}[.)]?(?:\s+|$)", raw_title
+            )
+            mixed_heading = any(
+                "merges the introductory prose" in str(warning)
+                for warning in title_assignment.get("warnings", [])
+            )
+            if number_match is None and mixed_heading:
+                number_match = re.search(
+                    rf"(?:^|\s){escaped_number}[.)]?\s+", raw_title
+                )
             if number_match:
                 prefix = raw_title[: number_match.start()].strip()
                 display_title = raw_title[number_match.end() :].strip()
@@ -165,8 +176,6 @@ def build_semantic_document(
                             "endPosition": positions[title_block_id] - 0.1,
                         }
                     )
-            else:
-                display_title = re.sub(rf"^{re.escape(str(value['number']))}\s*", "", raw_title, count=1)
         title_unit = {
             "id": f"heading-{value['sectionId']}",
             "kind": "heading",
@@ -231,6 +240,64 @@ def build_semantic_document(
                 "position": position,
             }
         )
+
+    unsectioned_units = [
+        unit for unit in units.values() if unit.get("sectionId") not in section_by_id
+    ]
+    unsectioned_visuals = [
+        visual
+        for visual in rendered_visuals
+        if visual.get("sectionId") not in section_by_id
+    ]
+    if unsectioned_units or unsectioned_visuals:
+        base_id = "sec-preamble" if sections else "sec-document"
+        synthetic_id = base_id
+        suffix = 2
+        while synthetic_id in section_by_id:
+            synthetic_id = f"{base_id}-{suffix}"
+            suffix += 1
+        title_text = "Preamble" if sections else "Document"
+        pages = [
+            int(page)
+            for unit in unsectioned_units
+            for page in unit.get("pages", [])
+        ] + [
+            int(visual.get("pageNumber", 1)) for visual in unsectioned_visuals
+        ]
+        synthetic_section = {
+            "id": synthetic_id,
+            "number": None,
+            "level": 1,
+            "parentSectionId": None,
+            "pageStart": min(pages, default=1),
+            "title": {
+                "id": f"heading-{synthetic_id}",
+                "kind": "heading",
+                "sectionId": synthetic_id,
+                "original": title_text,
+                "sourceHeading": title_text,
+                "japanese": "",
+                "sourceBlockIds": [],
+                "pages": [min(pages, default=1)],
+                "citations": [],
+                "objectReferences": [],
+                "referenceLabel": None,
+                "preservedTerms": [],
+                "warnings": [
+                    "PaperTrans created a synthetic section so unheaded source content is not dropped."
+                ],
+                "confidence": 1.0,
+                "position": 0,
+                "endPosition": 0,
+            },
+            "content": [],
+        }
+        sections.insert(0, synthetic_section)
+        section_by_id[synthetic_id] = synthetic_section
+        for unit in unsectioned_units:
+            unit["sectionId"] = synthetic_id
+        for visual in unsectioned_visuals:
+            visual["sectionId"] = synthetic_id
 
     for unit in units.values():
         section = section_by_id.get(unit["sectionId"])

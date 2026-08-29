@@ -82,6 +82,11 @@ function authorLabel(paper: PaperSummary, locale: AppLocale) {
   return paper.authors.length > 1 ? text.otherAuthors(paper.authors[0]) : paper.authors[0];
 }
 
+function sourceLabel(paper: PaperSummary) {
+  if (paper.resolvedArxivId) return `arXiv:${paper.resolvedArxivId}`;
+  return paper.sourceType === "unknown" ? "DOCUMENT" : paper.sourceType.toUpperCase();
+}
+
 function progressPercent(paper: PaperSummary) {
   if (!paper.progress.total) return paper.status === "completed" ? 100 : 0;
   return Math.round((paper.progress.completed / paper.progress.total) * 100);
@@ -546,7 +551,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <ArrowLeft aria-hidden="true" />{text.backToLibrary}
                 </button>
                 <div className="reader-title">
-                  <small>arXiv:{selected.resolvedArxivId}</small>
+                  <small>{sourceLabel(selected)}</small>
                   <h1>{selected.title}</h1>
                 </div>
                 <div className="reader-actions">
@@ -629,7 +634,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div><dt>{text.addedAt}</dt><dd>{formatPaperDate(selected.createdAt, locale)}</dd></div>
                   <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
-                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{text.openArxivSource}<ArrowSquareOut /></a>}
+                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{selected.sourceType === "arxiv" ? text.openArxivSource : text.openSource}<ArrowSquareOut /></a>}
               </section>
             </aside>
           </section>
@@ -660,7 +665,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     <span className="paper-type"><FileText weight="duotone" aria-hidden="true" /></span>
                     <span className="paper-copy">
                       <span className="paper-kicker">
-                        <span>arXiv:{paper.resolvedArxivId}</span>
+                        <span>{sourceLabel(paper)}</span>
                         <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{text.status[paper.status]}</span>
                       </span>
                       <strong>{paper.title}</strong>

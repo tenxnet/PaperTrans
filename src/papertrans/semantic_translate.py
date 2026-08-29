@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 from .metrics import record_stage, utc_now
 from .semantic import iter_translatable_units, save_semantic_document
@@ -210,6 +210,7 @@ def translate_semantic_document(
     model: str = "gpt-5.6-sol",
     reasoning_effort: str = "high",
     metrics_path: Path | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     stage_started: datetime = utc_now()
     schema = repo_root / ".agents/skills/academic-paper-translator/references/translation-output.schema.json"
@@ -223,6 +224,8 @@ def translate_semantic_document(
     document["model"]["translation"] = model
     document["model"]["translationReasoningEffort"] = reasoning_effort
     save_semantic_document(document, document_path)
+    if progress_callback:
+        progress_callback(document)
     cache_dir.mkdir(parents=True, exist_ok=True)
     worker_count = max(1, min(max_workers, len(chunks) or 1))
     chunk_metrics: list[dict[str, Any]] = []
@@ -256,6 +259,8 @@ def translate_semantic_document(
                 unit["warnings"].extend(_check_invariants(unit["original"], unit["japanese"]))
             chunk_metrics.append(completed)
             save_semantic_document(document, document_path)
+            if progress_callback:
+                progress_callback(document)
             print(f"Completed semantic translation chunk {completed['index']}/{len(chunks)}", file=sys.stderr, flush=True)
 
     warnings = [str(value) for value in document.get("warnings", [])]
@@ -263,6 +268,8 @@ def translate_semantic_document(
         warnings.extend(str(value) for value in unit.get("warnings", []))
     document["status"] = "needs_review" if warnings else "translated"
     save_semantic_document(document, document_path)
+    if progress_callback:
+        progress_callback(document)
     stage_ended = utc_now()
     record_stage(
         metrics_path,

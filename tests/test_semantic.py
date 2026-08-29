@@ -102,6 +102,63 @@ def test_builds_real_sections_and_semantic_paragraphs():
     assert content[1]["value"]["caption"] == "Figure 1: Original caption."
 
 
+def test_synthesizes_section_for_document_without_headings():
+    evidence = {
+        "sourceFile": "unheaded.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [{"blockId": "p1-body", "text": "Unheaded body text."}],
+            }
+        ],
+    }
+    structure = {
+        "warnings": [],
+        "sections": [],
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": "p1-body",
+                        "role": "paragraph",
+                        "readingOrder": 1,
+                        "sectionId": None,
+                        "paragraphId": "p1-body",
+                        "hidden": False,
+                        "confidence": 1,
+                        "warnings": [],
+                    }
+                ],
+                "visualObjects": [],
+            }
+        ],
+    }
+
+    document = build_semantic_document(evidence, structure, [])
+
+    assert document["sections"][0]["title"]["original"] == "Document"
+    assert document["sections"][0]["content"][0]["value"]["original"] == "Unheaded body text."
+
+
+def test_section_title_strips_only_a_leading_number_and_delimiter():
+    cases = [
+        ("1. Introduction", "1", "Introduction"),
+        ("3.1 Results", "3.1", "Results"),
+        ("Results improved by 3.1 percent", "3.1", "Results improved by 3.1 percent"),
+    ]
+    for raw_title, number, expected in cases:
+        evidence, structure, visuals = sample_semantic_inputs()
+        evidence["pages"][0]["blocks"][1]["text"] = raw_title
+        structure["sections"][0]["number"] = number
+
+        document = build_semantic_document(evidence, structure, visuals)
+
+        assert document["sections"][0]["title"]["original"] == expected
+        assert document["sections"][0]["title"]["sourceHeading"] == raw_title
+
+
 def test_splits_author_from_known_affiliation():
     evidence, structure, visuals = sample_semantic_inputs()
     evidence["pages"][0]["blocks"].insert(1, {"blockId": "p1-author", "text": "Ada Lovelace Example University"})
@@ -178,6 +235,7 @@ def test_semantic_translation_runs_chunks_in_parallel_and_records_metrics(tmp_pa
 
     monkeypatch.setattr(semantic_translation.subprocess, "run", fake_run)
     metrics_path = tmp_path / "metrics.json"
+    progress: list[int] = []
     semantic_translation.translate_semantic_document(
         document,
         tmp_path / "document.json",
@@ -186,12 +244,18 @@ def test_semantic_translation_runs_chunks_in_parallel_and_records_metrics(tmp_pa
         max_characters=1,
         max_workers=3,
         metrics_path=metrics_path,
+        progress_callback=lambda current: progress.append(
+            sum(bool(unit.get("japanese")) for unit in iter_translatable_units(current))
+        ),
     )
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))["stages"]["semantic_translation"]
     assert maximum_active >= 2
     assert metrics["details"]["workers"] == 3
     assert metrics["details"]["modelCalls"] == 4
     assert metrics["details"]["translatedUnits"] == 4
+    assert progress[0] == 0
+    assert progress[-1] == 4
+    assert progress == sorted(progress)
 
 
 def test_structure_validation_rejects_missing_blocks():

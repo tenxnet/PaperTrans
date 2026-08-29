@@ -7,10 +7,13 @@ from pathlib import Path
 from .arxiv_html import run_arxiv_html_pipeline
 from .chatgpt_worker import MCPTranslationStore
 from .deterministic_structure import analyze_layout_deterministic, evaluate_structure
+from .docling_adapter import extract_docling_semantics
 from .extract import extract_document
 from .hybrid_structure import refine_structure_with_llm
 from .io import load_document
 from .metrics import record_stage, utc_now
+from .pdf_artifacts import write_pdf_job_manifest, write_semantic_pdf_qa
+from .pdf_benchmark import run_pdf_parser_benchmark
 from .render import create_bundle, render_document
 from .semantic import (
     build_semantic_document,
@@ -141,6 +144,12 @@ def _parser() -> argparse.ArgumentParser:
     semantic_pipeline.add_argument("--output-root", type=Path, default=Path("output"))
     semantic_pipeline.add_argument("--repo-root", type=Path, default=Path.cwd())
     semantic_pipeline.add_argument(
+        "--layout-parser",
+        choices=("pymupdf", "docling"),
+        default="pymupdf",
+        help="Use the legacy PyMuPDF geometry path or Docling's semantic document parser",
+    )
+    semantic_pipeline.add_argument(
         "--structure-mode", choices=("hybrid", "llm"), default="hybrid"
     )
     semantic_pipeline.add_argument("--structure-confidence-threshold", type=float, default=0.7)
@@ -154,6 +163,19 @@ def _parser() -> argparse.ArgumentParser:
     semantic_pipeline.add_argument("--translation-workers", type=int, default=3)
     semantic_pipeline.add_argument("--max-characters", type=int, default=9000)
     semantic_pipeline.add_argument("--skip-translation", action="store_true")
+
+    pdf_benchmark = subparsers.add_parser(
+        "pdf-benchmark",
+        help="Compare Docling with the deterministic PyMuPDF parser on a local PDF corpus",
+    )
+    pdf_benchmark.add_argument("corpus_dir", type=Path)
+    pdf_benchmark.add_argument("--output", type=Path, required=True)
+    pdf_benchmark.add_argument(
+        "--work-root",
+        type=Path,
+        default=Path("output/pdf-parser-benchmark"),
+    )
+    pdf_benchmark.add_argument("--limit", type=int, default=10)
 
     arxiv_html_pipeline = subparsers.add_parser(
         "arxiv-html-pipeline",
@@ -184,6 +206,27 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "pdf-benchmark":
+        report = run_pdf_parser_benchmark(
+            args.corpus_dir,
+            args.output,
+            args.work_root,
+            limit=args.limit,
+        )
+        print(
+            json.dumps(
+                {
+                    "papers": report["paperCount"],
+                    "report": str(args.output),
+                    "markdown": str(args.output.with_suffix(".md")),
+                    "workRoot": report["workRoot"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        if report["status"] != "completed":
+            raise SystemExit(1)
+        return
     if args.command == "prepare-mcp-job":
         store = MCPTranslationStore(
             args.repo_root.resolve(),
@@ -425,108 +468,205 @@ def main() -> None:
         publication_dir = paper_root / "html"
         bundle_path = paper_root / f"{args.slug}-html.zip"
         metrics_path = paper_root / "run-metrics.json"
-
-        started = utc_now()
-        evidence = extract_layout_evidence(args.source, work_dir, evidence_path)
-        record_stage(
-            metrics_path,
-            "layout_extraction",
-            started,
-            utc_now(),
-            {"pages": evidence["pageCount"], "blocks": sum(len(page["blocks"]) for page in evidence["pages"])},
+        manifest_path = work_dir / "papertrans-job.json"
+        pipeline_started = utc_now()
+        manifest_structure_mode = "docling" if args.layout_parser == "docling" else args.structure_mode
+        document = None
+        active_manifest = write_pdf_job_manifest(
+            manifest_path,
+            slug=args.slug,
+            source=args.source,
+            status="translating",
+            pdf_parser=args.layout_parser,
+            structure_mode=manifest_structure_mode,
+            started_at=pipeline_started.isoformat(),
+            skip_translation=args.skip_translation,
         )
-        if args.structure_mode == "hybrid":
-            baseline_path = work_dir / "structure-baseline.json"
-            baseline = analyze_layout_deterministic(
-                evidence,
-                baseline_path,
-                metrics_path=metrics_path,
-            )
-            structured = refine_structure_with_llm(
-                evidence,
-                baseline,
-                work_dir,
-                structure_path,
-                repo_root,
-                confidence_threshold=args.structure_confidence_threshold,
-                max_review_pages=args.max_structure_review_pages,
-                max_workers=args.structure_review_workers,
-                model=args.structure_model,
-                reasoning_effort=args.structure_reasoning_effort,
-                metrics_path=metrics_path,
-            )
-        else:
-            structured = analyze_layout(
-                evidence,
-                work_dir,
-                structure_path,
-                repo_root,
-                batch_size=args.structure_batch_size,
-                model=args.structure_model,
-                reasoning_effort=args.structure_reasoning_effort,
-                metrics_path=metrics_path,
-            )
-        visual_started = utc_now()
-        objects = render_visual_objects(args.source, structured, work_dir / "assets")
-        visuals_path.write_text(json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8")
-        write_visual_qa(objects, work_dir / "visual-qa.html")
-        record_stage(
-            metrics_path,
-            "visual_extraction",
-            visual_started,
-            utc_now(),
-            {"visualObjects": len(objects)},
-        )
-
-        build_started = utc_now()
-        previous = load_semantic_document(semantic_path) if semantic_path.exists() else None
-        document = build_semantic_document(evidence, structured, objects)
-        if previous:
-            merge_semantic_translations(document, previous)
-        save_semantic_document(document, semantic_path)
-        unit_count = sum(
-            1 for section in document["sections"] for item in section["content"] if item["type"] == "unit"
-        )
-        record_stage(
-            metrics_path,
-            "semantic_build",
-            build_started,
-            utc_now(),
-            {"sections": len(document["sections"]), "units": unit_count},
-        )
-        if not args.skip_translation:
-            document = translate_semantic_document(
-                document,
-                semantic_path,
-                repo_root,
-                translation_cache,
-                max_characters=args.max_characters,
-                max_workers=args.translation_workers,
-                model=args.translation_model,
-                reasoning_effort=args.translation_reasoning_effort,
-                metrics_path=metrics_path,
-            )
-        render_started = utc_now()
-        index = render_semantic_document(document, work_dir, publication_dir, args.source)
-        create_bundle(publication_dir, bundle_path)
-        record_stage(
-            metrics_path,
-            "html_render",
-            render_started,
-            utc_now(),
-            {"html": str(index), "zip": str(bundle_path)},
-        )
-        print(
-            json.dumps(
+        source_sha256 = str(active_manifest["source"]["sha256"])
+        try:
+            started = utc_now()
+            if args.layout_parser == "docling":
+                evidence, structured, objects = extract_docling_semantics(
+                    args.source,
+                    work_dir,
+                    evidence_path,
+                    structure_path,
+                    visuals_path,
+                )
+            else:
+                evidence = extract_layout_evidence(args.source, work_dir, evidence_path)
+                if args.structure_mode == "hybrid":
+                    baseline_path = work_dir / "structure-baseline.json"
+                    baseline = analyze_layout_deterministic(
+                        evidence,
+                        baseline_path,
+                        metrics_path=metrics_path,
+                    )
+                    structured = refine_structure_with_llm(
+                        evidence,
+                        baseline,
+                        work_dir,
+                        structure_path,
+                        repo_root,
+                        confidence_threshold=args.structure_confidence_threshold,
+                        max_review_pages=args.max_structure_review_pages,
+                        max_workers=args.structure_review_workers,
+                        model=args.structure_model,
+                        reasoning_effort=args.structure_reasoning_effort,
+                        metrics_path=metrics_path,
+                    )
+                else:
+                    structured = analyze_layout(
+                        evidence,
+                        work_dir,
+                        structure_path,
+                        repo_root,
+                        batch_size=args.structure_batch_size,
+                        model=args.structure_model,
+                        reasoning_effort=args.structure_reasoning_effort,
+                        metrics_path=metrics_path,
+                    )
+                objects = render_visual_objects(args.source, structured, work_dir / "assets")
+                visuals_path.write_text(
+                    json.dumps(objects, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            record_stage(
+                metrics_path,
+                "layout_extraction",
+                started,
+                utc_now(),
                 {
-                    "html": str(index),
-                    "bundle": str(bundle_path),
-                    "metrics": str(metrics_path),
-                    "status": document["status"],
+                    "parser": args.layout_parser,
+                    "pages": evidence["pageCount"],
+                    "blocks": sum(len(page["blocks"]) for page in evidence["pages"]),
                 },
-                ensure_ascii=False,
             )
-        )
+            write_visual_qa(objects, work_dir / "visual-qa.html")
+
+            build_started = utc_now()
+            previous = load_semantic_document(semantic_path) if semantic_path.exists() else None
+            document = build_semantic_document(evidence, structured, objects)
+            if previous:
+                merge_semantic_translations(document, previous)
+            save_semantic_document(document, semantic_path)
+            write_pdf_job_manifest(
+                manifest_path,
+                slug=args.slug,
+                source=args.source,
+                status="translating",
+                pdf_parser=args.layout_parser,
+                structure_mode=manifest_structure_mode,
+                document=document,
+                started_at=pipeline_started.isoformat(),
+                skip_translation=args.skip_translation,
+                source_sha256=source_sha256,
+            )
+            unit_count = sum(
+                1
+                for section in document["sections"]
+                for item in section["content"]
+                if item["type"] == "unit"
+            )
+            record_stage(
+                metrics_path,
+                "semantic_build",
+                build_started,
+                utc_now(),
+                {"sections": len(document["sections"]), "units": unit_count},
+            )
+            if not args.skip_translation:
+                document = translate_semantic_document(
+                    document,
+                    semantic_path,
+                    repo_root,
+                    translation_cache,
+                    max_characters=args.max_characters,
+                    max_workers=args.translation_workers,
+                    model=args.translation_model,
+                    reasoning_effort=args.translation_reasoning_effort,
+                    metrics_path=metrics_path,
+                    progress_callback=lambda current_document: write_pdf_job_manifest(
+                        manifest_path,
+                        slug=args.slug,
+                        source=args.source,
+                        status="translating",
+                        pdf_parser=args.layout_parser,
+                        structure_mode=manifest_structure_mode,
+                        document=current_document,
+                        started_at=pipeline_started.isoformat(),
+                        skip_translation=args.skip_translation,
+                        source_sha256=source_sha256,
+                    ),
+                )
+            render_started = utc_now()
+            index = render_semantic_document(document, work_dir, publication_dir, args.source)
+            qa = write_semantic_pdf_qa(
+                document,
+                publication_dir,
+                pdf_parser=args.layout_parser,
+                evidence=evidence,
+                structure=structured,
+            )
+            create_bundle(publication_dir, bundle_path)
+            record_stage(
+                metrics_path,
+                "html_render",
+                render_started,
+                utc_now(),
+                {"html": str(index), "zip": str(bundle_path), "qa": qa["status"]},
+            )
+            status = (
+                "failed"
+                if qa["status"] != "passed"
+                else "needs_review"
+                if args.skip_translation
+                or document.get("status") == "needs_review"
+                or bool(qa.get("emptyTextPages"))
+                else "completed"
+            )
+            write_pdf_job_manifest(
+                manifest_path,
+                slug=args.slug,
+                source=args.source,
+                status=status,
+                pdf_parser=args.layout_parser,
+                structure_mode=manifest_structure_mode,
+                document=document,
+                started_at=pipeline_started.isoformat(),
+                skip_translation=args.skip_translation,
+                error="HTML artifact QA failed" if status == "failed" else None,
+                source_sha256=source_sha256,
+            )
+            if status == "failed":
+                raise RuntimeError("HTML artifact QA failed")
+            print(
+                json.dumps(
+                    {
+                        "html": str(index),
+                        "bundle": str(bundle_path),
+                        "manifest": str(manifest_path),
+                        "qa": str(publication_dir / "qa.json"),
+                        "metrics": str(metrics_path),
+                        "status": status,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except BaseException as error:
+            write_pdf_job_manifest(
+                manifest_path,
+                slug=args.slug,
+                source=args.source,
+                status="failed",
+                pdf_parser=args.layout_parser,
+                structure_mode=manifest_structure_mode,
+                document=document,
+                started_at=pipeline_started.isoformat(),
+                skip_translation=args.skip_translation,
+                error=str(error),
+                source_sha256=source_sha256,
+            )
+            raise
         return
 
     if args.command == "pipeline":
