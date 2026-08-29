@@ -14,7 +14,7 @@ from papertrans.docling_adapter import (
     docling_document_to_ir,
     extract_docling_semantics,
 )
-from papertrans.semantic import build_semantic_document
+from papertrans.semantic import build_semantic_document, iter_translatable_units
 from papertrans.structure import validate_structure_batch
 
 
@@ -301,6 +301,475 @@ def test_maps_native_docling_graph_to_existing_ir_without_markdown() -> None:
     assert any(value["kind"] == "equation" for value in visuals)
 
 
+def test_hides_picture_overlay_text_but_keeps_caption_and_body() -> None:
+    document = sample_docling_document()
+    document["texts"][3]["parent"] = {"$ref": "#/pictures/0"}
+    for index, (text, bbox) in enumerate(
+        (
+            ("80", {"l": 180, "t": 420, "r": 195, "b": 405}),
+            ("deception", {"l": 300, "t": 380, "r": 360, "b": 365}),
+        ),
+        start=11,
+    ):
+        document["texts"].append(
+            {
+                "self_ref": f"#/texts/{index}",
+                "parent": {"$ref": "#/pictures/0"},
+                "label": "text",
+                "orig": text,
+                "text": text,
+                "prov": [
+                    {
+                        "page_no": 1,
+                        "bbox": {**bbox, "coord_origin": "BOTTOMLEFT"},
+                        "charspan": [0, len(text)],
+                    }
+                ],
+            }
+        )
+    document["pictures"][0]["children"] = [
+        {"$ref": "#/texts/3"},
+        {"$ref": "#/texts/11"},
+        {"$ref": "#/texts/12"},
+    ]
+    document["groups"][0]["children"] = [
+        value
+        for value in document["groups"][0]["children"]
+        if value["$ref"] != "#/texts/3"
+    ]
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+    blocks = {
+        block["blockId"]: block
+        for page in evidence["pages"]
+        for block in page["blocks"]
+    }
+
+    for block_id in ("dl-texts-11", "dl-texts-12"):
+        assert assignments[block_id]["role"] == "noise"
+        assert assignments[block_id]["hidden"] is True
+        assert assignments[block_id]["paragraphId"] is None
+        assert assignments[block_id]["suppressedVisualText"] is True
+        assert blocks[block_id]["suppressedVisualText"] is True
+        assert blocks[block_id]["embeddedVisualOwnerRefs"] == ["#/pictures/0"]
+
+    assert assignments["dl-texts-3"]["role"] == "caption"
+    assert assignments["dl-texts-3"]["hidden"] is False
+    figure = next(value for value in structure["pages"][0]["visualObjects"] if value["kind"] == "figure")
+    assert figure["captionBlockIds"] == ["dl-texts-3"]
+    assert figure["insertAfterBlockId"] == "dl-texts-1"
+    assert structure["doclingDiagnostics"] == {
+        "embeddedVisualTextItems": 2,
+        "suppressedEmbeddedVisualTextBlocks": 2,
+        "associatedOrphanCaptions": [],
+    }
+
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    originals = [unit["original"] for unit in iter_translatable_units(semantic)]
+    assert "80" not in originals
+    assert "deception" not in originals
+    assert any("A claim cites" in original for original in originals)
+    rendered_figure = next(value for value in semantic["visualObjects"] if value["kind"] == "figure")
+    assert rendered_figure["caption"] == "Figure 1: Native visual evidence."
+
+
+def test_hides_body_reachable_short_text_inside_visual_bbox_only() -> None:
+    document = sample_docling_document()
+    for index, (text, bbox) in enumerate(
+        (
+            ("harmful", {"l": 300, "t": 420, "r": 360, "b": 400}),
+            ("Outside figure body text.", {"l": 60, "t": 610, "r": 260, "b": 585}),
+        ),
+        start=11,
+    ):
+        document["texts"].append(
+            {
+                "self_ref": f"#/texts/{index}",
+                "parent": {"$ref": "#/body"},
+                "label": "text",
+                "orig": text,
+                "text": text,
+                "prov": [
+                    {
+                        "page_no": 1,
+                        "bbox": {**bbox, "coord_origin": "BOTTOMLEFT"},
+                        "charspan": [0, len(text)],
+                    }
+                ],
+            }
+        )
+    picture_index = next(
+        index
+        for index, value in enumerate(document["groups"][0]["children"])
+        if value["$ref"] == "#/pictures/0"
+    )
+    document["groups"][0]["children"][picture_index:picture_index] = [
+        {"$ref": "#/texts/12"},
+        {"$ref": "#/texts/11"},
+    ]
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+    blocks = {
+        block["blockId"]: block
+        for page in evidence["pages"]
+        for block in page["blocks"]
+    }
+
+    assert assignments["dl-texts-11"]["role"] == "noise"
+    assert assignments["dl-texts-11"]["hidden"] is True
+    assert assignments["dl-texts-11"]["suppressedVisualText"] is True
+    assert blocks["dl-texts-11"]["embeddedVisualOwnerRefs"] == ["#/pictures/0"]
+    assert assignments["dl-texts-12"]["role"] == "paragraph"
+    assert assignments["dl-texts-12"]["hidden"] is False
+    assert assignments["dl-texts-12"]["suppressedVisualText"] is False
+    assert blocks["dl-texts-12"]["embeddedVisualOwnerRefs"] == []
+
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    originals = [unit["original"] for unit in iter_translatable_units(semantic)]
+    assert "harmful" not in originals
+    assert "Outside figure body text." in originals
+    assert structure["doclingDiagnostics"] == {
+        "embeddedVisualTextItems": 1,
+        "suppressedEmbeddedVisualTextBlocks": 1,
+        "associatedOrphanCaptions": [],
+    }
+
+
+def test_table_caption_and_footnote_survive_while_cell_text_is_hidden() -> None:
+    document = sample_docling_document()
+    table_texts = (
+        ("Table 1: Exact results.", "caption", 11),
+        ("* Equal contribution.", "footnote", 12),
+        ("Accuracy", "text", 13),
+    )
+    for text, label, index in table_texts:
+        top = 500 if index == 11 else 450 - (index - 11) * 25
+        bottom = 485 if index == 11 else 430 - (index - 11) * 25
+        document["texts"].append(
+            {
+                "self_ref": f"#/texts/{index}",
+                "parent": {
+                    "$ref": "#/body" if index == 11 else "#/tables/0"
+                },
+                "label": label,
+                "orig": text,
+                "text": text,
+                "prov": [
+                    {
+                        "page_no": 2,
+                        "bbox": {
+                            "l": 100,
+                            "t": top,
+                            "r": 500,
+                            "b": bottom,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, len(text)],
+                    }
+                ],
+            }
+        )
+    document["tables"] = [
+        {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "children": [
+                {"$ref": "#/texts/12"},
+                {"$ref": "#/texts/13"},
+            ],
+            "captions": [],
+            "footnotes": [{"$ref": "#/texts/12"}],
+            "prov": [
+                {
+                    "page_no": 2,
+                    "bbox": {
+                        "l": 80,
+                        "t": 480,
+                        "r": 520,
+                        "b": 360,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, 0],
+                }
+            ],
+        }
+    ]
+    document["groups"][0]["children"][-2:-2] = [
+        {"$ref": "#/texts/11"},
+        {"$ref": "#/tables/0"},
+    ]
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+    assert assignments["dl-texts-11"]["role"] == "caption"
+    assert assignments["dl-texts-11"]["hidden"] is False
+    assert assignments["dl-texts-12"]["role"] == "footnote"
+    assert assignments["dl-texts-12"]["hidden"] is False
+    assert assignments["dl-texts-13"]["role"] == "noise"
+    assert assignments["dl-texts-13"]["hidden"] is True
+
+    table = next(
+        value
+        for page in structure["pages"]
+        for value in page["visualObjects"]
+        if value["kind"] == "table"
+    )
+    assert table["label"] == "Table 1"
+    assert table["captionBlockIds"] == ["dl-texts-11"]
+    assert structure["doclingDiagnostics"]["associatedOrphanCaptions"] == [
+        {"captionRef": "#/texts/11", "visualRef": "#/tables/0"}
+    ]
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    originals = [unit["original"] for unit in iter_translatable_units(semantic)]
+    assert "* Equal contribution." in originals
+    assert "Accuracy" not in originals
+
+
+def test_caption_assignment_repairs_wrong_owner_by_kind_and_geometry() -> None:
+    document = sample_docling_document()
+    document["pictures"][0]["captions"] = []
+    table_caption = "Table 1: Exact results."
+    document["texts"].append(
+        {
+            "self_ref": "#/texts/11",
+            "parent": {"$ref": "#/body"},
+            "label": "text",
+            "orig": table_caption,
+            "text": table_caption,
+            "prov": [
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 90,
+                        "t": 90,
+                        "r": 510,
+                        "b": 70,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, len(table_caption)],
+                }
+            ],
+        }
+    )
+    document["tables"] = [
+        {
+            "self_ref": "#/tables/0",
+            "label": "table",
+            "children": [],
+            # Docling incorrectly points the table at the figure caption.
+            "captions": [{"$ref": "#/texts/3"}],
+            "footnotes": [],
+            "prov": [
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 80,
+                        "t": 180,
+                        "r": 520,
+                        "b": 100,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, 0],
+                }
+            ],
+        }
+    ]
+    children = document["groups"][0]["children"]
+    caption_index = children.index({"$ref": "#/texts/3"})
+    children[caption_index + 1 : caption_index + 1] = [
+        {"$ref": "#/tables/0"},
+        {"$ref": "#/texts/11"},
+    ]
+
+    _evidence, structure = docling_document_to_ir(document)
+    visuals = {
+        visual["kind"]: visual
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+        if visual["kind"] in {"figure", "table"}
+    }
+
+    assert visuals["figure"]["label"] == "Figure 1"
+    assert visuals["figure"]["captionBlockIds"] == ["dl-texts-3"]
+    assert visuals["table"]["label"] == "Table 1"
+    assert visuals["table"]["captionBlockIds"] == ["dl-texts-11"]
+    caption_ids = [
+        block_id
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+        for block_id in visual["captionBlockIds"]
+    ]
+    assert len(caption_ids) == len(set(caption_ids))
+
+
+def test_reassembles_same_line_caption_fragments() -> None:
+    document = sample_docling_document()
+    document["pictures"][0]["captions"] = []
+    document["texts"][3]["orig"] = "Figure 1."
+    document["texts"][3]["text"] = "Figure 1."
+    document["texts"][3]["prov"][0]["charspan"] = [0, 9]
+    document["texts"][3]["prov"][0]["bbox"].update({"l": 90, "r": 160})
+    continuation = "Split caption text."
+    document["texts"].append(
+        {
+            "self_ref": "#/texts/11",
+            "parent": {"$ref": "#/body"},
+            "label": "text",
+            "orig": continuation,
+            "text": continuation,
+            "prov": [
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 165,
+                        "t": 230,
+                        "r": 330,
+                        "b": 205,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, len(continuation)],
+                }
+            ],
+        }
+    )
+    children = document["groups"][0]["children"]
+    caption_index = children.index({"$ref": "#/texts/3"})
+    children.insert(caption_index + 1, {"$ref": "#/texts/11"})
+
+    evidence, structure = docling_document_to_ir(document)
+    figure = next(
+        visual
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+        if visual["kind"] == "figure"
+    )
+    assert figure["captionBlockIds"] == ["dl-texts-3", "dl-texts-11"]
+    assignments = _assignments(structure)
+    assert assignments["dl-texts-11"]["role"] == "caption"
+    assert assignments["dl-texts-11"]["associatedVisualCaption"] is True
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    rendered_figure = next(
+        visual for visual in semantic["visualObjects"] if visual["kind"] == "figure"
+    )
+    assert rendered_figure["caption"] == "Figure 1. Split caption text."
+
+
+def test_suppresses_only_visual_segments_and_bbox_boundary_overlap() -> None:
+    document = sample_docling_document()
+    body_text = "Visible body sentence."
+    visual_text = "harmful"
+    combined = f"{body_text}\n{visual_text}"
+    document["texts"].append(
+        {
+            "self_ref": "#/texts/11",
+            "parent": {"$ref": "#/body"},
+            "label": "text",
+            "orig": combined,
+            "text": combined,
+            "prov": [
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 60,
+                        "t": 640,
+                        "r": 260,
+                        "b": 615,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, len(body_text)],
+                },
+                {
+                    "page_no": 2,
+                    "bbox": {
+                        "l": 250,
+                        "t": 420,
+                        "r": 310,
+                        "b": 400,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [len(body_text) + 1, len(combined)],
+                },
+            ],
+        }
+    )
+    edge_text = "edge label"
+    document["texts"].append(
+        {
+            "self_ref": "#/texts/12",
+            "parent": {"$ref": "#/body"},
+            "label": "text",
+            "orig": edge_text,
+            "text": edge_text,
+            "prov": [
+                {
+                    "page_no": 2,
+                    "bbox": {
+                        "l": 250,
+                        "t": 253,
+                        "r": 330,
+                        "b": 246,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, len(edge_text)],
+                }
+            ],
+        }
+    )
+    document["pictures"].append(
+        {
+            "self_ref": "#/pictures/1",
+            "label": "picture",
+            "children": [],
+            "captions": [],
+            "prov": [
+                {
+                    "page_no": 2,
+                    "bbox": {
+                        "l": 60,
+                        "t": 500,
+                        "r": 540,
+                        "b": 250,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, 0],
+                }
+            ],
+        }
+    )
+    children = document["groups"][0]["children"]
+    children[2:2] = [
+        {"$ref": "#/texts/11"},
+        {"$ref": "#/pictures/1"},
+        {"$ref": "#/texts/12"},
+    ]
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+    assert assignments["dl-texts-11"]["role"] == "paragraph"
+    assert assignments["dl-texts-11"]["hidden"] is False
+    assert assignments["dl-texts-11-s2"]["role"] == "noise"
+    assert assignments["dl-texts-11-s2"]["hidden"] is True
+    assert assignments["dl-texts-12"]["role"] == "noise"
+    assert assignments["dl-texts-12"]["hidden"] is True
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    originals = [unit["original"] for unit in iter_translatable_units(semantic)]
+    assert body_text in originals
+    assert visual_text not in originals
+    assert edge_text not in originals
+
+
 def test_multi_page_character_spans_preserve_exact_text_and_reject_gaps() -> None:
     document = sample_docling_document()
     paragraph = document["texts"][1]
@@ -436,6 +905,11 @@ def test_converter_explicitly_disables_ocr_for_digital_pdf(
             observed["heading_hierarchy_enabled"] = enabled
             self.enabled = enabled
 
+    class FakeThreadedDoclingParseBackendOptions:
+        def __init__(self, *, parser_threads: int):
+            observed["parser_threads"] = parser_threads
+            self.parser_threads = parser_threads
+
     class FakePdfPipelineOptions:
         def __init__(
             self,
@@ -460,8 +934,14 @@ def test_converter_explicitly_disables_ocr_for_digital_pdf(
             self.do_ocr = do_ocr
 
     class FakePdfFormatOption:
-        def __init__(self, *, pipeline_options: FakePdfPipelineOptions):
+        def __init__(
+            self,
+            *,
+            pipeline_options: FakePdfPipelineOptions,
+            backend_options: FakeThreadedDoclingParseBackendOptions,
+        ):
             observed["pipeline_options"] = pipeline_options
+            observed["backend_options"] = backend_options
 
     class FakeInputFormat:
         PDF = "pdf"
@@ -507,11 +987,17 @@ def test_converter_explicitly_disables_ocr_for_digital_pdf(
             LayoutObjectDetectionOptions=FakeLayoutObjectDetectionOptions,
             HeadingHierarchyOptions=FakeHeadingHierarchyOptions,
         ),
+        "docling.datamodel.backend_options": SimpleNamespace(
+            ThreadedDoclingParseBackendOptions=(
+                FakeThreadedDoclingParseBackendOptions
+            )
+        ),
         "onnxruntime": SimpleNamespace(),
     }
     monkeypatch.setattr(adapter.importlib, "import_module", modules.__getitem__)
     monkeypatch.setenv("PAPERTRANS_DOCLING_ARTIFACTS_PATH", "/models/docling")
     monkeypatch.setenv("PAPERTRANS_DOCLING_DOCUMENT_TIMEOUT", "123.5")
+    monkeypatch.setenv("PAPERTRANS_DOCLING_PARSER_THREADS", "3")
 
     result = adapter.convert_pdf_with_docling(Path("paper.pdf"))
 
@@ -530,6 +1016,8 @@ def test_converter_explicitly_disables_ocr_for_digital_pdf(
     assert observed["accelerator_device"] == FakeAcceleratorDevice.CPU
     assert observed["onnx_providers"] == ["CPUExecutionProvider"]
     assert observed["heading_hierarchy_enabled"] is True
+    assert observed["parser_threads"] == 3
+    assert observed["backend_options"].parser_threads == 3
     assert observed["source"] == Path("paper.pdf")
     assert observed["raises_on_error"] is False
     format_options = observed["format_options"]
@@ -746,6 +1234,95 @@ def test_parent_runs_worker_without_stdout_protocol_and_reads_atomic_json(
     assert not worker_output.exists()
     assert json.loads((work_dir / "docling-document.json").read_text()) == result
     assert result["schema_name"] == "DoclingDocument"
+
+
+def test_parent_retries_native_parser_crash_once_with_one_parser_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    work_dir = tmp_path / "work"
+    calls: list[dict[str, object]] = []
+    retry_directories: list[Path] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            assert "env" not in kwargs
+            kwargs["stderr"].write(b"native parser crashed\n")
+            return SimpleNamespace(returncode=-adapter.signal.SIGSEGV)
+        assert kwargs["env"]["PAPERTRANS_DOCLING_PARSER_THREADS"] == "1"
+        retry_directory = Path(kwargs["cwd"])
+        retry_directories.append(retry_directory)
+        assert retry_directory.parent == work_dir.resolve()
+        assert retry_directory.name.startswith(".docling-retry-")
+        kwargs["stderr"].write(b"single-thread retry succeeded\n")
+        Path(command[-1]).write_text(
+            json.dumps(sample_docling_document()), encoding="utf-8"
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
+    monkeypatch.setattr(adapter.subprocess, "run", fake_run)
+    result = adapter._run_docling_worker(source, work_dir, timeout_seconds=12.5)
+
+    assert len(calls) == 2
+    assert len(retry_directories) == 1
+    assert not retry_directories[0].exists()
+    assert result["schema_name"] == "DoclingDocument"
+    log = (work_dir / "docling-worker.log").read_text()
+    assert "native parser crashed" in log
+    assert "retrying once with parser_threads=1" in log
+    assert "single-thread retry succeeded" in log
+
+
+def test_parent_retries_partial_conversion_once_with_one_parser_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    work_dir = tmp_path / "work"
+    calls: list[dict[str, object]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["stderr"].write(b"partial conversion\n")
+            return SimpleNamespace(returncode=adapter._DOCLING_PARTIAL_EXIT_CODE)
+        assert kwargs["env"]["PAPERTRANS_DOCLING_PARSER_THREADS"] == "1"
+        Path(command[-1]).write_text(
+            json.dumps(sample_docling_document()), encoding="utf-8"
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
+    monkeypatch.setattr(adapter.subprocess, "run", fake_run)
+    result = adapter._run_docling_worker(source, work_dir, timeout_seconds=12.5)
+
+    assert len(calls) == 2
+    assert result["schema_name"] == "DoclingDocument"
+    log = (work_dir / "docling-worker.log").read_text()
+    assert "partial conversion" in log
+    assert "retrying once with parser_threads=1" in log
+
+
+def test_parent_does_not_retry_persistent_partial_conversion_more_than_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def partial_run(_command: list[str], **kwargs):
+        nonlocal calls
+        calls += 1
+        kwargs["stderr"].write(b"partial conversion\n")
+        return SimpleNamespace(returncode=adapter._DOCLING_PARTIAL_EXIT_CODE)
+
+    monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
+    monkeypatch.setattr(adapter.subprocess, "run", partial_run)
+    with pytest.raises(adapter.DoclingWorkerError, match="status 75"):
+        adapter._run_docling_worker(tmp_path / "paper.pdf", tmp_path / "work")
+
+    assert calls == 2
 
 
 def test_parent_rejects_nonfinite_worker_timeout_without_starting_worker(

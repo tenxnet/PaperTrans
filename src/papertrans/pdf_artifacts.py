@@ -261,6 +261,108 @@ def write_semantic_pdf_qa(
         if not assignment.get("hidden") and assignment.get("role") in semantic_roles
     }
     missing_semantic_blocks = sorted(expected_blocks - represented_blocks)
+    embedded_visual_text_blocks = {
+        str(block.get("blockId"))
+        for page in evidence_pages
+        for block in page.get("blocks", [])
+        if block.get("suppressedVisualText") and block.get("blockId")
+    }
+    structure_visual_text_blocks = {
+        str(assignment.get("blockId"))
+        for page in (structure or {}).get("pages", [])
+        for assignment in page.get("blockAssignments", [])
+        if assignment.get("suppressedVisualText") and assignment.get("blockId")
+    }
+    structurally_visible_visual_text = {
+        str(assignment.get("blockId"))
+        for page in (structure or {}).get("pages", [])
+        for assignment in page.get("blockAssignments", [])
+        if assignment.get("suppressedVisualText")
+        and not assignment.get("hidden")
+        and assignment.get("blockId")
+    }
+    embedded_visual_text_blocks.update(structure_visual_text_blocks)
+    leaked_visual_text_blocks = sorted(
+        (embedded_visual_text_blocks & represented_blocks)
+        | structurally_visible_visual_text
+    )
+    caption_block_usage: dict[str, list[str]] = {}
+    visuals_by_page: dict[int, list[dict[str, Any]]] = {}
+    for page in (structure or {}).get("pages", []):
+        page_number = int(page.get("pageNumber", 0))
+        page_visuals = list(page.get("visualObjects", []))
+        visuals_by_page[page_number] = page_visuals
+        for visual in page_visuals:
+            object_id = str(visual.get("objectId") or "")
+            for block_id in visual.get("captionBlockIds", []):
+                caption_block_usage.setdefault(str(block_id), []).append(object_id)
+    duplicate_visual_caption_blocks = sorted(
+        block_id
+        for block_id, object_ids in caption_block_usage.items()
+        if len(set(object_ids)) > 1
+    )
+    unattached_visual_caption_blocks = sorted(
+        str(assignment.get("blockId"))
+        for page in (structure or {}).get("pages", [])
+        for assignment in page.get("blockAssignments", [])
+        if assignment.get("visualCaptionCandidate")
+        and not assignment.get("associatedVisualCaption")
+        and not assignment.get("hidden")
+        and assignment.get("blockId")
+    )
+    evidence_blocks_by_page = {
+        int(page.get("pageNumber", 0)): {
+            str(block.get("blockId")): block
+            for block in page.get("blocks", [])
+            if block.get("blockId")
+        }
+        for page in evidence_pages
+    }
+    visible_visual_overlap_blocks: set[str] = set()
+    overlap_roles = {"abstract", "list_item", "paragraph", "reference"}
+    for page in (structure or {}).get("pages", []):
+        page_number = int(page.get("pageNumber", 0))
+        page_blocks = evidence_blocks_by_page.get(page_number, {})
+        visual_bboxes = [
+            visual.get("bboxNormalized", [])
+            for visual in visuals_by_page.get(page_number, [])
+        ]
+        for assignment in page.get("blockAssignments", []):
+            block_id = str(assignment.get("blockId") or "")
+            block = page_blocks.get(block_id)
+            if (
+                not block_id
+                or block is None
+                or assignment.get("hidden")
+                or assignment.get("role") not in overlap_roles
+                or assignment.get("associatedVisualCaption")
+            ):
+                continue
+            bbox = block.get("bboxNormalized", [])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            area = max(0.0, float(bbox[2]) - float(bbox[0])) * max(
+                0.0, float(bbox[3]) - float(bbox[1])
+            )
+            if area <= 0:
+                continue
+            for visual_bbox in visual_bboxes:
+                if not isinstance(visual_bbox, list) or len(visual_bbox) != 4:
+                    continue
+                intersection_width = max(
+                    0.0,
+                    min(float(bbox[2]), float(visual_bbox[2]))
+                    - max(float(bbox[0]), float(visual_bbox[0])),
+                )
+                intersection_height = max(
+                    0.0,
+                    min(float(bbox[3]), float(visual_bbox[3]))
+                    - max(float(bbox[1]), float(visual_bbox[1])),
+                )
+                if intersection_width * intersection_height / area >= 0.4:
+                    visible_visual_overlap_blocks.add(block_id)
+                    break
+    visible_visual_overlap_block_ids = sorted(visible_visual_overlap_blocks)
     qa = {
         "schemaVersion": PDF_JOB_SCHEMA_VERSION,
         "status": (
@@ -270,6 +372,10 @@ def write_semantic_pdf_qa(
             and not invalid_geometry_pages
             and not all_text_pages_empty
             and not missing_semantic_blocks
+            and not leaked_visual_text_blocks
+            and not duplicate_visual_caption_blocks
+            and not unattached_visual_caption_blocks
+            and not visible_visual_overlap_block_ids
             and bool(semantic_body_units)
             else "failed"
         ),
@@ -292,6 +398,13 @@ def write_semantic_pdf_qa(
         "semanticSourceBlocks": len(expected_blocks),
         "representedSemanticBlocks": len(expected_blocks & represented_blocks),
         "missingSemanticBlocks": missing_semantic_blocks,
+        "visualTextDetected": len(embedded_visual_text_blocks),
+        "visualTextSuppressed": len(embedded_visual_text_blocks)
+        - len(leaked_visual_text_blocks),
+        "leakedVisualTextBlockIds": leaked_visual_text_blocks,
+        "duplicateVisualCaptionBlockIds": duplicate_visual_caption_blocks,
+        "unattachedVisualCaptionBlockIds": unattached_visual_caption_blocks,
+        "visibleVisualOverlapBlockIds": visible_visual_overlap_block_ids,
         "unresolvedInternalLinks": len(unresolved_links),
         "unresolvedInternalLinkTargets": unresolved_links,
         "missingLocalAssets": missing_assets,

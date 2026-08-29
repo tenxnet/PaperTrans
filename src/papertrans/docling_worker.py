@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .docling_adapter import convert_pdf_with_docling
+from .docling_adapter import (
+    _DOCLING_PARTIAL_EXIT_CODE,
+    DoclingPartialConversionError,
+    convert_pdf_with_docling,
+)
 
 
 def write_json_atomic(value: dict[str, Any], output_path: Path) -> None:
@@ -44,7 +49,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    document = convert_pdf_with_docling(args.source)
+    try:
+        document = convert_pdf_with_docling(args.source)
+    except DoclingPartialConversionError as error:
+        print(str(error), file=sys.stderr)
+        return _DOCLING_PARTIAL_EXIT_CODE
     write_json_atomic(document, args.output_json)
     return 0
 

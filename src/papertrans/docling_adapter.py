@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .deterministic_structure import visual_caption_score
 from .structure import render_visual_objects, validate_structure_batch
 
 
@@ -34,7 +36,12 @@ class DoclingWorkerTimeoutError(DoclingWorkerError):
     """Raised when the isolated Docling conversion worker times out."""
 
 
+class DoclingPartialConversionError(DoclingAdapterError):
+    """Raised when Docling returns only a partial PDF conversion."""
+
+
 _DOCLING_WORKER_LOG_LIMIT_BYTES = 256 * 1024
+_DOCLING_PARTIAL_EXIT_CODE = 75
 _DOCLING_DOCUMENT_TIMEOUT_SECONDS = 10 * 60.0
 _DOCLING_WORKER_TIMEOUT_SECONDS = _DOCLING_DOCUMENT_TIMEOUT_SECONDS + 30.0
 _CONTENT_COLLECTIONS = (
@@ -293,6 +300,19 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
         raise DoclingAdapterError(
             "PAPERTRANS_DOCLING_DOCUMENT_TIMEOUT must be a positive number"
         )
+    raw_parser_threads = os.environ.get("PAPERTRANS_DOCLING_PARSER_THREADS")
+    parser_threads: int | None = None
+    if raw_parser_threads is not None:
+        try:
+            parser_threads = int(raw_parser_threads)
+        except ValueError as error:
+            raise DoclingAdapterError(
+                "PAPERTRANS_DOCLING_PARSER_THREADS must be a positive integer"
+            ) from error
+        if parser_threads <= 0:
+            raise DoclingAdapterError(
+                "PAPERTRANS_DOCLING_PARSER_THREADS must be a positive integer"
+            )
     pipeline_kwargs: dict[str, Any] = {
         "do_ocr": False,
         "document_timeout": document_timeout,
@@ -311,11 +331,29 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
     if artifacts_path:
         pipeline_kwargs["artifacts_path"] = Path(artifacts_path)
     pdf_pipeline_options = pdf_pipeline_options_class(**pipeline_kwargs)
+    format_kwargs: dict[str, Any] = {"pipeline_options": pdf_pipeline_options}
+    if parser_threads is not None:
+        try:
+            backend_options_module = importlib.import_module(
+                "docling.datamodel.backend_options"
+            )
+        except (ImportError, ModuleNotFoundError) as error:
+            raise DoclingUnavailableError(
+                "The installed Docling package does not expose parser-thread controls"
+            ) from error
+        backend_options_class = getattr(
+            backend_options_module, "ThreadedDoclingParseBackendOptions", None
+        )
+        if backend_options_class is None:
+            raise DoclingUnavailableError(
+                "The installed Docling package does not expose parser-thread controls"
+            )
+        format_kwargs["backend_options"] = backend_options_class(
+            parser_threads=parser_threads
+        )
     converter = converter_class(
         format_options={
-            input_format.PDF: pdf_format_option_class(
-                pipeline_options=pdf_pipeline_options
-            )
+            input_format.PDF: pdf_format_option_class(**format_kwargs)
         }
     )
     result = converter.convert(Path(source), raises_on_error=False)
@@ -324,7 +362,12 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
         raw_status = getattr(status, "value", status)
         status_label = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(raw_status))[:64]
         summary = _sanitized_conversion_summary(getattr(result, "errors", []))
-        raise DoclingAdapterError(
+        error_class = (
+            DoclingPartialConversionError
+            if status_label == "partial_success"
+            else DoclingAdapterError
+        )
+        raise error_class(
             f"Docling conversion status {status_label or 'unknown'}: {summary}"
         )
     document = getattr(result, "document", None)
@@ -423,34 +466,87 @@ def _run_docling_worker(
     ]
     retained_stderr = bytearray()
     stderr_totals = [0]
-    read_fd, write_fd = os.pipe()
-    stderr_reader = threading.Thread(
-        target=_drain_worker_stderr,
-        args=(read_fd, retained_stderr, stderr_totals),
-        name="papertrans-docling-stderr",
-        daemon=True,
-    )
-    stderr_reader.start()
-    timeout_error: subprocess.TimeoutExpired | None = None
-    run_error: BaseException | None = None
-    process: Any | None = None
-    try:
-        with os.fdopen(write_fd, "wb", buffering=0) as stderr_writer:
-            try:
-                process = subprocess.run(
-                    command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr_writer,
-                    cwd=work_dir,
-                    check=False,
-                    timeout=timeout_seconds,
-                )
-            except subprocess.TimeoutExpired as error:
-                timeout_error = error
-            except BaseException as error:
-                run_error = error
-    finally:
-        stderr_reader.join()
+
+    def retain_log_chunk(chunk: bytes) -> None:
+        stderr_totals[0] += len(chunk)
+        retained_stderr.extend(chunk)
+        overflow = len(retained_stderr) - _DOCLING_WORKER_LOG_LIMIT_BYTES
+        if overflow > 0:
+            del retained_stderr[:overflow]
+
+    def run_attempt(
+        child_env: Mapping[str, str] | None = None,
+        attempt_work_dir: Path | None = None,
+    ) -> tuple[Any | None, subprocess.TimeoutExpired | None, BaseException | None]:
+        read_fd, write_fd = os.pipe()
+        stderr_reader = threading.Thread(
+            target=_drain_worker_stderr,
+            args=(read_fd, retained_stderr, stderr_totals),
+            name="papertrans-docling-stderr",
+            daemon=True,
+        )
+        stderr_reader.start()
+        attempt_process: Any | None = None
+        attempt_timeout: subprocess.TimeoutExpired | None = None
+        attempt_error: BaseException | None = None
+        try:
+            with os.fdopen(write_fd, "wb", buffering=0) as stderr_writer:
+                run_kwargs: dict[str, Any] = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": stderr_writer,
+                    "cwd": attempt_work_dir or work_dir,
+                    "check": False,
+                    "timeout": timeout_seconds,
+                }
+                if child_env is not None:
+                    run_kwargs["env"] = dict(child_env)
+                try:
+                    attempt_process = subprocess.run(command, **run_kwargs)
+                except subprocess.TimeoutExpired as error:
+                    attempt_timeout = error
+                except BaseException as error:
+                    attempt_error = error
+        finally:
+            stderr_reader.join()
+        return attempt_process, attempt_timeout, attempt_error
+
+    process, timeout_error, run_error = run_attempt()
+    retryable_signals = {
+        -value
+        for value in (
+            getattr(signal, "SIGSEGV", None),
+            getattr(signal, "SIGBUS", None),
+            getattr(signal, "SIGABRT", None),
+        )
+        if isinstance(value, int)
+    }
+    retry_reason: str | None = None
+    if process is not None and process.returncode in retryable_signals:
+        retry_reason = f"native signal {process.returncode}"
+    elif process is not None and process.returncode == _DOCLING_PARTIAL_EXIT_CODE:
+        retry_reason = "partial conversion"
+    if (
+        timeout_error is None
+        and run_error is None
+        and process is not None
+        and retry_reason is not None
+        and os.environ.get("PAPERTRANS_DOCLING_PARSER_THREADS") != "1"
+    ):
+        _cleanup_worker_output(output_path)
+        retain_log_chunk(
+            (
+                f"\nPaperTrans: Docling worker returned {retry_reason}; "
+                "retrying once with parser_threads=1.\n"
+            ).encode()
+        )
+        retry_env = os.environ.copy()
+        retry_env["PAPERTRANS_DOCLING_PARSER_THREADS"] = "1"
+        with tempfile.TemporaryDirectory(
+            prefix=".docling-retry-", dir=work_dir
+        ) as retry_directory:
+            process, timeout_error, run_error = run_attempt(
+                retry_env, Path(retry_directory)
+            )
     if timeout_error is not None:
         log = _capped_worker_log(
             bytes(retained_stderr),
@@ -867,6 +963,20 @@ def _visual_label(caption_texts: list[str], kind: str) -> str | None:
     return None if kind in {"figure", "table"} else kind.title()
 
 
+def _object_label_kind(text: str) -> str | None:
+    match = _OBJECT_LABEL.match(text)
+    if match is None:
+        return None
+    prefix = match.group(1).lower().rstrip(".")
+    if prefix in {"figure", "fig"}:
+        return "figure"
+    if prefix == "table":
+        return "table"
+    if prefix == "algorithm":
+        return "algorithm"
+    return "equation"
+
+
 def _source_name(document: Mapping[str, Any], source_file: str | Path | None) -> str:
     if source_file is not None:
         return Path(source_file).name
@@ -929,6 +1039,82 @@ def docling_document_to_ir(
                 f"Page {page_number}: page metadata was missing; geometry uses a unit page."
             )
 
+    visual_descendant_owners: dict[str, set[str]] = {}
+    visual_caption_refs: set[str] = set()
+    visual_footnote_refs: set[str] = set()
+    visual_footnote_owners: dict[str, set[str]] = {}
+    visual_reference_refs: set[str] = set()
+    visual_regions_by_page: dict[int, list[tuple[str, list[float]]]] = {}
+
+    def collect_visual_descendants(owner_ref: str, value: Any, seen: set[str]) -> None:
+        ref = _ref_value(value)
+        if ref is None or ref in seen or ref == owner_ref:
+            return
+        seen.add(ref)
+        indexed = ref_index.get(ref)
+        if indexed is None:
+            return
+        visual_descendant_owners.setdefault(ref, set()).add(owner_ref)
+        _collection, item = indexed
+        for child in _as_sequence(item.get("children")):
+            collect_visual_descendants(owner_ref, child, seen)
+
+    for owner_ref in dict.fromkeys(ordered_content_refs):
+        collection, item = ref_index[owner_ref]
+        if _visual_kind(collection, item) is None:
+            continue
+        if (provenance := next(iter(_provenance(item)), None)) is not None:
+            page_number = _page_number(provenance)
+            if page_number in page_sizes:
+                _pdf, normalized, _warnings, valid = _bbox(
+                    provenance, page_sizes[page_number]
+                )
+                if valid:
+                    visual_regions_by_page.setdefault(page_number, []).append(
+                        (owner_ref, normalized)
+                    )
+        for field, destination in (
+            ("captions", visual_caption_refs),
+            ("footnotes", visual_footnote_refs),
+            ("references", visual_reference_refs),
+        ):
+            for value in _as_sequence(item.get(field)):
+                if (ref := _ref_value(value)) is not None:
+                    destination.add(ref)
+                    if field == "footnotes":
+                        visual_footnote_owners.setdefault(ref, set()).add(owner_ref)
+        for child in _as_sequence(item.get("children")):
+            collect_visual_descendants(owner_ref, child, set())
+
+    independently_reachable_body_refs: set[str] = set()
+
+    def collect_non_visual_body_refs(value: Any, seen: set[str]) -> None:
+        ref = _ref_value(value)
+        if ref is None or ref in seen:
+            return
+        seen.add(ref)
+        indexed = ref_index.get(ref)
+        if indexed is None:
+            return
+        collection, item = indexed
+        if _visual_kind(collection, item) is not None:
+            return
+        if collection not in {"body", "furniture", "groups"}:
+            independently_reachable_body_refs.add(ref)
+        for child in _as_sequence(item.get("children")):
+            collect_non_visual_body_refs(child, seen)
+
+    body_root = raw.get("body")
+    if isinstance(body_root, Mapping):
+        for child in _as_sequence(body_root.get("children")):
+            collect_non_visual_body_refs(child, set())
+
+    preserved_visual_refs = visual_footnote_refs | visual_reference_refs
+    suppressed_visual_refs = (
+        set(visual_descendant_owners)
+        - preserved_visual_refs
+        - independently_reachable_body_refs
+    )
     traversal: list[tuple[int, str, str, Mapping[str, Any], bool]] = []
     visited: set[str] = set()
     traversal_index = 0
@@ -988,6 +1174,34 @@ def docling_document_to_ir(
     records: list[dict[str, Any]] = []
     item_order: dict[str, int] = {}
     ref_to_block_ids: dict[str, list[str]] = {}
+
+    def overlapping_visual_owners(
+        page_number: int, bbox: list[float]
+    ) -> set[str]:
+        width = max(0.0, bbox[2] - bbox[0])
+        height = max(0.0, bbox[3] - bbox[1])
+        area = width * height
+        if area <= 0:
+            return set()
+        center_x = (bbox[0] + bbox[2]) / 2
+        center_y = (bbox[1] + bbox[3]) / 2
+        owners: set[str] = set()
+        for owner_ref, visual_bbox in visual_regions_by_page.get(page_number, []):
+            intersection_width = max(
+                0.0, min(bbox[2], visual_bbox[2]) - max(bbox[0], visual_bbox[0])
+            )
+            intersection_height = max(
+                0.0, min(bbox[3], visual_bbox[3]) - max(bbox[1], visual_bbox[1])
+            )
+            overlap_ratio = intersection_width * intersection_height / area
+            center_inside = (
+                visual_bbox[0] <= center_x <= visual_bbox[2]
+                and visual_bbox[1] <= center_y <= visual_bbox[3]
+            )
+            if center_inside or overlap_ratio >= 0.4:
+                owners.add(owner_ref)
+        return owners
+
     for order, ref, collection, item, furniture_item in traversal:
         item_order[ref] = order
         raw_text = _raw_text(item)
@@ -1031,10 +1245,12 @@ def docling_document_to_ir(
                 ]
         base_id = _safe_id(ref)
         ref_to_block_ids[ref] = []
-        role = _ROLE_BY_LABEL.get(_label(item), "paragraph")
-        if furniture_item and role not in _FURNITURE_ROLES:
-            role = "header"
-        paragraph_id = f"para-{base_id}" if role in _BODY_ROLES else None
+        if ref in visual_footnote_refs:
+            base_role = "footnote"
+        else:
+            base_role = _ROLE_BY_LABEL.get(_label(item), "paragraph")
+        if furniture_item and base_role not in _FURNITURE_ROLES:
+            base_role = "header"
         previous_block_id: str | None = None
         for segment_index, (segment, provenance, segment_warnings) in enumerate(segment_values, start=1):
             block_id = base_id if segment_index == 1 else f"{base_id}-s{segment_index}"
@@ -1049,6 +1265,25 @@ def docling_document_to_ir(
                 pdf_bbox, normalized_bbox, bbox_warnings, valid_bbox = _bbox(
                     provenance, page_sizes[page_number]
                 )
+            embedded_visual_owners = (
+                set(visual_descendant_owners.get(ref, set()))
+                if ref in suppressed_visual_refs
+                else set()
+            )
+            if (
+                not embedded_visual_owners
+                and collection == "texts"
+                and _label(item) in {"text", "paragraph"}
+                and 0 < len(segment) <= 160
+                and valid_bbox
+            ):
+                embedded_visual_owners.update(
+                    overlapping_visual_owners(page_number, normalized_bbox)
+                )
+            suppressed_visual_text = bool(embedded_visual_owners)
+            role = "noise" if suppressed_visual_text else base_role
+            paragraph_id = f"para-{base_id}" if role in _BODY_ROLES else None
+            continues_from = previous_block_id if paragraph_id is not None else None
             warnings = [*segment_warnings, *bbox_warnings]
             records.append(
                 {
@@ -1066,13 +1301,17 @@ def docling_document_to_ir(
                     "bboxValid": valid_bbox,
                     "role": role,
                     "paragraphId": paragraph_id,
-                    "continuesFrom": previous_block_id,
+                    "continuesFrom": continues_from,
                     "furniture": furniture_item,
+                    "embeddedVisualOwnerRefs": sorted(embedded_visual_owners),
+                    "suppressedVisualText": suppressed_visual_text,
+                    "visualCaptionCandidate": False,
+                    "associatedVisualCaption": False,
                     "warnings": warnings,
                 }
             )
             ref_to_block_ids[ref].append(block_id)
-            previous_block_id = block_id
+            previous_block_id = block_id if paragraph_id is not None else None
 
     records.sort(key=lambda value: (value["order"], value["segmentIndex"]))
     _promote_missing_title(records)
@@ -1123,8 +1362,6 @@ def docling_document_to_ir(
             if record["role"] == "reference":
                 record["paragraphId"] = f"reference-{record['sourceBlockId']}"
 
-    _link_cross_item_page_continuations(records)
-
     block_by_id = {record["blockId"]: record for record in records}
     page_records: dict[int, list[dict[str, Any]]] = {page: [] for page in page_sizes}
     for record in records:
@@ -1133,6 +1370,8 @@ def docling_document_to_ir(
         values.sort(key=lambda value: (value["order"], value["segmentIndex"]))
 
     visuals_by_page: dict[int, list[dict[str, Any]]] = {page: [] for page in page_sizes}
+    visual_entries: list[dict[str, Any]] = []
+    explicit_caption_owners: dict[str, set[str]] = {}
     for order, ref, collection, item, _furniture_item in traversal:
         kind = _visual_kind(collection, item)
         if kind is None:
@@ -1151,57 +1390,352 @@ def docling_document_to_ir(
         if not valid_bbox or area < 0.0005:
             document_warnings.append(f"Skipped {kind} {ref}: invalid or implausibly small crop.")
             continue
-        caption_refs = [
+        explicit_caption_refs = [
             caption_ref
             for value in _as_sequence(item.get("captions"))
             if (caption_ref := _ref_value(value)) is not None
         ]
-        caption_block_ids = [
-            block_id
-            for caption_ref in caption_refs
-            for block_id in ref_to_block_ids.get(caption_ref, [])
-            if block_by_id[block_id]["pageNumber"] == page_number
+        for caption_ref in explicit_caption_refs:
+            explicit_caption_owners.setdefault(caption_ref, set()).add(ref)
+        visual_entries.append(
+            {
+                "ref": ref,
+                "order": order,
+                "pageNumber": page_number,
+                "kind": kind,
+                "bboxNormalized": normalized_bbox,
+                "explicitCaptionRefs": explicit_caption_refs,
+                "objectId": _safe_id(ref, prefix=kind),
+                "confidence": 0.99,
+                "warnings": bbox_warnings,
+            }
+        )
+
+    visual_entry_by_ref = {entry["ref"]: entry for entry in visual_entries}
+    for record_index, record in enumerate(records):
+        if record["role"] != "footnote" or record["ref"] not in visual_footnote_owners:
+            continue
+        owner_entries = [
+            visual_entry_by_ref[owner_ref]
+            for owner_ref in visual_footnote_owners[record["ref"]]
+            if owner_ref in visual_entry_by_ref
+            and visual_entry_by_ref[owner_ref]["pageNumber"] == record["pageNumber"]
         ]
-        caption_texts = [block_by_id[block_id]["text"] for block_id in caption_block_ids]
+        if not owner_entries:
+            continue
+        record_bbox = record["bboxNormalized"]
+        minimum_gap = min(
+            max(
+                max(
+                    0.0,
+                    max(record_bbox[0], entry["bboxNormalized"][0])
+                    - min(record_bbox[2], entry["bboxNormalized"][2]),
+                ),
+                max(
+                    0.0,
+                    max(record_bbox[1], entry["bboxNormalized"][1])
+                    - min(record_bbox[3], entry["bboxNormalized"][3]),
+                ),
+            )
+            for entry in owner_entries
+        )
+        previous_body = next(
+            (
+                candidate
+                for candidate in reversed(records[:record_index])
+                if not candidate["furniture"]
+                and not candidate["suppressedVisualText"]
+                and candidate["role"] in {"abstract", "paragraph"}
+            ),
+            None,
+        )
+        if (
+            minimum_gap > 0.12
+            and previous_body is not None
+            and record["pageNumber"] == previous_body["pageNumber"] + 1
+            and not re.search(r"[.!?;:)[\]}”’]\s*$", previous_body["text"].rstrip())
+        ):
+            record["role"] = "paragraph"
+            record["paragraphId"] = f"para-{record['sourceBlockId']}"
+            record["continuesFrom"] = None
+
+    def is_caption_record(record: dict[str, Any]) -> bool:
+        match = _OBJECT_LABEL.match(record["text"])
+        if match is None:
+            return False
+        if (
+            _label(record["item"]) == "caption"
+            or record["ref"] in explicit_caption_owners
+        ):
+            return True
+        remainder = record["text"][match.end() :].lstrip()
+        return not remainder or remainder[0] in ":.-–—"
+
+    caption_records = [record for record in records if is_caption_record(record)]
+    caption_edges: list[tuple[float, int, int, dict[str, Any], dict[str, Any]]] = []
+    for record in caption_records:
+        caption_kind = _object_label_kind(record["text"])
+        assert caption_kind is not None
+        for visual_entry in visual_entries:
+            if (
+                visual_entry["pageNumber"] != record["pageNumber"]
+                or visual_entry["kind"] != caption_kind
+            ):
+                continue
+            score = visual_caption_score(
+                caption_kind,
+                tuple(float(value) for value in record["bboxNormalized"]),
+                tuple(float(value) for value in visual_entry["bboxNormalized"]),
+            )
+            if score < 0:
+                continue
+            record["visualCaptionCandidate"] = True
+            explicit_match = int(
+                visual_entry["ref"] in explicit_caption_owners.get(record["ref"], set())
+            )
+            caption_edges.append(
+                (
+                    score,
+                    explicit_match,
+                    -abs(int(record["order"]) - int(visual_entry["order"])),
+                    record,
+                    visual_entry,
+                )
+            )
+
+    assigned_caption_records: dict[str, list[dict[str, Any]]] = {
+        visual_entry["ref"]: [] for visual_entry in visual_entries
+    }
+    claimed_caption_blocks: set[str] = set()
+    claimed_caption_visuals: set[str] = set()
+    associated_orphan_captions: list[dict[str, str]] = []
+    associated_pairs: set[tuple[str, str]] = set()
+
+    def assign_caption(
+        record: dict[str, Any],
+        visual_entry: dict[str, Any],
+        *,
+        primary: bool,
+    ) -> None:
+        block_id = record["blockId"]
+        visual_ref = visual_entry["ref"]
+        if block_id in claimed_caption_blocks:
+            return
+        claimed_caption_blocks.add(block_id)
+        assigned_caption_records[visual_ref].append(record)
+        record["role"] = "caption"
+        record["paragraphId"] = None
+        record["continuesFrom"] = None
+        record["suppressedVisualText"] = False
+        record["associatedVisualCaption"] = True
+        if primary:
+            claimed_caption_visuals.add(visual_ref)
+            if visual_ref not in explicit_caption_owners.get(record["ref"], set()):
+                pair = (record["ref"], visual_ref)
+                if pair not in associated_pairs:
+                    associated_pairs.add(pair)
+                    associated_orphan_captions.append(
+                        {"captionRef": record["ref"], "visualRef": visual_ref}
+                    )
+
+    caption_edges.sort(key=lambda value: value[:3], reverse=True)
+    for _score, _explicit, _order_distance, record, visual_entry in caption_edges:
+        if (
+            record["blockId"] in claimed_caption_blocks
+            or visual_entry["ref"] in claimed_caption_visuals
+        ):
+            continue
+        assign_caption(record, visual_entry, primary=True)
+
+    for record in caption_records:
+        if record["blockId"] in claimed_caption_blocks:
+            continue
+        caption_kind = _object_label_kind(record["text"])
+        explicit_entries = [
+            visual_entry
+            for visual_entry in visual_entries
+            if visual_entry["ref"] in explicit_caption_owners.get(record["ref"], set())
+            and visual_entry["pageNumber"] == record["pageNumber"]
+            and visual_entry["kind"] == caption_kind
+            and visual_entry["ref"] not in claimed_caption_visuals
+        ]
+        if explicit_entries:
+            record["visualCaptionCandidate"] = True
+            explicit_entry = min(
+                explicit_entries,
+                key=lambda value: abs(int(record["order"]) - int(value["order"])),
+            )
+            assign_caption(record, explicit_entry, primary=True)
+
+    for visual_entry in visual_entries:
+        visual_ref = visual_entry["ref"]
+        if visual_ref in claimed_caption_visuals:
+            continue
+        fallback_records = [
+            record
+            for caption_ref in visual_entry["explicitCaptionRefs"]
+            for block_id in ref_to_block_ids.get(caption_ref, [])
+            if (record := block_by_id[block_id])["pageNumber"]
+            == visual_entry["pageNumber"]
+            and record["blockId"] not in claimed_caption_blocks
+            and _object_label_kind(record["text"]) is None
+            and _label(record["item"]) == "caption"
+        ]
+        ranked_fallbacks = sorted(
+            (
+                (
+                    visual_caption_score(
+                        visual_entry["kind"],
+                        tuple(float(value) for value in record["bboxNormalized"]),
+                        tuple(
+                            float(value) for value in visual_entry["bboxNormalized"]
+                        ),
+                    ),
+                    record,
+                )
+                for record in fallback_records
+            ),
+            key=lambda value: value[0],
+            reverse=True,
+        )
+        if ranked_fallbacks and ranked_fallbacks[0][0] >= 0:
+            ranked_fallbacks[0][1]["visualCaptionCandidate"] = True
+            assign_caption(ranked_fallbacks[0][1], visual_entry, primary=True)
+
+    def shares_caption_line(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_bbox = left["bboxNormalized"]
+        right_bbox = right["bboxNormalized"]
+        overlap = max(
+            0.0, min(left_bbox[3], right_bbox[3]) - max(left_bbox[1], right_bbox[1])
+        )
+        minimum_height = max(
+            1e-9,
+            min(left_bbox[3] - left_bbox[1], right_bbox[3] - right_bbox[1]),
+        )
+        horizontal_gap = max(
+            0.0,
+            max(left_bbox[0], right_bbox[0]) - min(left_bbox[2], right_bbox[2]),
+        )
+        center_distance = abs(
+            (left_bbox[1] + left_bbox[3]) / 2
+            - (right_bbox[1] + right_bbox[3]) / 2
+        )
+        return (
+            overlap / minimum_height >= 0.5
+            and center_distance <= 0.008
+            and horizontal_gap <= 0.02
+        )
+
+    for visual_entry in visual_entries:
+        visual_ref = visual_entry["ref"]
+        line_records = list(assigned_caption_records[visual_ref])
+        if not line_records:
+            continue
+        changed = True
+        while changed:
+            changed = False
+            for record in page_records[visual_entry["pageNumber"]]:
+                if (
+                    record["blockId"] in claimed_caption_blocks
+                    or record["furniture"]
+                    or record["collection"] != "texts"
+                    or _object_label_kind(record["text"]) is not None
+                    or abs(int(record["order"]) - int(line_records[0]["order"])) > 12
+                    or not any(shares_caption_line(record, value) for value in line_records)
+                ):
+                    continue
+                record["visualCaptionCandidate"] = True
+                assign_caption(record, visual_entry, primary=False)
+                line_records.append(record)
+                changed = True
+
+    _link_cross_item_page_continuations(records)
+
+    for visual_entry in visual_entries:
+        page_number = visual_entry["pageNumber"]
+        visual_ref = visual_entry["ref"]
+        visual_bbox = list(visual_entry["bboxNormalized"])
+        for record in page_records[page_number]:
+            if (
+                not record["suppressedVisualText"]
+                or visual_ref not in record["embeddedVisualOwnerRefs"]
+                or not record["bboxValid"]
+            ):
+                continue
+            record_bbox = record["bboxNormalized"]
+            horizontal_gap = max(
+                0.0,
+                max(visual_bbox[0], record_bbox[0])
+                - min(visual_bbox[2], record_bbox[2]),
+            )
+            vertical_gap = max(
+                0.0,
+                max(visual_bbox[1], record_bbox[1])
+                - min(visual_bbox[3], record_bbox[3]),
+            )
+            if horizontal_gap <= 0.025 and vertical_gap <= 0.025:
+                visual_bbox = [
+                    min(visual_bbox[0], record_bbox[0]),
+                    min(visual_bbox[1], record_bbox[1]),
+                    max(visual_bbox[2], record_bbox[2]),
+                    max(visual_bbox[3], record_bbox[3]),
+                ]
+
         same_page_candidates = [
             record
             for record in records
             if record["pageNumber"] == page_number
-            and record["order"] <= order
+            and record["order"] <= visual_entry["order"]
             and not record["furniture"]
+            and not record["suppressedVisualText"]
             and record["role"] not in {"caption", "equation", "algorithm"}
         ]
         preceding_candidates = [
             record
             for record in records
-            if record["order"] <= order
+            if record["order"] <= visual_entry["order"]
             and not record["furniture"]
+            and not record["suppressedVisualText"]
             and record["role"] not in {"caption", "equation", "algorithm"}
         ]
         fallback_candidates = [
             record
             for record in page_records[page_number]
-            if not record["furniture"] and record["role"] != "caption"
+            if not record["furniture"]
+            and not record["suppressedVisualText"]
+            and record["role"] not in {"caption", "equation", "algorithm"}
         ]
         anchor_record = next(
             (
                 values[-1]
-                for values in (same_page_candidates, preceding_candidates, fallback_candidates)
+                for values in (
+                    same_page_candidates,
+                    preceding_candidates,
+                    fallback_candidates,
+                )
                 if values
             ),
             None,
         )
-        object_id = _safe_id(ref, prefix=kind)
+        caption_values = sorted(
+            assigned_caption_records[visual_ref],
+            key=lambda value: (value["order"], value["segmentIndex"]),
+        )
         visuals_by_page[page_number].append(
             {
-                "objectId": object_id,
-                "kind": kind,
-                "label": _visual_label(caption_texts, kind),
-                "bboxNormalized": normalized_bbox,
-                "captionBlockIds": caption_block_ids,
-                "insertAfterBlockId": anchor_record["blockId"] if anchor_record else None,
-                "confidence": 0.99,
-                "warnings": bbox_warnings,
+                "objectId": visual_entry["objectId"],
+                "kind": visual_entry["kind"],
+                "label": _visual_label(
+                    [record["text"] for record in caption_values],
+                    visual_entry["kind"],
+                ),
+                "bboxNormalized": visual_bbox,
+                "captionBlockIds": [record["blockId"] for record in caption_values],
+                "insertAfterBlockId": anchor_record["blockId"]
+                if anchor_record
+                else None,
+                "confidence": visual_entry["confidence"],
+                "warnings": visual_entry["warnings"],
             }
         )
 
@@ -1224,13 +1758,21 @@ def docling_document_to_ir(
                 "bold": False,
                 "italic": False,
                 "mathCharacterRatio": 1.0 if record["role"] == "equation" else 0.0,
+                "embeddedVisualOwnerRefs": record["embeddedVisualOwnerRefs"],
+                "suppressedVisualText": record["suppressedVisualText"],
+                "visualCaptionCandidate": record["visualCaptionCandidate"],
+                "associatedVisualCaption": record["associatedVisualCaption"],
             }
             for record in values
         ]
         assignments = []
         for reading_order, record in enumerate(values, start=1):
             role = record["role"]
-            hidden = bool(record["furniture"] or role in _FURNITURE_ROLES)
+            hidden = bool(
+                record["furniture"]
+                or record["suppressedVisualText"]
+                or role in _FURNITURE_ROLES
+            )
             assignments.append(
                 {
                     "blockId": record["blockId"],
@@ -1245,6 +1787,9 @@ def docling_document_to_ir(
                     "referenceLabel": _reference_label(record["text"])
                     if role == "reference"
                     else None,
+                    "suppressedVisualText": record["suppressedVisualText"],
+                    "visualCaptionCandidate": record["visualCaptionCandidate"],
+                    "associatedVisualCaption": record["associatedVisualCaption"],
                     "confidence": 0.99 if record["bboxValid"] else 0.7,
                     "warnings": record["warnings"],
                 }
@@ -1284,6 +1829,19 @@ def docling_document_to_ir(
         "model": {"name": "docling", "reasoningEffort": "none"},
         "pages": structure_pages,
         "sections": sections,
+        "doclingDiagnostics": {
+            "embeddedVisualTextItems": len(
+                {
+                    record["ref"]
+                    for record in records
+                    if record["suppressedVisualText"]
+                }
+            ),
+            "suppressedEmbeddedVisualTextBlocks": sum(
+                bool(record["suppressedVisualText"]) for record in records
+            ),
+            "associatedOrphanCaptions": associated_orphan_captions,
+        },
         "warnings": list(dict.fromkeys(document_warnings)),
     }
     validate_structure_batch(evidence_pages, structure)

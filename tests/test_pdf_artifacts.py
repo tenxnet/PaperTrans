@@ -205,6 +205,155 @@ def test_pdf_qa_fails_when_a_semantic_source_block_was_dropped(tmp_path: Path):
     assert qa["missingSemanticBlocks"] == ["missing-body"]
 
 
+def test_pdf_qa_rejects_embedded_visual_text_leaking_into_semantic_output(
+    tmp_path: Path,
+):
+    publication = tmp_path / "html"
+    publication.mkdir()
+    (publication / "index.html").write_text(
+        "<html><body>deception</body></html>", encoding="utf-8"
+    )
+    document = sample_document()
+    document["sections"][0]["content"][0]["value"]["sourceBlockIds"] = [
+        "chart-label"
+    ]
+    qa = write_semantic_pdf_qa(
+        document,
+        publication,
+        pdf_parser="docling",
+        evidence={
+            "pages": [
+                {
+                    "pageNumber": 1,
+                    "widthPdf": 612,
+                    "heightPdf": 792,
+                    "blocks": [
+                        {
+                            "blockId": "chart-label",
+                            "text": "deception",
+                            "suppressedVisualText": True,
+                        }
+                    ],
+                }
+            ]
+        },
+        structure={
+            "pages": [
+                {
+                    "blockAssignments": [
+                        {
+                            "blockId": "chart-label",
+                            "role": "noise",
+                            "hidden": False,
+                            "suppressedVisualText": True,
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+
+    assert qa["status"] == "failed"
+    assert qa["visualTextDetected"] == 1
+    assert qa["visualTextSuppressed"] == 0
+    assert qa["leakedVisualTextBlockIds"] == ["chart-label"]
+
+
+def test_pdf_qa_rejects_caption_conflicts_and_visible_visual_overlap(
+    tmp_path: Path,
+):
+    publication = tmp_path / "html"
+    publication.mkdir()
+    (publication / "index.html").write_text(
+        "<html><body>paper</body></html>", encoding="utf-8"
+    )
+    document = sample_document()
+    document["sections"][0]["content"][0]["value"]["sourceBlockIds"] = [
+        "body-overlap",
+        "orphan-caption",
+    ]
+    document["visualObjects"][0]["captionBlockIds"] = ["shared-caption"]
+    qa = write_semantic_pdf_qa(
+        document,
+        publication,
+        pdf_parser="docling",
+        evidence={
+            "pages": [
+                {
+                    "pageNumber": 1,
+                    "widthPdf": 612,
+                    "heightPdf": 792,
+                    "blocks": [
+                        {
+                            "blockId": "body-overlap",
+                            "text": "axis label",
+                            "bboxNormalized": [0.2, 0.2, 0.4, 0.3],
+                        },
+                        {
+                            "blockId": "orphan-caption",
+                            "text": "Figure 2. Missing crop.",
+                            "bboxNormalized": [0.2, 0.7, 0.8, 0.73],
+                        },
+                        {
+                            "blockId": "shared-caption",
+                            "text": "Figure 1. Shared.",
+                            "bboxNormalized": [0.2, 0.5, 0.8, 0.53],
+                        },
+                    ],
+                }
+            ]
+        },
+        structure={
+            "pages": [
+                {
+                    "pageNumber": 1,
+                    "blockAssignments": [
+                        {
+                            "blockId": "body-overlap",
+                            "role": "paragraph",
+                            "hidden": False,
+                        },
+                        {
+                            "blockId": "orphan-caption",
+                            "role": "paragraph",
+                            "hidden": False,
+                            "visualCaptionCandidate": True,
+                            "associatedVisualCaption": False,
+                        },
+                        {
+                            "blockId": "shared-caption",
+                            "role": "caption",
+                            "hidden": False,
+                            "visualCaptionCandidate": True,
+                            "associatedVisualCaption": True,
+                        },
+                    ],
+                    "visualObjects": [
+                        {
+                            "objectId": "figure-1",
+                            "bboxNormalized": [0.1, 0.1, 0.9, 0.4],
+                            "captionBlockIds": ["shared-caption"],
+                        },
+                        {
+                            "objectId": "figure-2",
+                            "bboxNormalized": [0.1, 0.55, 0.9, 0.68],
+                            "captionBlockIds": ["shared-caption"],
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert qa["status"] == "failed"
+    assert qa["duplicateVisualCaptionBlockIds"] == ["shared-caption"]
+    assert qa["unattachedVisualCaptionBlockIds"] == ["orphan-caption"]
+    assert qa["visibleVisualOverlapBlockIds"] == ["body-overlap"]
+    assert qa["output"]["figures"] == 1
+    assert qa["output"]["tables"] == 1
+    assert qa["output"]["visibleMath"] == 1
+
+
 def test_pdf_qa_rejects_title_only_semantic_output(tmp_path: Path):
     publication = tmp_path / "html"
     publication.mkdir()
