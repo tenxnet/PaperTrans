@@ -7,6 +7,9 @@ __pycache__/
 .pytest_cache/
 .playwright-cli/
 .coverage
+.env
+.env.*
+!.env.example
 data/
 tmp/
 output/
