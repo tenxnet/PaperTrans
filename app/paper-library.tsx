@@ -9,6 +9,7 @@ import {
   ClockCounterClockwise,
   FileText,
   FunnelSimple,
+  ListBullets,
   MagnifyingGlass,
   Plus,
   SpinnerGap,
@@ -30,6 +31,7 @@ import {
 type Filter = "all" | "active" | "review" | "unread" | "favorites";
 type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
 type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
+type TocEntry = { id: string; label: string; level: 2 | 3 };
 
 function isActive(paper: PaperSummary) {
   return ["prepared", "translating", "ready_to_finalize"].includes(paper.status);
@@ -90,7 +92,12 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [notice, setNotice] = useState("");
   const [showRequest, setShowRequest] = useState(false);
   const [arxivDraft, setArxivDraft] = useState("");
+  const [tocEntries, setTocEntries] = useState<TocEntry[]>([]);
+  const [activeTocId, setActiveTocId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const paperFrameRef = useRef<HTMLIFrameElement>(null);
+  const tocListRef = useRef<HTMLElement>(null);
+  const tocCleanupRef = useRef<(() => void) | null>(null);
   const text = UI_TEXT[locale];
 
   const selected = papers.find((paper) => paper.slug === selectedSlug) ?? null;
@@ -141,6 +148,24 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   useEffect(() => {
     document.documentElement.lang = locale;
   }, [locale]);
+
+  useEffect(() => {
+    tocCleanupRef.current?.();
+    tocCleanupRef.current = null;
+    setTocEntries([]);
+    setActiveTocId(null);
+    return () => {
+      tocCleanupRef.current?.();
+      tocCleanupRef.current = null;
+    };
+  }, [selectedSlug]);
+
+  useEffect(() => {
+    if (!activeTocId || !tocListRef.current) return;
+    const activeButton = Array.from(tocListRef.current.querySelectorAll<HTMLButtonElement>("[data-toc-id]"))
+      .find((button) => button.dataset.tocId === activeTocId);
+    activeButton?.scrollIntoView({ block: "nearest" });
+  }, [activeTocId]);
 
   function changeLocale(nextLocale: AppLocale) {
     setLocale(nextLocale);
@@ -260,6 +285,75 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   function resetEmbeddedPaper(iframe: HTMLIFrameElement) {
     try {
       iframe.contentWindow?.scrollTo({ top: 0, left: 0 });
+    } catch {
+      // The local artifact is same-origin; fail safely if deployment changes that assumption.
+    }
+  }
+
+  function initializeEmbeddedPaper(iframe: HTMLIFrameElement) {
+    resetEmbeddedPaper(iframe);
+    tocCleanupRef.current?.();
+    tocCleanupRef.current = null;
+
+    try {
+      const frameWindow = iframe.contentWindow;
+      const frameDocument = iframe.contentDocument;
+      if (!frameWindow || !frameDocument) return;
+
+      const headings = Array.from(frameDocument.querySelectorAll<HTMLElement>("article h2, article h3"));
+      const entries = headings.flatMap<TocEntry>((heading, index) => {
+        const labelNode = heading.querySelector<HTMLElement>(".ptx-heading-ja");
+        const label = (labelNode?.textContent ?? heading.textContent ?? "").replace(/\s+/g, " ").trim();
+        if (!label) return [];
+        const level = heading.tagName === "H3" ? 3 : 2;
+        if (!heading.id) {
+          const sourceId = heading.dataset.papertransId ?? String(index + 1);
+          heading.id = `papertrans-toc-${sourceId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+        }
+        return [{ id: heading.id, label, level }];
+      });
+
+      setTocEntries(entries);
+      setActiveTocId(entries[0]?.id ?? null);
+      if (!entries.length) return;
+
+      let animationFrame = 0;
+      const updateActiveSection = () => {
+        frameWindow.cancelAnimationFrame(animationFrame);
+        animationFrame = frameWindow.requestAnimationFrame(() => {
+          let currentId = entries[0].id;
+          for (const entry of entries) {
+            const heading = frameDocument.getElementById(entry.id);
+            if (!heading || heading.getBoundingClientRect().top > 140) break;
+            currentId = entry.id;
+          }
+          setActiveTocId((current) => current === currentId ? current : currentId);
+        });
+      };
+
+      frameWindow.addEventListener("scroll", updateActiveSection, { passive: true });
+      frameWindow.addEventListener("resize", updateActiveSection);
+      updateActiveSection();
+      tocCleanupRef.current = () => {
+        frameWindow.cancelAnimationFrame(animationFrame);
+        frameWindow.removeEventListener("scroll", updateActiveSection);
+        frameWindow.removeEventListener("resize", updateActiveSection);
+      };
+    } catch {
+      setTocEntries([]);
+      setActiveTocId(null);
+    }
+  }
+
+  function navigateToSection(id: string) {
+    try {
+      const heading = paperFrameRef.current?.contentDocument?.getElementById(id);
+      if (!heading) return;
+      setActiveTocId(id);
+      heading.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
     } catch {
       // The local artifact is same-origin; fail safely if deployment changes that assumption.
     }
@@ -393,11 +487,12 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
               </div>
               {selected.artifactUrl ? (
                 <iframe
+                  ref={paperFrameRef}
                   key={selected.slug}
                   className="paper-frame"
                   title={text.translatedPaperFrame(selected.title)}
                   src={`${selected.artifactUrl}?embed=1`}
-                  onLoad={(event) => resetEmbeddedPaper(event.currentTarget)}
+                  onLoad={(event) => initializeEmbeddedPaper(event.currentTarget)}
                 />
               ) : (
                 <div className="reader-empty"><SpinnerGap className="spin" /><p>{text.waitingForHtml}</p></div>
@@ -405,6 +500,26 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             </div>
 
             <aside className="inspector">
+              <section className="inspector-toc">
+                <p className="inspector-label"><ListBullets aria-hidden="true" />{text.tableOfContents}</p>
+                {tocEntries.length ? (
+                  <nav ref={tocListRef} className="toc-list" aria-label={text.tableOfContents}>
+                    {tocEntries.map((entry) => (
+                      <button
+                        key={entry.id}
+                        className={`toc-item level-${entry.level}${activeTocId === entry.id ? " active" : ""}`}
+                        type="button"
+                        data-toc-id={entry.id}
+                        aria-current={activeTocId === entry.id ? "location" : undefined}
+                        onClick={() => navigateToSection(entry.id)}
+                      >
+                        {entry.label}
+                      </button>
+                    ))}
+                  </nav>
+                ) : <p className="toc-empty">{text.noTableOfContents}</p>}
+              </section>
+
               <section>
                 <p className="inspector-label">{text.tags}</p>
                 <div className="paper-tags">
