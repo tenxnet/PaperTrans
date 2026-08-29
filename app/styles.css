@@ -125,8 +125,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .empty-state h2 { margin: 12px 0 5px; font: 500 18px Georgia, serif; }
 .empty-state p { margin: 0 0 18px; color: var(--muted); font-size: 12px; }
 
-.reader-layout { height: calc(100vh - 68px); display: grid; grid-template-columns: minmax(0, 1fr) 254px; overflow: hidden; background: var(--surface); }
-.reader-main { min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); border-right: 1px solid var(--line); }
+.reader-layout { width: 100%; min-width: 0; min-height: 0; height: calc(100vh - 68px); display: grid; grid-template-columns: minmax(0, 1fr) 254px; overflow: hidden; background: var(--surface); }
+.reader-main { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border-right: 1px solid var(--line); }
 .reader-header { min-height: 74px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 11px 17px; background: var(--paper); border-bottom: 1px solid var(--line); }
 .back-button { display: flex; align-items: center; gap: 5px; padding: 7px 8px; color: var(--muted); background: transparent; border: 0; border-radius: 5px; cursor: pointer; font-size: 11px; }
 .back-button:hover { color: var(--blue); background: var(--blue-soft); }
@@ -134,27 +134,13 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .reader-title { min-width: 0; }
 .reader-title small { display: block; margin-bottom: 3px; color: var(--blue); font: 9px ui-monospace, monospace; }
 .reader-title h1 { margin: 0; overflow: hidden; color: #272c34; font: 500 15px/1.25 Georgia, "Yu Mincho", serif; text-overflow: ellipsis; white-space: nowrap; }
-.paper-frame { width: 100%; height: 100%; background: white; border: 0; }
+.paper-frame { display: block; width: 100%; min-width: 0; height: 100%; min-height: 0; background: white; border: 0; }
 .reader-empty { display: grid; place-content: center; justify-items: center; gap: 10px; color: var(--muted); }
 .reader-empty svg { width: 24px; height: 24px; color: var(--blue); }
 .reader-empty p { margin: 0; font-size: 12px; }
-.inspector { overflow-y: auto; background: #faf9f6; }
+.inspector { min-width: 0; min-height: 0; overflow-y: auto; background: #faf9f6; }
 .inspector section { padding: 20px 18px; border-bottom: 1px solid var(--line); }
 .inspector-label { margin: 0 0 12px; color: #5d6570; font-size: 10px; font-weight: 700; letter-spacing: .07em; }
-.status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; color: var(--green); background: var(--green-soft); border-radius: 5px; font-size: 11px; font-weight: 650; }
-.status-badge.review { color: var(--amber); background: var(--amber-soft); }
-.status-badge svg { width: 15px; height: 15px; }
-.progress-track { height: 4px; margin-top: 14px; overflow: hidden; background: #e2e3e1; border-radius: 9px; }
-.progress-track span { display: block; height: 100%; background: var(--blue); border-radius: inherit; }
-.progress-copy { margin: 6px 0 0; color: var(--faint); font-size: 9px; text-align: right; }
-.qa-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 0; }
-.qa-grid div { padding: 9px; background: var(--surface); border: 1px solid #e4e4e1; border-radius: 5px; }
-.qa-grid dt { color: var(--muted); font-size: 9px; }
-.qa-grid dd { margin: 3px 0 0; color: #2f343c; font: 500 16px Georgia, serif; }
-.qa-result { display: flex; align-items: center; gap: 6px; margin: 12px 0 0; color: var(--green); font-size: 10px; font-weight: 600; }
-.qa-result.failed { color: var(--red); }
-.qa-result svg { width: 14px; height: 14px; }
-.qa-note { margin: 7px 0 0; color: var(--amber); font-size: 9px; line-height: 1.45; }
 .paper-tags { display: flex; flex-wrap: wrap; gap: 5px; }
 .tag-chip.removable { border: 1px solid #dce0e5; cursor: pointer; }
 .tag-chip.removable:hover { color: var(--red); background: var(--red-soft); border-color: #efceca; }

@@ -374,32 +374,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
 
             <aside className="inspector">
               <section>
-                <p className="inspector-label">状態</p>
-                <div className={`status-badge ${needsReview(selected) ? "review" : selected.status}`}>
-                  <StatusIcon paper={selected} />{STATUS_LABEL[selected.status]}
-                </div>
-                <div className="progress-track" aria-label={`翻訳進捗 ${progressPercent(selected)}%`}>
-                  <span style={{ width: `${progressPercent(selected)}%` }} />
-                </div>
-                <p className="progress-copy">{selected.progress.completed} / {selected.progress.total} チャンク</p>
-              </section>
-
-              <section>
-                <p className="inspector-label">品質検査</p>
-                <dl className="qa-grid">
-                  <div><dt>図</dt><dd>{selected.qa.figures}</dd></div>
-                  <div><dt>表</dt><dd>{selected.qa.tables}</dd></div>
-                  <div><dt>数式</dt><dd>{selected.qa.math}</dd></div>
-                  <div><dt>参考文献</dt><dd>{selected.qa.bibliographyEntries}</dd></div>
-                </dl>
-                <p className={`qa-result ${selected.qa.status}`}>
-                  {selected.qa.status === "passed" ? <CheckCircle weight="fill" /> : <WarningCircle weight="fill" />}
-                  {selected.qa.status === "passed" ? "構造QAを通過" : "QA結果を確認してください"}
-                </p>
-                {!selected.qa.browserChecked && <p className="qa-note">ブラウザDOM検査は未実施です</p>}
-              </section>
-
-              <section>
                 <p className="inspector-label">タグ</p>
                 <div className="paper-tags">
                   {selected.tags.map((tag) => (

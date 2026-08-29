@@ -296,7 +296,8 @@ def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
     assert rendered.find("a", href="#bib.b1") is not None
     layout_css = rendered.style.get_text() if rendered.style is not None else ""
     assert "grid-template-columns:minmax(0,1fr)" in layout_css
-    assert ".ptx-main .ltx_table,.ptx-main .ltx_figure_panel:has(table){max-width:100%;overflow-x:auto" in layout_css
+    assert ".ptx-main .ltx_table,.ptx-main .ltx_figure_panel:has(table){" in layout_css
+    assert "min-width:0;max-width:100%;overflow-x:auto" in layout_css
     assert ".ptx-ja .ltx_cite{white-space:normal}" in layout_css
     assert ".ptx-main .ltx_url{white-space:normal!important" in layout_css
     assert ".ptx-main .ltx_equationgroup" in layout_css

@@ -12,7 +12,15 @@ const TYPES: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
+  ".svg": "image/svg+xml",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".avif": "image/avif",
   ".css": "text/css; charset=utf-8",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
 };
 
 export async function GET(
@@ -31,13 +39,16 @@ export async function GET(
   try {
     if (!(await stat(requested)).isFile()) throw new Error("not a file");
     const body = await readFile(requested);
-    const isEmbeddedHtml = path.extname(requested).toLowerCase() === ".html"
-      && new URL(request.url).searchParams.get("embed") === "1";
-    const responseBody = isEmbeddedHtml
-      ? body.toString("utf8").replace(
-        "</head>",
-        "<style data-papertrans-embed>.ptx-topbar{display:none!important}html{scroll-padding-top:20px!important}.ptx-shell{padding-top:20px!important}</style></head>",
-      )
+    const isHtml = path.extname(requested).toLowerCase() === ".html";
+    const isEmbeddedHtml = isHtml && new URL(request.url).searchParams.get("embed") === "1";
+    const compatibilityCss = isHtml
+      ? "<style data-papertrans-browser-compat>html,body{width:100%;max-width:100%;overflow-x:hidden}.ptx-shell,.ptx-main,.ptx-main figure,.ptx-main .ltx_table,.ptx-main .ltx_flex_figure,.ptx-main .ltx_transformed_outer{min-width:0;max-width:100%}.ptx-main{width:100%;overflow:hidden}.ptx-main .ltx_flex_figure>*{min-width:0}.ptx-main figure img,.ptx-main figure object,.ptx-main figure svg{max-width:100%;height:auto}</style>"
+      : "";
+    const embedCss = isEmbeddedHtml
+      ? "<style data-papertrans-embed>.ptx-topbar{display:none!important}html{scroll-padding-top:20px!important}.ptx-shell{padding-top:20px!important}</style>"
+      : "";
+    const responseBody = isHtml
+      ? body.toString("utf8").replace("</head>", `${compatibilityCss}${embedCss}</head>`)
       : body;
     return new NextResponse(responseBody, {
       headers: {
