@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .arxiv_html import run_arxiv_html_pipeline
 from .deterministic_structure import analyze_layout_deterministic, evaluate_structure
 from .extract import extract_document
 from .hybrid_structure import refine_structure_with_llm
@@ -152,11 +153,39 @@ def _parser() -> argparse.ArgumentParser:
     semantic_pipeline.add_argument("--translation-workers", type=int, default=3)
     semantic_pipeline.add_argument("--max-characters", type=int, default=9000)
     semantic_pipeline.add_argument("--skip-translation", action="store_true")
+
+    arxiv_html_pipeline = subparsers.add_parser(
+        "arxiv-html-pipeline",
+        help="Acquire official arXiv HTML, translate semantic sections, and preserve MathML/links",
+    )
+    arxiv_html_pipeline.add_argument("arxiv_id")
+    arxiv_html_pipeline.add_argument("--slug", required=True)
+    arxiv_html_pipeline.add_argument("--output-root", type=Path, default=Path("output"))
+    arxiv_html_pipeline.add_argument("--repo-root", type=Path, default=Path.cwd())
+    arxiv_html_pipeline.add_argument("--translation-model", default="gpt-5.6-luna")
+    arxiv_html_pipeline.add_argument("--translation-reasoning-effort", default="high")
+    arxiv_html_pipeline.add_argument("--translation-workers", type=int, default=4)
+    arxiv_html_pipeline.add_argument("--max-characters", type=int, default=14000)
+    arxiv_html_pipeline.add_argument("--skip-translation", action="store_true")
     return parser
 
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "arxiv-html-pipeline":
+        result = run_arxiv_html_pipeline(
+            args.arxiv_id,
+            args.slug,
+            args.output_root,
+            args.repo_root.resolve(),
+            max_characters=args.max_characters,
+            translation_workers=args.translation_workers,
+            translation_model=args.translation_model,
+            translation_reasoning_effort=args.translation_reasoning_effort,
+            skip_translation=args.skip_translation,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return
     if args.command == "extract":
         document = extract_document(args.source, args.work_dir, args.output)
         print(json.dumps({"pages": document.page_count, "items": sum(1 for _ in document.iter_items())}))
