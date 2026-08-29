@@ -64,3 +64,7 @@ pnpm build
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Do not attach copyrighted paper files, generated translations, credentials, or private local data to issues or pull requests.
 
 The remaining public-release work is tracked in the [OSS release checklist](docs/oss-release-checklist.md).
+
+## License
+
+PaperTrans source code, repository Skills, templates, and documentation are provided under the [Apache License 2.0](LICENSE). This license does not automatically apply to papers acquired by users, figures and tables contained in those papers, or generated translation artifacts.

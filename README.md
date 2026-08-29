@@ -130,6 +130,10 @@ Webアプリの「新しい翻訳」から、arXiv IDを含むChatGPT向け依�
 
 公開前の残作業は[OSSリリースチェックリスト](docs/oss-release-checklist.md)で管理します。
 
+## ライセンス
+
+PaperTransのソースコード、リポジトリ内Skills、テンプレート、ドキュメントは[Apache License 2.0](LICENSE)で提供します。利用者が取得した論文、論文中の図表、生成された翻訳HTMLには、このライセンスが自動的に適用されるわけではありません。
+
 ## 検証
 
 ```bash

@@ -43,4 +43,4 @@ Changes to a repository Skill should also pass its quick validation where applic
 - Document new environment variables in `.env.example` without real values.
 - Note any behavior that is specific to Chromium, Firefox, macOS, or Linux.
 
-By contributing, you agree that your contribution is provided under the repository's project license once that license is selected and published.
+Unless you explicitly state otherwise, contributions intentionally submitted for inclusion in PaperTrans are provided under the [Apache License 2.0](LICENSE).
