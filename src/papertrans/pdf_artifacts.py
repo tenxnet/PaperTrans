@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+import pymupdf as fitz
 from bs4 import BeautifulSoup
 
 from .semantic import TRANSLATABLE_ROLES, iter_translatable_units
+from .structure import is_near_certain_blank_pixmap
 
 
 PDF_JOB_SCHEMA_VERSION = 1
@@ -167,6 +169,35 @@ def _local_asset_path(publication_dir: Path, raw_url: str) -> Path | None:
     return candidate
 
 
+def _emitted_blank_visual_assets(
+    document: dict[str, Any], publication_dir: Path
+) -> list[dict[str, Any]]:
+    blank_assets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for visual in document.get("visualObjects", []):
+        raw_asset = str(visual.get("asset", "")).strip()
+        if not raw_asset or raw_asset in seen:
+            continue
+        seen.add(raw_asset)
+        asset_path = _local_asset_path(publication_dir, raw_asset)
+        if asset_path is None or not asset_path.is_file():
+            continue
+        try:
+            pixmap = fitz.Pixmap(str(asset_path))
+        except (RuntimeError, ValueError):
+            # Missing/corrupt assets are already handled by the normal artifact QA.
+            continue
+        if is_near_certain_blank_pixmap(pixmap):
+            blank_assets.append(
+                {
+                    "objectId": str(visual.get("objectId", "")),
+                    "pageNumber": int(visual.get("pageNumber", 0)),
+                    "asset": raw_asset,
+                }
+            )
+    return blank_assets
+
+
 def write_semantic_pdf_qa(
     document: dict[str, Any],
     publication_dir: Path,
@@ -197,6 +228,10 @@ def write_semantic_pdf_qa(
         missing_assets.append("index.html")
 
     visuals = document.get("visualObjects", [])
+    emitted_blank_visual_assets = _emitted_blank_visual_assets(document, publication_dir)
+    filtered_blank_visuals = list(
+        (structure or {}).get("renderDiagnostics", {}).get("filteredBlankVisuals", [])
+    )
     references = 0
     for section in document.get("sections", []):
         references += sum(
@@ -383,6 +418,7 @@ def write_semantic_pdf_qa(
             and not duplicate_visual_caption_blocks
             and not unattached_visual_caption_blocks
             and not visible_visual_overlap_block_ids
+            and not emitted_blank_visual_assets
             and bool(semantic_body_units)
             else "failed"
         ),
@@ -413,6 +449,8 @@ def write_semantic_pdf_qa(
         "duplicateVisualCaptionBlockIds": duplicate_visual_caption_blocks,
         "unattachedVisualCaptionBlockIds": unattached_visual_caption_blocks,
         "visibleVisualOverlapBlockIds": visible_visual_overlap_block_ids,
+        "emittedBlankVisualAssets": emitted_blank_visual_assets,
+        "filteredBlankVisuals": filtered_blank_visuals,
         "unresolvedInternalLinks": len(unresolved_links),
         "unresolvedInternalLinkTargets": unresolved_links,
         "missingLocalAssets": missing_assets,

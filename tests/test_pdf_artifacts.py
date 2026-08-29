@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pymupdf as fitz
 import pytest
 
 import papertrans.cli as cli
@@ -101,6 +102,62 @@ def test_pdf_qa_checks_links_assets_and_semantic_counts(tmp_path: Path):
     assert qa["output"]["translatedUnits"] == 3
     assert qa["invalidPageGeometry"] == []
     assert qa["missingTitleSource"] is False
+
+
+def test_pdf_qa_fails_when_a_blank_visual_asset_is_emitted(tmp_path: Path):
+    publication = tmp_path / "html"
+    assets = publication / "assets"
+    assets.mkdir(parents=True)
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 8, 8), False)
+    pixmap.clear_with(255)
+    pixmap.save(assets / "blank.png")
+    (publication / "index.html").write_text(
+        '<html><body><img src="assets/blank.png"></body></html>', encoding="utf-8"
+    )
+    document = sample_document()
+    document["visualObjects"] = [
+        {
+            "objectId": "blank-figure",
+            "pageNumber": 1,
+            "kind": "figure",
+            "asset": "assets/blank.png",
+        }
+    ]
+
+    qa = write_semantic_pdf_qa(document, publication, pdf_parser="docling")
+
+    assert qa["status"] == "failed"
+    assert qa["emittedBlankVisualAssets"] == [
+        {
+            "objectId": "blank-figure",
+            "pageNumber": 1,
+            "asset": "assets/blank.png",
+        }
+    ]
+
+
+def test_pdf_qa_reports_filtered_blank_visual_without_failing(tmp_path: Path):
+    publication = tmp_path / "html"
+    publication.mkdir()
+    (publication / "index.html").write_text("<html><body></body></html>", encoding="utf-8")
+    filtered = {
+        "objectId": "blank-figure",
+        "pageNumber": 1,
+        "kind": "figure",
+        "bboxNormalized": [0.1, 0.2, 0.3, 0.4],
+        "reason": "Every rendered RGB sample was near-white (>= 250).",
+    }
+
+    qa = write_semantic_pdf_qa(
+        sample_document(),
+        publication,
+        pdf_parser="docling",
+        structure={"pages": [], "renderDiagnostics": {"filteredBlankVisuals": [filtered]}},
+    )
+
+    assert qa["status"] == "passed"
+    assert qa["emittedBlankVisualAssets"] == []
+    assert qa["filteredBlankVisuals"] == [filtered]
 
 
 def test_pdf_qa_rejects_docling_title_fallback_without_source_evidence(
