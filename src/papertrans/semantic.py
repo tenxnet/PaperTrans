@@ -216,8 +216,16 @@ def build_semantic_document(
 
     caption_text: dict[str, str] = {}
     for visual in visual_objects:
-        caption_text[visual["objectId"]] = _join_source_parts(
-            [raw_blocks[block_id]["text"] for block_id in visual.get("captionBlockIds", [])]
+        override = visual.get("captionTextOverride")
+        caption_text[visual["objectId"]] = (
+            str(override).strip()
+            if isinstance(override, str) and override.strip()
+            else _join_source_parts(
+                [
+                    raw_blocks[block_id]["text"]
+                    for block_id in visual.get("captionBlockIds", [])
+                ]
+            )
         )
 
     rendered_visuals: list[dict[str, Any]] = []

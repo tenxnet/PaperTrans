@@ -403,6 +403,57 @@ def write_semantic_pdf_qa(
                     visible_visual_overlap_blocks.add(block_id)
                     break
     visible_visual_overlap_block_ids = sorted(visible_visual_overlap_blocks)
+    docling_diagnostics = (structure or {}).get("doclingDiagnostics", {})
+    suppressed_internal_caption_block_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get(
+            "suppressedInternalCaptionBlockIds", []
+        )
+        if value
+    )
+    overlarge_visual_object_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get("overlargeVisualObjectIds", [])
+        if value
+    )
+    missing_caption_text_override_object_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get(
+            "missingCaptionTextOverrideObjectIds", []
+        )
+        if value
+    )
+    unmerged_multi_panel_visual_object_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get(
+            "unmergedMultiPanelVisualObjectIds", []
+        )
+        if value
+    )
+    dangling_parent_section_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get("danglingParentSectionIds", [])
+        if value
+    )
+    blank_visible_heading_block_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get("blankVisibleHeadingBlockIds", [])
+        if value
+    )
+    suppressed_blank_heading_block_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get(
+            "suppressedBlankHeadingBlockIds", []
+        )
+        if value
+    )
+    unabsorbed_panel_heading_block_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get(
+            "unabsorbedPanelHeadingBlockIds", []
+        )
+        if value
+    )
     qa = {
         "schemaVersion": PDF_JOB_SCHEMA_VERSION,
         "status": (
@@ -417,6 +468,13 @@ def write_semantic_pdf_qa(
             and not duplicate_visual_caption_blocks
             and not unattached_visual_caption_blocks
             and not visible_visual_overlap_block_ids
+            and not suppressed_internal_caption_block_ids
+            and not overlarge_visual_object_ids
+            and not missing_caption_text_override_object_ids
+            and not unmerged_multi_panel_visual_object_ids
+            and not dangling_parent_section_ids
+            and not blank_visible_heading_block_ids
+            and not unabsorbed_panel_heading_block_ids
             and not emitted_blank_visual_assets
             and bool(semantic_body_units)
             else "failed"
@@ -448,6 +506,18 @@ def write_semantic_pdf_qa(
         "duplicateVisualCaptionBlockIds": duplicate_visual_caption_blocks,
         "unattachedVisualCaptionBlockIds": unattached_visual_caption_blocks,
         "visibleVisualOverlapBlockIds": visible_visual_overlap_block_ids,
+        "suppressedInternalCaptionBlockIds": suppressed_internal_caption_block_ids,
+        "overlargeVisualObjectIds": overlarge_visual_object_ids,
+        "missingCaptionTextOverrideObjectIds": (
+            missing_caption_text_override_object_ids
+        ),
+        "unmergedMultiPanelVisualObjectIds": (
+            unmerged_multi_panel_visual_object_ids
+        ),
+        "danglingParentSectionIds": dangling_parent_section_ids,
+        "blankVisibleHeadingBlockIds": blank_visible_heading_block_ids,
+        "suppressedBlankHeadingBlockIds": suppressed_blank_heading_block_ids,
+        "unabsorbedPanelHeadingBlockIds": unabsorbed_panel_heading_block_ids,
         "emittedBlankVisualAssets": emitted_blank_visual_assets,
         "filteredBlankVisuals": filtered_blank_visuals,
         "unresolvedInternalLinks": len(unresolved_links),

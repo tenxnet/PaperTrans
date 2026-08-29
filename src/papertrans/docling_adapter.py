@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import pymupdf as fitz
+
 from .deterministic_structure import visual_caption_score
+from .pdf_caption_refinement import refine_pdf_caption_texts
 from .structure import render_visual_objects, validate_structure_batch
 
 
@@ -1301,6 +1304,2063 @@ def _rectangle_intersection_area(left: list[float], right: list[float]) -> float
     )
 
 
+_RECOVERED_INTERNAL_CAPTION_WARNING = (
+    "Docling's picture crop crossed an internal caption boundary; the crop was "
+    "recovered from source-PDF geometry."
+)
+
+
+def _normalized_pdf_rect(rect: fitz.Rect, page: fitz.Page) -> list[float]:
+    return [
+        (rect.x0 - page.rect.x0) / page.rect.width,
+        (rect.y0 - page.rect.y0) / page.rect.height,
+        (rect.x1 - page.rect.x0) / page.rect.width,
+        (rect.y1 - page.rect.y0) / page.rect.height,
+    ]
+
+
+def _pdf_text_regions(page: fitz.Page) -> list[dict[str, Any]]:
+    """Return source-PDF text blocks and line-level font evidence.
+
+    This is intentionally only used after the narrow internal-caption trigger
+    fires.  Docling text remains authoritative; PDF spans provide geometry and
+    font evidence for separating a run-in heading, equation, and prose that a
+    malformed picture node swallowed.
+    """
+
+    regions: list[dict[str, Any]] = []
+    raw = page.get_text("dict", flags=fitz.TEXTFLAGS_DICT)
+    for region_index, block in enumerate(raw.get("blocks", [])):
+        if int(block.get("type", -1)) != 0 or not block.get("bbox"):
+            continue
+        lines: list[dict[str, Any]] = []
+        for line in block.get("lines", []):
+            spans = [span for span in line.get("spans", []) if span.get("bbox")]
+            if not spans:
+                continue
+            character_count = 0
+            bold_count = 0
+            math_count = 0
+            text_parts: list[str] = []
+            for span in spans:
+                text = str(span.get("text", ""))
+                count = len(text.strip())
+                character_count += count
+                text_parts.append(text)
+                font = str(span.get("font", "")).lower()
+                flags = int(span.get("flags", 0))
+                if "bold" in font or "medi" in font or flags & 16:
+                    bold_count += count
+                if any(
+                    token in font
+                    for token in ("cmmi", "cmsy", "cmex", "math", "symbol")
+                ):
+                    math_count += count
+            line_rect = fitz.Rect(line.get("bbox") or spans[0]["bbox"])
+            lines.append(
+                {
+                    "bboxNormalized": _normalized_pdf_rect(line_rect, page),
+                    "text": "".join(text_parts).strip(),
+                    "boldRatio": bold_count / character_count
+                    if character_count
+                    else 0.0,
+                    "mathRatio": math_count / character_count
+                    if character_count
+                    else 0.0,
+                    "fontSizeMax": max(
+                        (float(span.get("size", 0)) for span in spans), default=0.0
+                    ),
+                }
+            )
+        if not lines:
+            continue
+        regions.append(
+            {
+                "regionIndex": region_index,
+                "bboxNormalized": _normalized_pdf_rect(
+                    fitz.Rect(block["bbox"]), page
+                ),
+                "lines": lines,
+            }
+        )
+    return regions
+
+
+def _best_pdf_text_region(
+    block: dict[str, Any], regions: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    bbox = [float(value) for value in block.get("bboxNormalized", [])]
+    if len(bbox) != 4:
+        return None
+    area = max(1e-9, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for region in regions:
+        region_bbox = region["bboxNormalized"]
+        overlap = _rectangle_intersection_area(bbox, region_bbox) / area
+        center_inside = (
+            region_bbox[0] - 0.002 <= center_x <= region_bbox[2] + 0.002
+            and region_bbox[1] - 0.002 <= center_y <= region_bbox[3] + 0.002
+        )
+        if overlap <= 0 and not center_inside:
+            continue
+        ranked.append((overlap + (0.2 if center_inside else 0.0), region))
+    if not ranked:
+        return None
+    score, region = max(ranked, key=lambda value: value[0])
+    return region if score >= 0.12 else None
+
+
+def _best_pdf_text_line_index(
+    block: dict[str, Any], region: dict[str, Any] | None
+) -> int | None:
+    """Return the source-PDF line that materially overlaps one Docling block."""
+
+    if region is None:
+        return None
+    bbox = [float(value) for value in block.get("bboxNormalized", [])]
+    if len(bbox) != 4:
+        return None
+    area = max(1e-9, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    ranked: list[tuple[float, int]] = []
+    for index, line in enumerate(region.get("lines", [])):
+        line_bbox = line["bboxNormalized"]
+        overlap = _rectangle_intersection_area(bbox, line_bbox) / area
+        center_inside = (
+            line_bbox[0] - 0.002 <= center_x <= line_bbox[2] + 0.002
+            and line_bbox[1] - 0.002 <= center_y <= line_bbox[3] + 0.002
+        )
+        if overlap <= 0 and not center_inside:
+            continue
+        ranked.append((overlap + (0.2 if center_inside else 0.0), index))
+    if not ranked:
+        return None
+    score, index = max(ranked)
+    return index if score >= 0.12 else None
+
+
+def _caption_blocks_for_start(
+    start: dict[str, Any],
+    next_start: dict[str, Any] | None,
+    owner_blocks: list[dict[str, Any]],
+    source_regions: dict[str, dict[str, Any] | None],
+    block_positions: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Build one caption from a contiguous source-PDF line chain.
+
+    PyMuPDF may place a short caption and the following body line in one text
+    block.  Region identity alone therefore cannot define caption ownership.
+    A terminal line which ends well before the region's right edge terminates
+    the chain; a terminal line reaching the edge is treated as a wrapped line.
+    """
+
+    start_id = str(start["blockId"])
+    region = source_regions.get(start_id)
+    start_line_index = _best_pdf_text_line_index(start, region)
+    if region is None or start_line_index is None:
+        return []
+    lines = list(region.get("lines", []))
+    if not lines:
+        return []
+    boundary = len(lines)
+    if next_start is not None:
+        next_id = str(next_start["blockId"])
+        if source_regions.get(next_id) is region:
+            next_line_index = _best_pdf_text_line_index(next_start, region)
+            if next_line_index is not None and next_line_index > start_line_index:
+                boundary = next_line_index
+
+    region_bbox = [float(value) for value in region["bboxNormalized"]]
+    region_width = max(1e-9, region_bbox[2] - region_bbox[0])
+    selected_lines: set[int] = set()
+    previous_bbox: list[float] | None = None
+    terminal = re.compile(r"[.!?](?:[\"'\u2019\u201d)\]])?\s*$")
+    for line_index in range(start_line_index, boundary):
+        line = lines[line_index]
+        line_bbox = [float(value) for value in line["bboxNormalized"]]
+        if previous_bbox is not None:
+            vertical_gap = line_bbox[1] - previous_bbox[3]
+            line_height = max(
+                1e-9,
+                min(
+                    previous_bbox[3] - previous_bbox[1],
+                    line_bbox[3] - line_bbox[1],
+                ),
+            )
+            if vertical_gap > max(0.012, line_height * 1.25):
+                break
+        selected_lines.add(line_index)
+        text = str(line.get("text", "")).strip()
+        right_gap = max(0.0, region_bbox[2] - line_bbox[2])
+        reaches_wrap_edge = right_gap <= max(0.012, region_width * 0.10)
+        if terminal.search(text) and not reaches_wrap_edge:
+            break
+        previous_bbox = line_bbox
+
+    group = [
+        block
+        for block in owner_blocks
+        if source_regions.get(str(block["blockId"])) is region
+        and _best_pdf_text_line_index(block, region) in selected_lines
+    ]
+    group.sort(key=lambda block: block_positions[str(block["blockId"])])
+    return group if any(str(block["blockId"]) == start_id for block in group) else []
+
+
+def _pdf_line_evidence(
+    block: dict[str, Any], region: dict[str, Any] | None
+) -> tuple[float, float, float]:
+    if region is None:
+        return 0.0, 0.0, 0.0
+    bbox = [float(value) for value in block["bboxNormalized"]]
+    area = max(1e-9, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for line in region["lines"]:
+        line_bbox = line["bboxNormalized"]
+        overlap = _rectangle_intersection_area(bbox, line_bbox) / area
+        if overlap > 0:
+            ranked.append((overlap, line))
+    if not ranked:
+        return 0.0, 0.0, 0.0
+    _score, line = max(ranked, key=lambda value: value[0])
+    return (
+        float(line["boldRatio"]),
+        float(line["mathRatio"]),
+        float(line["fontSizeMax"]),
+    )
+
+
+def _is_material_internal_figure_caption(
+    block: dict[str, Any], visual_bbox: list[float]
+) -> bool:
+    match = _OBJECT_LABEL.match(str(block.get("text", "")))
+    if match is None or _object_label_kind(str(block.get("text", ""))) != "figure":
+        return False
+    remainder = str(block.get("text", ""))[match.end() :].lstrip()
+    if not remainder or remainder[0] not in ":.-–—":
+        return False
+    bbox = [float(value) for value in block.get("bboxNormalized", [])]
+    if len(bbox) != 4 or visual_bbox[3] - visual_bbox[1] < 0.22:
+        return False
+    horizontal_overlap = max(
+        0.0, min(bbox[2], visual_bbox[2]) - max(bbox[0], visual_bbox[0])
+    )
+    block_width = max(1e-9, bbox[2] - bbox[0])
+    return (
+        len(str(block.get("text", "")).strip()) >= 12
+        and horizontal_overlap / block_width >= 0.7
+        and bbox[1] >= visual_bbox[1] + 0.025
+        and bbox[3] <= visual_bbox[3] - 0.025
+    )
+
+
+def _rendered_ink_bbox(
+    page: fitz.Page, bbox_normalized: list[float]
+) -> list[float] | None:
+    """Tighten a triggered crop to visible rendered ink, honoring PDF clips."""
+
+    rect = fitz.Rect(
+        bbox_normalized[0] * page.rect.width + page.rect.x0,
+        bbox_normalized[1] * page.rect.height + page.rect.y0,
+        bbox_normalized[2] * page.rect.width + page.rect.x0,
+        bbox_normalized[3] * page.rect.height + page.rect.y0,
+    )
+    if rect.is_empty:
+        return None
+    scale = 2.5
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale), clip=rect, alpha=False
+    )
+    gray = fitz.Pixmap(fitz.csGRAY, pixmap)
+    samples = gray.samples
+    stride = int(gray.stride)
+    first_y: int | None = None
+    last_y: int | None = None
+    first_x = int(gray.width)
+    last_x = -1
+    for y in range(int(gray.height)):
+        row = samples[y * stride : y * stride + int(gray.width)]
+        first_match = re.search(rb"[\x00-\xf9]", row)
+        if first_match is None:
+            continue
+        reverse_match = re.search(rb"[\x00-\xf9]", row[::-1])
+        assert reverse_match is not None
+        first_y = y if first_y is None else first_y
+        last_y = y
+        first_x = min(first_x, first_match.start())
+        last_x = max(last_x, int(gray.width) - reverse_match.start() - 1)
+    if first_y is None or last_y is None or last_x < first_x:
+        return None
+    padding = max(3, round(scale * 1.5))
+    first_x = max(0, first_x - padding)
+    first_y = max(0, first_y - padding)
+    last_x = min(int(gray.width) - 1, last_x + padding)
+    last_y = min(int(gray.height) - 1, last_y + padding)
+    width = max(1, int(gray.width))
+    height = max(1, int(gray.height))
+    tightened = [
+        bbox_normalized[0]
+        + (bbox_normalized[2] - bbox_normalized[0]) * first_x / width,
+        bbox_normalized[1]
+        + (bbox_normalized[3] - bbox_normalized[1]) * first_y / height,
+        bbox_normalized[0]
+        + (bbox_normalized[2] - bbox_normalized[0]) * (last_x + 1) / width,
+        bbox_normalized[1]
+        + (bbox_normalized[3] - bbox_normalized[1]) * (last_y + 1) / height,
+    ]
+    if (tightened[2] - tightened[0]) * (tightened[3] - tightened[1]) < 0.0005:
+        return None
+    return [round(max(0.0, min(1.0, value)), 5) for value in tightened]
+
+
+def _rendered_bbox_has_ink(
+    page: fitz.Page, bbox_normalized: list[float]
+) -> bool:
+    """Return whether an exact source rectangle contains any visible ink.
+
+    This deliberately does not reuse ``_rendered_ink_bbox``: that crop helper
+    rejects very small tightened regions, while a short but real heading (for
+    example a figure panel label) can legitimately occupy such a region.
+    """
+
+    rect = fitz.Rect(
+        bbox_normalized[0] * page.rect.width + page.rect.x0,
+        bbox_normalized[1] * page.rect.height + page.rect.y0,
+        bbox_normalized[2] * page.rect.width + page.rect.x0,
+        bbox_normalized[3] * page.rect.height + page.rect.y0,
+    )
+    if rect.is_empty:
+        return False
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(2.5, 2.5), clip=rect, alpha=False
+    )
+    gray = fitz.Pixmap(fitz.csGRAY, pixmap)
+    samples = gray.samples
+    stride = int(gray.stride)
+    width = int(gray.width)
+    return any(
+        re.search(rb"[\x00-\xf9]", samples[y * stride : y * stride + width])
+        is not None
+        for y in range(int(gray.height))
+    )
+
+
+def _suppress_blank_docling_headings(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> None:
+    """Hide repeated figure metadata that Docling exposed as section headings.
+
+    Some tagged PDFs contain invisible accessibility metadata immediately before
+    a figure.  Docling can label that metadata as ``section_header`` even though
+    its exact source rectangle renders completely white.  Silently dropping an
+    arbitrary blank heading would be risky because its provenance could merely
+    be wrong, so automatic suppression requires three independent signals:
+
+    * the heading is unnumbered and not on page one;
+    * a same-page figure is anchored directly after it; and
+    * the same blank heading text occurs on another page.
+
+    Any other visible semantic heading whose source rectangle is blank remains
+    in the document and is reported as an unresolved diagnostic so publication
+    QA fails closed.
+    """
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics.setdefault("suppressedBlankHeadingBlockIds", [])
+    diagnostics.setdefault("blankVisibleHeadingBlockIds", [])
+    try:
+        pdf = fitz.open(source)
+    except Exception:
+        return
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    structure_pages = {
+        int(page["pageNumber"]): page for page in structure.get("pages", [])
+    }
+    blocks = {
+        str(block["blockId"]): block
+        for page in evidence_pages.values()
+        for block in page.get("blocks", [])
+    }
+    ordered_assignments = [
+        assignment
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    assignment_positions = {
+        str(assignment["blockId"]): index
+        for index, assignment in enumerate(ordered_assignments)
+    }
+
+    blank_candidates: list[dict[str, Any]] = []
+    try:
+        for page_number, page_structure in structure_pages.items():
+            if not 1 <= page_number <= len(pdf):
+                continue
+            pdf_page = pdf[page_number - 1]
+            for assignment in page_structure.get("blockAssignments", []):
+                if assignment.get("role") != "heading" or assignment.get("hidden"):
+                    continue
+                block_id = str(assignment["blockId"])
+                block = blocks.get(block_id)
+                if block is None:
+                    continue
+                bbox = [float(value) for value in block.get("bboxNormalized", [])]
+                if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                    continue
+                if _rendered_bbox_has_ink(pdf_page, bbox):
+                    continue
+                text = re.sub(r"\s+", " ", str(block.get("text", ""))).strip()
+                anchored_visuals = [
+                    visual
+                    for visual in page_structure.get("visualObjects", [])
+                    if visual.get("kind") == "figure"
+                    and str(visual.get("insertAfterBlockId") or "") == block_id
+                ]
+                blank_candidates.append(
+                    {
+                        "assignment": assignment,
+                        "block": block,
+                        "blockId": block_id,
+                        "pageNumber": page_number,
+                        "textKey": text.casefold(),
+                        "numbered": bool(
+                            _NUMBERED_HEADING.match(text)
+                            or _APPENDIX_HEADING.match(text)
+                        ),
+                        "anchoredVisuals": anchored_visuals,
+                    }
+                )
+    finally:
+        pdf.close()
+
+    repeated_text_keys = {
+        candidate["textKey"]
+        for candidate in blank_candidates
+        if candidate["textKey"]
+        and len(
+            {
+                int(other["pageNumber"])
+                for other in blank_candidates
+                if other["textKey"] == candidate["textKey"]
+            }
+        )
+        >= 2
+    }
+    suppressible = [
+        candidate
+        for candidate in blank_candidates
+        if int(candidate["pageNumber"]) > 1
+        and not candidate["numbered"]
+        and candidate["anchoredVisuals"]
+        and candidate["textKey"] in repeated_text_keys
+    ]
+    suppressible_ids = {
+        str(candidate["blockId"]) for candidate in suppressible
+    }
+    unresolved_ids = sorted(
+        str(candidate["blockId"])
+        for candidate in blank_candidates
+        if str(candidate["blockId"]) not in suppressible_ids
+    )
+
+    semantic_anchor_roles = {
+        "title",
+        "author",
+        "affiliation",
+        "abstract",
+        "heading",
+        "paragraph",
+        "list_item",
+        "reference",
+        "footnote",
+    }
+    fallback_by_block_id: dict[str, tuple[str | None, str | None]] = {}
+    for candidate in suppressible:
+        block_id = str(candidate["blockId"])
+        position = assignment_positions.get(block_id, 0)
+        fallback_assignment = next(
+            (
+                previous
+                for previous in reversed(ordered_assignments[:position])
+                if not previous.get("hidden")
+                and str(previous.get("blockId") or "") not in suppressible_ids
+                and str(previous.get("role") or "") in semantic_anchor_roles
+            ),
+            None,
+        )
+        fallback_by_block_id[block_id] = (
+            str(fallback_assignment["blockId"])
+            if fallback_assignment is not None
+            else None,
+            str(fallback_assignment["sectionId"])
+            if fallback_assignment is not None
+            and fallback_assignment.get("sectionId")
+            else None,
+        )
+
+    sections = list(structure.get("sections", []))
+    removed_sections = {
+        str(section["sectionId"]): section
+        for section in sections
+        if str(section.get("titleBlockId")) in suppressible_ids
+    }
+    fallback_section_by_removed_id = {
+        section_id: fallback_by_block_id.get(
+            str(section.get("titleBlockId") or ""), (None, None)
+        )[1]
+        for section_id, section in removed_sections.items()
+    }
+
+    def surviving_parent(section_id: str | None) -> str | None:
+        seen: set[str] = set()
+        while section_id and section_id in removed_sections and section_id not in seen:
+            seen.add(section_id)
+            parent = removed_sections[section_id].get("parentSectionId")
+            section_id = (
+                str(parent)
+                if parent
+                else fallback_section_by_removed_id.get(section_id)
+            )
+        return section_id
+
+    for assignment in ordered_assignments:
+        section_id = assignment.get("sectionId")
+        if section_id and str(section_id) in removed_sections:
+            assignment["sectionId"] = surviving_parent(str(section_id))
+    for section in sections:
+        parent = section.get("parentSectionId")
+        if parent and str(parent) in removed_sections:
+            section["parentSectionId"] = surviving_parent(str(parent))
+    structure["sections"] = [
+        section
+        for section in sections
+        if str(section["sectionId"]) not in removed_sections
+    ]
+
+    for candidate in suppressible:
+        block_id = str(candidate["blockId"])
+        block = candidate["block"]
+        assignment = candidate["assignment"]
+        owner_ids = sorted(
+            str(visual["objectId"])
+            for visual in candidate["anchoredVisuals"]
+            if visual.get("objectId")
+        )
+        block["embeddedVisualOwnerRefs"] = owner_ids
+        block["suppressedVisualText"] = True
+        block["suppressedBlankSourceHeading"] = True
+        block["visualCaptionCandidate"] = False
+        block["associatedVisualCaption"] = False
+        assignment["role"] = "noise"
+        assignment["sectionId"] = None
+        assignment["paragraphId"] = None
+        assignment["continuesFrom"] = None
+        assignment["hidden"] = True
+        assignment["suppressedVisualText"] = True
+        assignment["suppressedBlankSourceHeading"] = True
+        assignment["visualCaptionCandidate"] = False
+        assignment["associatedVisualCaption"] = False
+        warning = (
+            "Repeated invisible figure metadata mislabeled as a section heading "
+            "was suppressed after its exact source rectangle rendered blank."
+        )
+        if warning not in assignment.setdefault("warnings", []):
+            assignment["warnings"].append(warning)
+
+        fallback_anchor = fallback_by_block_id.get(block_id, (None, None))[0]
+        for visual in candidate["anchoredVisuals"]:
+            if fallback_anchor is None:
+                visual.pop("insertAfterBlockId", None)
+            else:
+                visual["insertAfterBlockId"] = fallback_anchor
+
+    diagnostics["suppressedBlankHeadingBlockIds"] = sorted(suppressible_ids)
+    diagnostics["blankVisibleHeadingBlockIds"] = unresolved_ids
+    if unresolved_ids:
+        warning = (
+            "A visible Docling section heading has a blank source-PDF rectangle; "
+            "publication QA must fail closed."
+        )
+        if warning not in structure.setdefault("warnings", []):
+            structure["warnings"].append(warning)
+
+
+def _absorb_aligned_figure_panel_headings(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> None:
+    """Fold a row of panel labels back into its owning combined figure.
+
+    Docling occasionally exposes two column labels at the top of one figure as
+    nested section headers.  The trigger intentionally requires a row of at
+    least two short, unnumbered headings straddling one figure's top edge, plus
+    an explicit visual anchor to one member of that row.  A lone real section
+    heading above a figure therefore remains untouched.
+    """
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics.setdefault("absorbedPanelHeadingGroups", [])
+    diagnostics.setdefault("unabsorbedPanelHeadingBlockIds", [])
+    try:
+        pdf = fitz.open(source)
+    except Exception:
+        return
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    structure_pages = {
+        int(page["pageNumber"]): page for page in structure.get("pages", [])
+    }
+    blocks = {
+        str(block["blockId"]): block
+        for page in evidence_pages.values()
+        for block in page.get("blocks", [])
+    }
+    ordered_assignments = [
+        assignment
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    assignment_positions = {
+        str(assignment["blockId"]): index
+        for index, assignment in enumerate(ordered_assignments)
+    }
+    proposals: list[dict[str, Any]] = []
+    unresolved: set[str] = set()
+    try:
+        for page_number, page_structure in structure_pages.items():
+            if not 1 <= page_number <= len(pdf):
+                continue
+            visible_headings = []
+            for assignment in page_structure.get("blockAssignments", []):
+                if assignment.get("role") != "heading" or assignment.get("hidden"):
+                    continue
+                block_id = str(assignment["blockId"])
+                block = blocks.get(block_id)
+                if block is None:
+                    continue
+                text = re.sub(r"\s+", " ", str(block.get("text", ""))).strip()
+                bbox = [float(value) for value in block.get("bboxNormalized", [])]
+                if (
+                    not 1 <= len(text) <= 80
+                    or len(bbox) != 4
+                    or _NUMBERED_HEADING.match(text)
+                    or _APPENDIX_HEADING.match(text)
+                ):
+                    continue
+                visible_headings.append(
+                    {
+                        "assignment": assignment,
+                        "block": block,
+                        "blockId": block_id,
+                        "bbox": bbox,
+                    }
+                )
+
+            for visual in page_structure.get("visualObjects", []):
+                if visual.get("kind") != "figure":
+                    continue
+                visual_bbox = [
+                    float(value) for value in visual.get("bboxNormalized", [])
+                ]
+                if len(visual_bbox) != 4:
+                    continue
+                candidates = []
+                for heading in visible_headings:
+                    bbox = heading["bbox"]
+                    width = max(1e-9, bbox[2] - bbox[0])
+                    horizontal_overlap = max(
+                        0.0,
+                        min(bbox[2], visual_bbox[2])
+                        - max(bbox[0], visual_bbox[0]),
+                    )
+                    if (
+                        horizontal_overlap / width >= 0.75
+                        and bbox[1] <= visual_bbox[1] + 0.025
+                        and bbox[3] >= visual_bbox[1] - 0.012
+                        and bbox[3] <= visual_bbox[1] + 0.04
+                    ):
+                        candidates.append(heading)
+                if len(candidates) < 2:
+                    continue
+                center_ys = [
+                    (heading["bbox"][1] + heading["bbox"][3]) / 2
+                    for heading in candidates
+                ]
+                center_xs = sorted(
+                    (heading["bbox"][0] + heading["bbox"][2]) / 2
+                    for heading in candidates
+                )
+                candidate_ids = {
+                    str(heading["blockId"]) for heading in candidates
+                }
+                if (
+                    max(center_ys) - min(center_ys) > 0.02
+                    or center_xs[-1] - center_xs[0] < 0.16
+                    or str(visual.get("insertAfterBlockId") or "")
+                    not in candidate_ids
+                ):
+                    continue
+                proposals.append(
+                    {
+                        "pageNumber": page_number,
+                        "visual": visual,
+                        "headings": candidates,
+                    }
+                )
+    finally:
+        pdf.close()
+
+    heading_owner_counts: dict[str, int] = {}
+    for proposal in proposals:
+        for heading in proposal["headings"]:
+            block_id = str(heading["blockId"])
+            heading_owner_counts[block_id] = heading_owner_counts.get(block_id, 0) + 1
+    for block_id, count in heading_owner_counts.items():
+        if count > 1:
+            unresolved.add(block_id)
+
+    semantic_anchor_roles = {
+        "title",
+        "author",
+        "affiliation",
+        "abstract",
+        "heading",
+        "paragraph",
+        "list_item",
+        "reference",
+        "footnote",
+    }
+    accepted: list[dict[str, Any]] = []
+    accepted_ids: set[str] = set()
+    for proposal in proposals:
+        candidate_ids = {
+            str(heading["blockId"]) for heading in proposal["headings"]
+        }
+        if candidate_ids & unresolved:
+            continue
+        earliest_position = min(
+            assignment_positions.get(block_id, 10**12)
+            for block_id in candidate_ids
+        )
+        fallback = next(
+            (
+                previous
+                for previous in reversed(ordered_assignments[:earliest_position])
+                if not previous.get("hidden")
+                and str(previous.get("blockId") or "") not in candidate_ids
+                and str(previous.get("role") or "") in semantic_anchor_roles
+                and previous.get("sectionId")
+            ),
+            None,
+        )
+        if fallback is None:
+            unresolved.update(candidate_ids)
+            continue
+        proposal["fallbackBlockId"] = str(fallback["blockId"])
+        proposal["fallbackSectionId"] = str(fallback["sectionId"])
+        accepted.append(proposal)
+        accepted_ids.update(candidate_ids)
+
+    sections = list(structure.get("sections", []))
+    removed_sections = {
+        str(section["sectionId"]): section
+        for section in sections
+        if str(section.get("titleBlockId")) in accepted_ids
+    }
+    fallback_section_by_removed_id = {
+        section_id: next(
+            (
+                str(proposal["fallbackSectionId"])
+                for proposal in accepted
+                if str(section.get("titleBlockId"))
+                in {
+                    str(heading["blockId"])
+                    for heading in proposal["headings"]
+                }
+            ),
+            None,
+        )
+        for section_id, section in removed_sections.items()
+    }
+
+    def surviving_parent(section_id: str | None) -> str | None:
+        seen: set[str] = set()
+        while section_id and section_id in removed_sections and section_id not in seen:
+            seen.add(section_id)
+            parent = removed_sections[section_id].get("parentSectionId")
+            section_id = (
+                str(parent)
+                if parent
+                else fallback_section_by_removed_id.get(section_id)
+            )
+        return section_id
+
+    for assignment in ordered_assignments:
+        section_id = assignment.get("sectionId")
+        if section_id and str(section_id) in removed_sections:
+            assignment["sectionId"] = surviving_parent(str(section_id))
+    for section in sections:
+        parent = section.get("parentSectionId")
+        if parent and str(parent) in removed_sections:
+            section["parentSectionId"] = surviving_parent(str(parent))
+    structure["sections"] = [
+        section
+        for section in sections
+        if str(section["sectionId"]) not in removed_sections
+    ]
+
+    absorbed_groups: list[dict[str, Any]] = []
+    replacement_anchor_by_heading: dict[str, str] = {}
+    for proposal in accepted:
+        heading_ids = sorted(
+            str(heading["blockId"]) for heading in proposal["headings"]
+        )
+        fallback_block_id = str(proposal["fallbackBlockId"])
+        for block_id in heading_ids:
+            replacement_anchor_by_heading[block_id] = fallback_block_id
+        visual = proposal["visual"]
+        bbox = [float(value) for value in visual["bboxNormalized"]]
+        label_top = min(
+            float(heading["bbox"][1]) for heading in proposal["headings"]
+        )
+        visual["bboxNormalized"] = [
+            bbox[0],
+            round(max(0.0, min(bbox[1], label_top - 0.004)), 5),
+            bbox[2],
+            bbox[3],
+        ]
+        for heading in proposal["headings"]:
+            block = heading["block"]
+            assignment = heading["assignment"]
+            block["embeddedVisualOwnerRefs"] = [str(visual["objectId"])]
+            block["suppressedVisualText"] = True
+            block["suppressedFigurePanelHeading"] = True
+            block["visualCaptionCandidate"] = False
+            block["associatedVisualCaption"] = False
+            assignment["role"] = "noise"
+            assignment["sectionId"] = None
+            assignment["paragraphId"] = None
+            assignment["continuesFrom"] = None
+            assignment["hidden"] = True
+            assignment["suppressedVisualText"] = True
+            assignment["suppressedFigurePanelHeading"] = True
+            assignment["visualCaptionCandidate"] = False
+            assignment["associatedVisualCaption"] = False
+            warning = (
+                "Aligned column labels were folded into their combined figure "
+                "instead of being exposed as document sections."
+            )
+            if warning not in assignment.setdefault("warnings", []):
+                assignment["warnings"].append(warning)
+        absorbed_groups.append(
+            {
+                "objectId": str(visual["objectId"]),
+                "pageNumber": int(proposal["pageNumber"]),
+                "panelHeadingBlockIds": heading_ids,
+                "fallbackBlockId": fallback_block_id,
+                "fallbackSectionId": str(proposal["fallbackSectionId"]),
+            }
+        )
+
+    if replacement_anchor_by_heading:
+        for page_structure in structure.get("pages", []):
+            for visual in page_structure.get("visualObjects", []):
+                anchor = str(visual.get("insertAfterBlockId") or "")
+                if anchor in replacement_anchor_by_heading:
+                    visual["insertAfterBlockId"] = replacement_anchor_by_heading[anchor]
+
+    diagnostics["absorbedPanelHeadingGroups"] = absorbed_groups
+    diagnostics["unabsorbedPanelHeadingBlockIds"] = sorted(unresolved)
+    if unresolved:
+        warning = (
+            "Aligned headings overlapped a figure boundary but could not be "
+            "absorbed unambiguously; publication QA must fail closed."
+        )
+        if warning not in structure.setdefault("warnings", []):
+            structure["warnings"].append(warning)
+
+
+def _set_recovered_block(
+    block: dict[str, Any],
+    assignment: dict[str, Any],
+    *,
+    role: str,
+    section_id: str | None,
+    paragraph_id: str | None = None,
+    continues_from: str | None = None,
+    caption: bool = False,
+) -> None:
+    block["embeddedVisualOwnerRefs"] = []
+    block["suppressedVisualText"] = False
+    block["visualCaptionCandidate"] = caption
+    block["associatedVisualCaption"] = caption
+    assignment["role"] = role
+    assignment["sectionId"] = section_id
+    assignment["paragraphId"] = paragraph_id
+    assignment["continuesFrom"] = continues_from
+    assignment["hidden"] = False
+    assignment["suppressedVisualText"] = False
+    assignment["visualCaptionCandidate"] = caption
+    assignment["associatedVisualCaption"] = caption
+    warning = (
+        "Text swallowed by an overlarge Docling picture was recovered from "
+        "source-PDF geometry."
+    )
+    warnings = assignment.setdefault("warnings", [])
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def _move_bottom_footnotes_after_recovered_body(
+    page_blocks: list[dict[str, Any]],
+    page_structure: dict[str, Any],
+    recovered_body_ids: set[str],
+) -> list[str]:
+    """Restore bottom-footnote order after Docling swallowed the page body."""
+
+    if not recovered_body_ids:
+        return []
+    blocks = {str(block["blockId"]): block for block in page_blocks}
+    assignments = list(page_structure.get("blockAssignments", []))
+    assignment_by_id = {
+        str(assignment["blockId"]): assignment for assignment in assignments
+    }
+    recovered_bottoms = [
+        float(blocks[block_id]["bboxNormalized"][3])
+        for block_id in recovered_body_ids
+        if block_id in blocks
+        and assignment_by_id.get(block_id, {}).get("role")
+        in {"paragraph", "heading", "equation"}
+    ]
+    if not recovered_bottoms:
+        return []
+    recovered_bottom = max(recovered_bottoms)
+    ordered = sorted(assignments, key=lambda value: int(value["readingOrder"]))
+    positions = {
+        str(assignment["blockId"]): index
+        for index, assignment in enumerate(ordered)
+    }
+    recovered_positions = [
+        positions[block_id] for block_id in recovered_body_ids if block_id in positions
+    ]
+    if not recovered_positions:
+        return []
+    last_recovered_position = max(recovered_positions)
+    movable = [
+        assignment
+        for assignment in ordered
+        if assignment.get("role") == "footnote"
+        and not assignment.get("hidden")
+        and str(assignment["blockId"]) in blocks
+        and float(blocks[str(assignment["blockId"])]["bboxNormalized"][1])
+        >= recovered_bottom - 0.004
+        and positions[str(assignment["blockId"])] < last_recovered_position
+    ]
+    if not movable:
+        return []
+    movable_ids = {str(assignment["blockId"]) for assignment in movable}
+    rebuilt = [
+        assignment
+        for assignment in ordered
+        if str(assignment["blockId"]) not in movable_ids
+    ]
+    insertion = max(
+        index
+        for index, assignment in enumerate(rebuilt)
+        if str(assignment["blockId"]) in recovered_body_ids
+    ) + 1
+    rebuilt[insertion:insertion] = movable
+    for reading_order, assignment in enumerate(rebuilt, start=1):
+        assignment["readingOrder"] = reading_order
+    page_structure["blockAssignments"] = rebuilt
+    return [str(assignment["blockId"]) for assignment in movable]
+
+
+def _recover_overlarge_docling_pictures(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> None:
+    """Recover pictures whose raw Docling bbox crosses internal captions.
+
+    The trigger is deliberately narrow: a tall figure must own a caption-like
+    descendant whose label begins materially inside the figure.  Once fired,
+    source-PDF text blocks separate caption fragments from following prose and
+    rendered ink honors Form-XObject clipping that Docling's raw bbox lost.
+    """
+
+    detected_caption_ids: set[str] = set()
+    attached_caption_ids: set[str] = set()
+    unresolved_visual_ids: set[str] = set()
+    recovered_diagnostics: list[dict[str, Any]] = []
+    section_by_id = {
+        str(section["sectionId"]): section
+        for section in structure.get("sections", [])
+    }
+    page_structures = {
+        int(page["pageNumber"]): page for page in structure.get("pages", [])
+    }
+
+    try:
+        probe = fitz.open(source)
+        probe.close()
+    except Exception:
+        diagnostics = structure.setdefault("doclingDiagnostics", {})
+        diagnostics.setdefault("recoveredOverlargeVisuals", [])
+        diagnostics.setdefault("suppressedInternalCaptionBlockIds", [])
+        diagnostics.setdefault("overlargeVisualObjectIds", [])
+        return
+
+    with fitz.open(source) as pdf:
+        for evidence_page in evidence.get("pages", []):
+            page_number = int(evidence_page["pageNumber"])
+            page_structure = page_structures.get(page_number)
+            if page_structure is None or not 1 <= page_number <= len(pdf):
+                continue
+            pdf_page = pdf[page_number - 1]
+            pdf_regions = _pdf_text_regions(pdf_page)
+            page_blocks = list(evidence_page.get("blocks", []))
+            block_positions = {
+                str(block["blockId"]): index for index, block in enumerate(page_blocks)
+            }
+            assignments = {
+                str(assignment["blockId"]): assignment
+                for assignment in page_structure.get("blockAssignments", [])
+            }
+            source_regions = {
+                str(block["blockId"]): _best_pdf_text_region(block, pdf_regions)
+                for block in page_blocks
+            }
+
+            original_visuals = list(page_structure.get("visualObjects", []))
+            replacement_visuals: list[dict[str, Any]] = []
+            for visual in original_visuals:
+                if visual.get("kind") != "figure":
+                    replacement_visuals.append(visual)
+                    continue
+                object_id = str(visual.get("objectId", ""))
+                visual_bbox = [float(value) for value in visual["bboxNormalized"]]
+                owner_refs = {
+                    str(owner_ref)
+                    for block in page_blocks
+                    for owner_ref in block.get("embeddedVisualOwnerRefs", [])
+                    if _safe_id(str(owner_ref), prefix="figure") == object_id
+                }
+                owner_blocks = [
+                    block
+                    for block in page_blocks
+                    if owner_refs
+                    & {
+                        str(value)
+                        for value in block.get("embeddedVisualOwnerRefs", [])
+                    }
+                ]
+                caption_starts = [
+                    block
+                    for block in owner_blocks
+                    if _is_material_internal_figure_caption(block, visual_bbox)
+                ]
+                caption_starts.sort(
+                    key=lambda block: (
+                        float(block["bboxNormalized"][1]),
+                        block_positions[str(block["blockId"])],
+                    )
+                )
+                detected_caption_ids.update(
+                    str(block["blockId"]) for block in caption_starts
+                )
+                if not caption_starts:
+                    replacement_visuals.append(visual)
+                    continue
+                if any(
+                    source_regions.get(str(start["blockId"])) is None
+                    for start in caption_starts
+                ):
+                    unresolved_visual_ids.add(object_id)
+                    replacement_visuals.append(visual)
+                    continue
+
+                caption_groups = [
+                    _caption_blocks_for_start(
+                        start,
+                        caption_starts[index + 1]
+                        if index + 1 < len(caption_starts)
+                        else None,
+                        owner_blocks,
+                        source_regions,
+                        block_positions,
+                    )
+                    for index, start in enumerate(caption_starts)
+                ]
+                if any(not group for group in caption_groups):
+                    unresolved_visual_ids.add(object_id)
+                    replacement_visuals.append(visual)
+                    continue
+
+                group_bboxes = []
+                for group in caption_groups:
+                    boxes = [
+                        [float(value) for value in block["bboxNormalized"]]
+                        for block in group
+                    ]
+                    group_bboxes.append(
+                        [
+                            min(box[0] for box in boxes),
+                            min(box[1] for box in boxes),
+                            max(box[2] for box in boxes),
+                            max(box[3] for box in boxes),
+                        ]
+                    )
+                caption_group_ids = {
+                    str(block["blockId"])
+                    for group in caption_groups
+                    for block in group
+                }
+                inter_caption_blocks = [
+                    block
+                    for index in range(len(group_bboxes) - 1)
+                    for block in owner_blocks
+                    if str(block["blockId"]) not in caption_group_ids
+                    and block.get("suppressedVisualText")
+                    and float(block["bboxNormalized"][3])
+                    > group_bboxes[index][3] + 0.001
+                    and float(block["bboxNormalized"][1])
+                    < group_bboxes[index + 1][1] - 0.001
+                ]
+                if inter_caption_blocks:
+                    # The following figure body cannot be separated safely from
+                    # semantic text in the same interval.  Preserve the raw
+                    # state and force publication QA to fail closed.
+                    unresolved_visual_ids.add(object_id)
+                    replacement_visuals.append(visual)
+                    continue
+                final_caption_bottom = group_bboxes[-1][3]
+                if any(
+                    str(block["blockId"]) not in caption_group_ids
+                    and block.get("suppressedVisualText")
+                    and float(block["bboxNormalized"][1])
+                    >= final_caption_bottom - 0.002
+                    and float(block["bboxNormalized"][1]) < 0.92
+                    and source_regions.get(str(block["blockId"])) is None
+                    for block in owner_blocks
+                ):
+                    unresolved_visual_ids.add(object_id)
+                    replacement_visuals.append(visual)
+                    continue
+
+                recovered_bboxes: list[list[float]] = []
+                previous_caption_bottom: float | None = None
+                for caption_bbox in group_bboxes:
+                    body_top = (
+                        visual_bbox[1]
+                        if previous_caption_bottom is None
+                        else previous_caption_bottom + 0.004
+                    )
+                    body_bottom = caption_bbox[1] - 0.004
+                    candidate_bbox = [
+                        visual_bbox[0],
+                        body_top,
+                        visual_bbox[2],
+                        body_bottom,
+                    ]
+                    if (
+                        body_bottom <= body_top
+                        or (candidate_bbox[2] - candidate_bbox[0])
+                        * (candidate_bbox[3] - candidate_bbox[1])
+                        < 0.0005
+                    ):
+                        recovered_bboxes = []
+                        break
+                    tightened = _rendered_ink_bbox(pdf_page, candidate_bbox)
+                    if tightened is None:
+                        recovered_bboxes = []
+                        break
+                    recovered_bboxes.append(tightened)
+                    previous_caption_bottom = caption_bbox[3]
+                if len(recovered_bboxes) != len(caption_groups):
+                    unresolved_visual_ids.add(object_id)
+                    replacement_visuals.append(visual)
+                    continue
+
+                anchor_assignment = assignments.get(
+                    str(visual.get("insertAfterBlockId") or "")
+                )
+                base_section_id = (
+                    str(anchor_assignment.get("sectionId"))
+                    if anchor_assignment and anchor_assignment.get("sectionId")
+                    else None
+                )
+                recovered_figures: list[dict[str, Any]] = []
+                for index, (group, bbox) in enumerate(
+                    zip(caption_groups, recovered_bboxes, strict=True), start=1
+                ):
+                    caption_ids = [str(block["blockId"]) for block in group]
+                    for block in group:
+                        assignment = assignments[str(block["blockId"])]
+                        _set_recovered_block(
+                            block,
+                            assignment,
+                            role="caption",
+                            section_id=base_section_id,
+                            caption=True,
+                        )
+                    attached_caption_ids.update(caption_ids)
+                    recovered = copy.deepcopy(visual)
+                    if index > 1:
+                        recovered["objectId"] = f"{object_id}-split-{index}"
+                    recovered["bboxNormalized"] = bbox
+                    recovered["captionBlockIds"] = caption_ids
+                    recovered["label"] = _visual_label(
+                        [str(block["text"]) for block in group], "figure"
+                    )
+                    warnings = recovered.setdefault("warnings", [])
+                    if _RECOVERED_INTERNAL_CAPTION_WARNING not in warnings:
+                        warnings.append(_RECOVERED_INTERNAL_CAPTION_WARNING)
+                    recovered_figures.append(recovered)
+                replacement_visuals.extend(recovered_figures)
+
+                released_blocks = [
+                    block
+                    for block in owner_blocks
+                    if str(block["blockId"]) not in attached_caption_ids
+                    and block.get("suppressedVisualText")
+                    and float(block["bboxNormalized"][1])
+                    >= final_caption_bottom - 0.002
+                    and float(block["bboxNormalized"][1]) < 0.92
+                    and source_regions.get(str(block["blockId"])) is not None
+                ]
+                released_blocks.sort(
+                    key=lambda block: (
+                        int(
+                            source_regions[str(block["blockId"])]["regionIndex"]
+                        ),
+                        _best_pdf_text_line_index(
+                            block, source_regions[str(block["blockId"])]
+                        )
+                        or 0,
+                        round(float(block["bboxNormalized"][0]), 4),
+                        block_positions[str(block["blockId"])],
+                    )
+                )
+                released_positions = {
+                    str(block["blockId"]): index
+                    for index, block in enumerate(released_blocks)
+                }
+
+                equation_blocks: set[str] = set()
+                recovered_equations: list[dict[str, Any]] = []
+                for label_block in released_blocks:
+                    label_match = re.fullmatch(
+                        r"\s*\((\d+[a-z]?)\)\s*", str(label_block.get("text", ""))
+                    )
+                    if label_match is None:
+                        continue
+                    label_bbox = [
+                        float(value) for value in label_block["bboxNormalized"]
+                    ]
+                    group = [
+                        block
+                        for block in released_blocks
+                        if float(block["bboxNormalized"][3])
+                        >= label_bbox[1] - 0.022
+                        and float(block["bboxNormalized"][1])
+                        <= label_bbox[3] + 0.022
+                    ]
+                    math_support = any(
+                        _pdf_line_evidence(
+                            block, source_regions.get(str(block["blockId"]))
+                        )[1]
+                        >= 0.2
+                        for block in group
+                    ) or any(
+                        re.search(
+                            r"[=<>\u2264\u2265\u2211\u220f\u222b\u221a\u00b1\u00d7\u00f7\u2202\u2207]",
+                            str(block.get("text", "")),
+                        )
+                        for block in group
+                    )
+                    if len(group) < 3 or not math_support:
+                        continue
+                    boxes = [
+                        [float(value) for value in block["bboxNormalized"]]
+                        for block in group
+                    ]
+                    equation_bbox = [
+                        max(0.0, min(box[0] for box in boxes) - 0.003),
+                        max(0.0, min(box[1] for box in boxes) - 0.003),
+                        min(1.0, max(box[2] for box in boxes) + 0.003),
+                        min(1.0, max(box[3] for box in boxes) + 0.003),
+                    ]
+                    tightened_equation = _rendered_ink_bbox(
+                        pdf_page, equation_bbox
+                    )
+                    if tightened_equation is None:
+                        continue
+                    equation_ids = [str(block["blockId"]) for block in group]
+                    equation_blocks.update(equation_ids)
+                    first_position = min(
+                        released_positions[block_id] for block_id in equation_ids
+                    )
+                    previous_id = next(
+                        (
+                            str(block["blockId"])
+                            for block in reversed(released_blocks)
+                            if released_positions[str(block["blockId"])] < first_position
+                            and str(block["blockId"]) not in equation_ids
+                        ),
+                        str(visual.get("insertAfterBlockId") or "") or None,
+                    )
+                    recovered_equations.append(
+                        {
+                            "objectId": (
+                                "equation-recovered-"
+                                f"{str(label_block['blockId']).removeprefix('dl-')}"
+                            ),
+                            "kind": "equation",
+                            "label": f"Equation {label_match.group(1)}",
+                            "bboxNormalized": tightened_equation,
+                            "captionBlockIds": [],
+                            "insertAfterBlockId": previous_id,
+                            "confidence": 0.96,
+                            "warnings": [
+                                "Equation swallowed by an overlarge Docling picture was recovered from source-PDF coordinates."
+                            ],
+                        }
+                    )
+                replacement_visuals.extend(recovered_equations)
+
+                current_section_id = base_section_id
+                paragraph_groups: list[
+                    tuple[str | None, int, list[dict[str, Any]]]
+                ] = []
+                active_paragraph_key: tuple[str | None, int] | None = None
+                for block in released_blocks:
+                    block_id = str(block["blockId"])
+                    if block_id in equation_blocks:
+                        active_paragraph_key = None
+                        _set_recovered_block(
+                            block,
+                            assignments[block_id],
+                            role="equation",
+                            section_id=current_section_id,
+                        )
+                        continue
+                    region = source_regions[block_id]
+                    bold_ratio, _math_ratio, _font_size = _pdf_line_evidence(
+                        block, region
+                    )
+                    text = str(block.get("text", "")).strip()
+                    is_heading = 4 <= len(text) <= 120 and bold_ratio >= 0.72
+                    if is_heading:
+                        active_paragraph_key = None
+                        base_section = section_by_id.get(str(base_section_id))
+                        parent_level = (
+                            int(base_section.get("level", 1))
+                            if base_section
+                            else 1
+                        )
+                        current_section_id = _safe_id(
+                            str(block["sourceBlockId"]).removeprefix("dl-"),
+                            prefix="sec",
+                        )
+                        section = {
+                            "sectionId": current_section_id,
+                            "number": None,
+                            "titleBlockId": block_id,
+                            "level": min(6, parent_level + 1),
+                            "parentSectionId": base_section_id,
+                            "pageStart": page_number,
+                        }
+                        if current_section_id not in section_by_id:
+                            structure.setdefault("sections", []).append(section)
+                            section_by_id[current_section_id] = section
+                        _set_recovered_block(
+                            block,
+                            assignments[block_id],
+                            role="heading",
+                            section_id=current_section_id,
+                        )
+                        continue
+                    paragraph_key = (
+                        current_section_id,
+                        int(region["regionIndex"]),
+                    )
+                    if active_paragraph_key != paragraph_key:
+                        paragraph_groups.append(
+                            (current_section_id, paragraph_key[1], [])
+                        )
+                        active_paragraph_key = paragraph_key
+                    paragraph_groups[-1][2].append(block)
+
+                last_paragraph_group: list[dict[str, Any]] = []
+                for paragraph_section_id, _region_index, group in paragraph_groups:
+                    paragraph_id = f"para-{group[0]['blockId']}"
+                    previous_block_id: str | None = None
+                    for block in group:
+                        block_id = str(block["blockId"])
+                        _set_recovered_block(
+                            block,
+                            assignments[block_id],
+                            role="paragraph",
+                            section_id=paragraph_section_id,
+                            paragraph_id=paragraph_id,
+                            continues_from=previous_block_id,
+                        )
+                        previous_block_id = block_id
+                    last_paragraph_group = group
+
+                moved_footnote_ids = _move_bottom_footnotes_after_recovered_body(
+                    page_blocks,
+                    page_structure,
+                    {str(block["blockId"]) for block in released_blocks},
+                )
+
+                if last_paragraph_group and page_number < len(pdf):
+                    last_block = last_paragraph_group[-1]
+                    last_text = str(last_block.get("text", "")).rstrip()
+                    last_bbox = [
+                        float(value) for value in last_block["bboxNormalized"]
+                    ]
+                    next_structure = page_structures.get(page_number + 1)
+                    if (
+                        next_structure is not None
+                        and last_bbox[3] >= 0.88
+                        and not re.search(r"[.!?;:)\]}\u201d\u2019]\s*$", last_text)
+                    ):
+                        next_assignments = sorted(
+                            next_structure.get("blockAssignments", []),
+                            key=lambda value: int(value["readingOrder"]),
+                        )
+                        next_body = next(
+                            (
+                                assignment
+                                for assignment in next_assignments
+                                if not assignment.get("hidden")
+                                and assignment.get("role") in {"abstract", "paragraph"}
+                            ),
+                            None,
+                        )
+                        if next_body is not None:
+                            continuation_section_id = assignments[
+                                str(last_block["blockId"])
+                            ].get("sectionId")
+                            next_body["paragraphId"] = assignments[
+                                str(last_block["blockId"])
+                            ]["paragraphId"]
+                            next_body["continuesFrom"] = str(last_block["blockId"])
+                            next_body["sectionId"] = continuation_section_id
+                            warning = (
+                                "Cross-page continuation was relinked after recovering "
+                                "text swallowed by an overlarge picture."
+                            )
+                            warnings = next_body.setdefault("warnings", [])
+                            if warning not in warnings:
+                                warnings.append(warning)
+                            for assignment in next_assignments:
+                                if assignment.get("role") == "heading":
+                                    break
+                                if assignment.get("sectionId") in {
+                                    None,
+                                    base_section_id,
+                                }:
+                                    assignment["sectionId"] = (
+                                        continuation_section_id
+                                    )
+                            for next_visual in next_structure.get(
+                                "visualObjects", []
+                            ):
+                                if next_visual.get("insertAfterBlockId") == visual.get(
+                                    "insertAfterBlockId"
+                                ):
+                                    next_visual["insertAfterBlockId"] = str(
+                                        last_block["blockId"]
+                                    )
+
+                recovered_diagnostics.append(
+                    {
+                        "objectId": object_id,
+                        "pageNumber": page_number,
+                        "replacementObjectIds": [
+                            value["objectId"] for value in recovered_figures
+                        ],
+                        "captionBlockIds": [
+                            str(block["blockId"])
+                            for group in caption_groups
+                            for block in group
+                        ],
+                        "movedFootnoteBlockIds": moved_footnote_ids,
+                    }
+                )
+            page_structure["visualObjects"] = replacement_visuals
+
+    positions: dict[str, int] = {}
+    position = 0
+    for page in sorted(
+        structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+    ):
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        ):
+            position += 1
+            positions[str(assignment["blockId"])] = position
+    structure.get("sections", []).sort(
+        key=lambda section: positions.get(str(section["titleBlockId"]), 10**12)
+    )
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    all_blocks = [
+        block
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    ]
+    diagnostics["embeddedVisualTextItems"] = len(
+        {
+            str(block.get("sourceBlockId") or block.get("blockId"))
+            for block in all_blocks
+            if block.get("suppressedVisualText")
+        }
+    )
+    diagnostics["suppressedEmbeddedVisualTextBlocks"] = sum(
+        bool(block.get("suppressedVisualText")) for block in all_blocks
+    )
+    suppressed_internal = sorted(detected_caption_ids - attached_caption_ids)
+    diagnostics["recoveredOverlargeVisuals"] = recovered_diagnostics
+    diagnostics["suppressedInternalCaptionBlockIds"] = suppressed_internal
+    diagnostics["overlargeVisualObjectIds"] = sorted(unresolved_visual_ids)
+    if suppressed_internal or unresolved_visual_ids:
+        warning = (
+            "Source-PDF recovery could not safely resolve every overlarge "
+            "Docling picture; publication QA must fail closed."
+        )
+        warnings = structure.setdefault("warnings", [])
+        if warning not in warnings:
+            warnings.append(warning)
+
+
+def _looks_like_combined_left_right_crop(
+    visual_bbox: list[float], caption_bbox: list[float]
+) -> bool:
+    """Recognize a single crop that already spans a left/right caption."""
+
+    visual_width = visual_bbox[2] - visual_bbox[0]
+    caption_width = caption_bbox[2] - caption_bbox[0]
+    horizontal_overlap = max(
+        0.0,
+        min(visual_bbox[2], caption_bbox[2])
+        - max(visual_bbox[0], caption_bbox[0]),
+    )
+    center_distance = abs(
+        (visual_bbox[0] + visual_bbox[2] - caption_bbox[0] - caption_bbox[2])
+        / 2
+    )
+    vertical_gap = caption_bbox[1] - visual_bbox[3]
+    return (
+        visual_width >= 0.30
+        and caption_width > 0
+        and visual_width / caption_width >= 0.72
+        and horizontal_overlap / min(visual_width, caption_width) >= 0.82
+        and center_distance <= 0.08
+        and 0 <= vertical_gap <= 0.12
+    )
+
+
+def _relink_interrupted_panel_paragraph(
+    *,
+    anchor_id: str | None,
+    after_block_ids: set[str],
+    fallback_section_id: str | None,
+    ordered_assignments: list[dict[str, Any]],
+    assignment_positions: dict[str, int],
+    blocks: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Join a sentence split across a floated, falsely sectioned panel."""
+
+    if not anchor_id or anchor_id not in assignment_positions or anchor_id not in blocks:
+        return []
+    anchor_assignment = ordered_assignments[assignment_positions[anchor_id]]
+    if (
+        anchor_assignment.get("hidden")
+        or anchor_assignment.get("role") not in {"abstract", "paragraph"}
+        or not anchor_assignment.get("paragraphId")
+    ):
+        return []
+    anchor_text = str(blocks[anchor_id].get("text", "")).rstrip()
+    if not anchor_text or re.search(r"[.!?;:)\]}\u2019\u201d]\s*$", anchor_text):
+        return []
+    boundary_positions = [
+        assignment_positions[block_id]
+        for block_id in after_block_ids
+        if block_id in assignment_positions
+    ]
+    if not boundary_positions:
+        return []
+    next_assignment = next(
+        (
+            assignment
+            for assignment in ordered_assignments[max(boundary_positions) + 1 :]
+            if not assignment.get("hidden")
+            and assignment.get("role") in {"abstract", "paragraph"}
+            and str(assignment["blockId"]) in blocks
+        ),
+        None,
+    )
+    if next_assignment is None:
+        return []
+    next_id = str(next_assignment["blockId"])
+    next_text = str(blocks[next_id].get("text", "")).lstrip()
+    if not next_text[:1].islower():
+        return []
+    if next_assignment.get("sectionId") not in {
+        None,
+        fallback_section_id,
+    }:
+        return []
+    old_paragraph_id = next_assignment.get("paragraphId") or next_id
+    continuation_group = [
+        assignment
+        for assignment in ordered_assignments[assignment_positions[next_id] :]
+        if (assignment.get("paragraphId") or str(assignment["blockId"]))
+        == old_paragraph_id
+    ]
+    previous_id = anchor_id
+    relinked: list[str] = []
+    for assignment in continuation_group:
+        block_id = str(assignment["blockId"])
+        assignment["paragraphId"] = anchor_assignment["paragraphId"]
+        assignment["sectionId"] = anchor_assignment.get("sectionId")
+        assignment["continuesFrom"] = previous_id
+        warning = (
+            "A sentence interrupted by a split left/right figure was relinked."
+        )
+        if warning not in assignment.setdefault("warnings", []):
+            assignment["warnings"].append(warning)
+        previous_id = block_id
+        relinked.append(block_id)
+    return relinked
+
+
+def _merge_split_panel_figures(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> None:
+    """Merge a nearby unlabeled panel when one shared caption says left/right."""
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics.setdefault("mergedMultiPanelVisuals", [])
+    diagnostics.setdefault("unmergedMultiPanelVisualObjectIds", [])
+    diagnostics.setdefault("danglingParentSectionIds", [])
+    try:
+        pdf = fitz.open(source)
+    except Exception:
+        return
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    structure_pages = {
+        int(page["pageNumber"]): page for page in structure.get("pages", [])
+    }
+    global_blocks = {
+        str(block["blockId"]): block
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    }
+    ordered_assignments = [
+        assignment
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    global_assignment_positions = {
+        str(assignment["blockId"]): index
+        for index, assignment in enumerate(ordered_assignments)
+    }
+    merged: list[dict[str, Any]] = []
+    unresolved: set[str] = set()
+    try:
+        for page_number, page_structure in structure_pages.items():
+            evidence_page = evidence_pages.get(page_number)
+            if evidence_page is None or not 1 <= page_number <= len(pdf):
+                continue
+            blocks = {
+                str(block["blockId"]): block
+                for block in evidence_page.get("blocks", [])
+            }
+            assignments = {
+                str(assignment["blockId"]): assignment
+                for assignment in page_structure.get("blockAssignments", [])
+            }
+            visuals = list(page_structure.get("visualObjects", []))
+            consumed_ids: set[str] = set()
+            replacements: dict[str, dict[str, Any]] = {}
+            for captioned in visuals:
+                caption_ids = [
+                    str(value) for value in captioned.get("captionBlockIds", [])
+                ]
+                if captioned.get("kind") != "figure" or not caption_ids:
+                    continue
+                caption_text = " ".join(
+                    str(blocks[block_id].get("text", ""))
+                    for block_id in caption_ids
+                    if block_id in blocks
+                )
+                if not (
+                    re.search(r"\(\s*left\s*\)", caption_text, re.IGNORECASE)
+                    and re.search(
+                        r"\(\s*right\s*\)", caption_text, re.IGNORECASE
+                    )
+                ):
+                    continue
+                caption_bbox_values = [
+                    [float(value) for value in blocks[block_id]["bboxNormalized"]]
+                    for block_id in caption_ids
+                    if block_id in blocks
+                ]
+                if not caption_bbox_values:
+                    continue
+                caption_bbox = [
+                    min(value[0] for value in caption_bbox_values),
+                    min(value[1] for value in caption_bbox_values),
+                    max(value[2] for value in caption_bbox_values),
+                    max(value[3] for value in caption_bbox_values),
+                ]
+                caption_top = caption_bbox[1]
+                captioned_bbox = [
+                    float(value) for value in captioned["bboxNormalized"]
+                ]
+                candidates: list[dict[str, Any]] = []
+                for candidate in visuals:
+                    if (
+                        candidate is captioned
+                        or candidate.get("kind") != "figure"
+                        or candidate.get("label")
+                        or candidate.get("captionBlockIds")
+                    ):
+                        continue
+                    candidate_bbox = [
+                        float(value) for value in candidate["bboxNormalized"]
+                    ]
+                    vertical_overlap = max(
+                        0.0,
+                        min(captioned_bbox[3], candidate_bbox[3])
+                        - max(captioned_bbox[1], candidate_bbox[1]),
+                    )
+                    minimum_height = max(
+                        1e-9,
+                        min(
+                            captioned_bbox[3] - captioned_bbox[1],
+                            candidate_bbox[3] - candidate_bbox[1],
+                        ),
+                    )
+                    horizontal_gap = max(
+                        0.0,
+                        max(captioned_bbox[0], candidate_bbox[0])
+                        - min(captioned_bbox[2], candidate_bbox[2]),
+                    )
+                    combined_left = min(captioned_bbox[0], candidate_bbox[0])
+                    combined_right = max(captioned_bbox[2], candidate_bbox[2])
+                    combined_bottom = max(captioned_bbox[3], candidate_bbox[3])
+                    if (
+                        vertical_overlap / minimum_height >= 0.55
+                        and horizontal_gap <= 0.22
+                        and combined_right - combined_left <= 0.82
+                        and 0 <= caption_top - combined_bottom <= 0.10
+                    ):
+                        candidates.append(candidate)
+                if not candidates:
+                    if not _looks_like_combined_left_right_crop(
+                        captioned_bbox, caption_bbox
+                    ):
+                        unresolved.add(str(captioned["objectId"]))
+                    continue
+                if len(candidates) != 1:
+                    unresolved.add(str(captioned["objectId"]))
+                    unresolved.update(str(value["objectId"]) for value in candidates)
+                    continue
+
+                unlabeled = candidates[0]
+                if (
+                    str(captioned["objectId"]) in consumed_ids
+                    or str(unlabeled["objectId"]) in consumed_ids
+                ):
+                    unresolved.update(
+                        {str(captioned["objectId"]), str(unlabeled["objectId"])}
+                    )
+                    continue
+                combined_bbox = [
+                    min(
+                        float(captioned["bboxNormalized"][0]),
+                        float(unlabeled["bboxNormalized"][0]),
+                    ),
+                    min(
+                        float(captioned["bboxNormalized"][1]),
+                        float(unlabeled["bboxNormalized"][1]),
+                    ),
+                    max(
+                        float(captioned["bboxNormalized"][2]),
+                        float(unlabeled["bboxNormalized"][2]),
+                    ),
+                    max(
+                        float(captioned["bboxNormalized"][3]),
+                        float(unlabeled["bboxNormalized"][3]),
+                    ),
+                ]
+                caption_folded = re.sub(r"\s+", " ", caption_text).casefold()
+                panel_headers = []
+                for block in evidence_page.get("blocks", []):
+                    block_id = str(block["blockId"])
+                    text = re.sub(r"\s+", " ", str(block.get("text", ""))).strip()
+                    bbox = [float(value) for value in block["bboxNormalized"]]
+                    horizontal_overlap = max(
+                        0.0,
+                        min(combined_bbox[2], bbox[2])
+                        - max(combined_bbox[0], bbox[0]),
+                    )
+                    if (
+                        block_id not in caption_ids
+                        and 4 <= len(text) <= 80
+                        and text.casefold() in caption_folded
+                        and horizontal_overlap
+                        / max(1e-9, bbox[2] - bbox[0])
+                        >= 0.65
+                        and bbox[1] >= combined_bbox[1] - 0.03
+                        and bbox[3] <= combined_bbox[3] + 0.03
+                    ):
+                        panel_headers.append(block)
+                if len(panel_headers) < 2:
+                    unresolved.update(
+                        {str(captioned["objectId"]), str(unlabeled["objectId"])}
+                    )
+                    continue
+                for block in panel_headers:
+                    bbox = [float(value) for value in block["bboxNormalized"]]
+                    combined_bbox = [
+                        min(combined_bbox[0], bbox[0]),
+                        min(combined_bbox[1], bbox[1]),
+                        max(combined_bbox[2], bbox[2]),
+                        max(combined_bbox[3], bbox[3]),
+                    ]
+                tightened = _rendered_ink_bbox(pdf[page_number - 1], combined_bbox)
+                if tightened is None:
+                    unresolved.update(
+                        {str(captioned["objectId"]), str(unlabeled["objectId"])}
+                    )
+                    continue
+
+                removed_section_ids = {
+                    str(section["sectionId"])
+                    for section in structure.get("sections", [])
+                    if str(section.get("titleBlockId"))
+                    in {str(block["blockId"]) for block in panel_headers}
+                }
+                fallback_section_id = next(
+                    (
+                        str(assignment.get("sectionId"))
+                        for assignment in reversed(
+                            ordered_assignments[
+                                : min(
+                                    global_assignment_positions.get(
+                                        str(block["blockId"]), 10**12
+                                    )
+                                    for block in panel_headers
+                                )
+                            ]
+                        )
+                        if assignment.get("sectionId")
+                        and str(assignment.get("sectionId"))
+                        not in removed_section_ids
+                        and not assignment.get("hidden")
+                    ),
+                    None,
+                )
+                anchor_id = next(
+                    (
+                        str(assignment["blockId"])
+                        for assignment in reversed(
+                            ordered_assignments[
+                                : min(
+                                    global_assignment_positions.get(
+                                        str(block["blockId"]), 10**12
+                                    )
+                                    for block in panel_headers
+                                )
+                            ]
+                        )
+                        if not assignment.get("hidden")
+                        and assignment.get("role")
+                        not in {"caption", "equation", "algorithm"}
+                    ),
+                    str(captioned.get("insertAfterBlockId") or "") or None,
+                )
+                for block in panel_headers:
+                    block_id = str(block["blockId"])
+                    owner_refs = {
+                        str(value)
+                        for caption_id in caption_ids
+                        if caption_id in blocks
+                        for value in blocks[caption_id].get(
+                            "embeddedVisualOwnerRefs", []
+                        )
+                    }
+                    block["embeddedVisualOwnerRefs"] = sorted(owner_refs)
+                    block["suppressedVisualText"] = True
+                    block["visualCaptionCandidate"] = False
+                    block["associatedVisualCaption"] = False
+                    assignment = assignments[block_id]
+                    assignment["role"] = "noise"
+                    assignment["sectionId"] = None
+                    assignment["paragraphId"] = None
+                    assignment["continuesFrom"] = None
+                    assignment["hidden"] = True
+                    assignment["suppressedVisualText"] = True
+                    assignment["visualCaptionCandidate"] = False
+                    assignment["associatedVisualCaption"] = False
+                    warning = (
+                        "A panel header duplicated inside a shared left/right figure was suppressed."
+                    )
+                    if warning not in assignment.setdefault("warnings", []):
+                        assignment["warnings"].append(warning)
+                reparented_section_ids: list[str] = []
+                if removed_section_ids:
+                    for section in structure.get("sections", []):
+                        if str(section.get("parentSectionId")) in removed_section_ids:
+                            section["parentSectionId"] = fallback_section_id
+                            reparented_section_ids.append(str(section["sectionId"]))
+                    structure["sections"] = [
+                        section
+                        for section in structure.get("sections", [])
+                        if str(section["sectionId"]) not in removed_section_ids
+                    ]
+                    for assignment in ordered_assignments:
+                        if str(assignment.get("sectionId")) in removed_section_ids:
+                            assignment["sectionId"] = fallback_section_id
+
+                relinked_paragraph_ids = _relink_interrupted_panel_paragraph(
+                    anchor_id=anchor_id,
+                    after_block_ids={
+                        *caption_ids,
+                        *(str(block["blockId"]) for block in panel_headers),
+                    },
+                    fallback_section_id=fallback_section_id,
+                    ordered_assignments=ordered_assignments,
+                    assignment_positions=global_assignment_positions,
+                    blocks=global_blocks,
+                )
+
+                combined = copy.deepcopy(captioned)
+                combined["bboxNormalized"] = tightened
+                combined["insertAfterBlockId"] = anchor_id
+                warning = (
+                    "Adjacent left/right panels split into separate Docling pictures were merged under their shared caption."
+                )
+                if warning not in combined.setdefault("warnings", []):
+                    combined["warnings"].append(warning)
+                consumed_ids.update(
+                    {str(captioned["objectId"]), str(unlabeled["objectId"])}
+                )
+                replacements[str(captioned["objectId"])] = combined
+                merged.append(
+                    {
+                        "objectId": str(combined["objectId"]),
+                        "pageNumber": page_number,
+                        "mergedObjectIds": [
+                            str(unlabeled["objectId"]),
+                            str(captioned["objectId"]),
+                        ],
+                        "suppressedPanelHeaderBlockIds": [
+                            str(block["blockId"]) for block in panel_headers
+                        ],
+                        "relinkedParagraphBlockIds": relinked_paragraph_ids,
+                        "reparentedSectionIds": sorted(reparented_section_ids),
+                    }
+                )
+
+            if consumed_ids:
+                rebuilt: list[dict[str, Any]] = []
+                inserted: set[str] = set()
+                for visual in visuals:
+                    object_id = str(visual["objectId"])
+                    if object_id not in consumed_ids:
+                        rebuilt.append(visual)
+                        continue
+                    replacement = replacements.get(object_id)
+                    if replacement is not None and object_id not in inserted:
+                        rebuilt.append(replacement)
+                        inserted.add(object_id)
+                page_structure["visualObjects"] = rebuilt
+    finally:
+        pdf.close()
+
+    diagnostics["mergedMultiPanelVisuals"] = merged
+    diagnostics["unmergedMultiPanelVisualObjectIds"] = sorted(unresolved)
+    section_ids = {
+        str(section["sectionId"]) for section in structure.get("sections", [])
+    }
+    dangling_parent_section_ids = sorted(
+        str(section["sectionId"])
+        for section in structure.get("sections", [])
+        if section.get("parentSectionId")
+        and str(section["parentSectionId"]) not in section_ids
+    )
+    diagnostics["danglingParentSectionIds"] = dangling_parent_section_ids
+    all_blocks = [
+        block
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    ]
+    diagnostics["embeddedVisualTextItems"] = len(
+        {
+            str(block.get("sourceBlockId") or block.get("blockId"))
+            for block in all_blocks
+            if block.get("suppressedVisualText")
+        }
+    )
+    diagnostics["suppressedEmbeddedVisualTextBlocks"] = sum(
+        bool(block.get("suppressedVisualText")) for block in all_blocks
+    )
+    if unresolved:
+        warning = (
+            "A caption explicitly described left/right panels, but their split "
+            "Docling pictures could not be merged unambiguously."
+        )
+        if warning not in structure.setdefault("warnings", []):
+            structure["warnings"].append(warning)
+    if dangling_parent_section_ids:
+        warning = (
+            "Panel-section cleanup left a dangling parentSectionId; publication "
+            "QA must fail closed."
+        )
+        if warning not in structure.setdefault("warnings", []):
+            structure["warnings"].append(warning)
+
+
 def _source_name(document: Mapping[str, Any], source_file: str | Path | None) -> str:
     if source_file is not None:
         return Path(source_file).name
@@ -2245,6 +4305,31 @@ def extract_docling_semantics(
         timeout_seconds=worker_timeout_seconds,
     )
     evidence, structure = docling_document_to_ir(raw_document, source_file=source.name)
+    _suppress_blank_docling_headings(source, evidence, structure)
+    _absorb_aligned_figure_panel_headings(source, evidence, structure)
+    _recover_overlarge_docling_pictures(source, evidence, structure)
+    _merge_split_panel_figures(source, evidence, structure)
+    caption_overrides = refine_pdf_caption_texts(source, evidence, structure)
+    missing_required_overrides: list[str] = []
+    for page in structure.get("pages", []):
+        for visual in page.get("visualObjects", []):
+            object_id = str(visual.get("objectId") or "")
+            if override := caption_overrides.get(object_id):
+                visual["captionTextOverride"] = override
+                continue
+            if any(
+                "exact interleaving" in str(warning).lower()
+                for warning in visual.get("warnings", [])
+            ):
+                missing_required_overrides.append(object_id)
+    structure.setdefault("doclingDiagnostics", {})[
+        "missingCaptionTextOverrideObjectIds"
+    ] = sorted(set(missing_required_overrides))
+    if missing_required_overrides:
+        structure.setdefault("warnings", []).append(
+            "Source-PDF caption refinement was required for an interleaved caption but did not produce an unambiguous override."
+        )
+    validate_structure_batch(evidence["pages"], structure)
     visuals = render_visual_objects(source, structure, work_dir / "assets")
     for path, value in (
         (evidence_path, evidence),

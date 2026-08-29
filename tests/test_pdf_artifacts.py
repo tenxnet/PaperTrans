@@ -449,6 +449,45 @@ def test_pdf_qa_rejects_caption_conflicts_and_visible_visual_overlap(
     assert qa["output"]["visibleMath"] == 1
 
 
+def test_pdf_qa_fails_closed_for_unresolved_docling_visual_recovery(
+    tmp_path: Path,
+):
+    publication = tmp_path / "html"
+    publication.mkdir()
+    (publication / "index.html").write_text(
+        "<html><body>paper</body></html>", encoding="utf-8"
+    )
+
+    qa = write_semantic_pdf_qa(
+        sample_document(),
+        publication,
+        pdf_parser="docling",
+        structure={
+            "pages": [],
+            "doclingDiagnostics": {
+                "suppressedInternalCaptionBlockIds": ["internal-caption"],
+                "overlargeVisualObjectIds": ["figure-overlarge"],
+                "missingCaptionTextOverrideObjectIds": ["figure-interleaved"],
+                "unmergedMultiPanelVisualObjectIds": ["figure-left"],
+                "danglingParentSectionIds": ["sec-child"],
+                "blankVisibleHeadingBlockIds": ["heading-blank"],
+                "suppressedBlankHeadingBlockIds": ["heading-metadata"],
+                "unabsorbedPanelHeadingBlockIds": ["heading-panel"],
+            },
+        },
+    )
+
+    assert qa["status"] == "failed"
+    assert qa["suppressedInternalCaptionBlockIds"] == ["internal-caption"]
+    assert qa["overlargeVisualObjectIds"] == ["figure-overlarge"]
+    assert qa["missingCaptionTextOverrideObjectIds"] == ["figure-interleaved"]
+    assert qa["unmergedMultiPanelVisualObjectIds"] == ["figure-left"]
+    assert qa["danglingParentSectionIds"] == ["sec-child"]
+    assert qa["blankVisibleHeadingBlockIds"] == ["heading-blank"]
+    assert qa["suppressedBlankHeadingBlockIds"] == ["heading-metadata"]
+    assert qa["unabsorbedPanelHeadingBlockIds"] == ["heading-panel"]
+
+
 def test_pdf_qa_rejects_title_only_semantic_output(tmp_path: Path):
     publication = tmp_path / "html"
     publication.mkdir()
