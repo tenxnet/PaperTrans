@@ -10,7 +10,12 @@ from papertrans.pdf_artifacts import write_pdf_job_manifest, write_semantic_pdf_
 
 def sample_document() -> dict:
     return {
-        "title": {"id": "paper-title", "original": "Source title", "japanese": "日本語題"},
+        "title": {
+            "id": "paper-title",
+            "original": "Source title",
+            "japanese": "日本語題",
+            "sourceBlockIds": ["title-source"],
+        },
         "frontMatter": {"authors": [{"original": "Ada Example"}]},
         "sections": [
             {
@@ -95,6 +100,39 @@ def test_pdf_qa_checks_links_assets_and_semantic_counts(tmp_path: Path):
     assert qa["output"]["bibliographyEntries"] == 1
     assert qa["output"]["translatedUnits"] == 3
     assert qa["invalidPageGeometry"] == []
+    assert qa["missingTitleSource"] is False
+
+
+def test_pdf_qa_rejects_docling_title_fallback_without_source_evidence(
+    tmp_path: Path,
+):
+    publication = tmp_path / "html"
+    publication.mkdir()
+    (publication / "index.html").write_text(
+        "<html><body>paper</body></html>", encoding="utf-8"
+    )
+    document = sample_document()
+    document["title"]["original"] = "arxiv-1512-03385"
+    document["title"]["sourceBlockIds"] = []
+
+    qa = write_semantic_pdf_qa(
+        document,
+        publication,
+        pdf_parser="docling",
+        evidence={
+            "pages": [
+                {
+                    "pageNumber": 1,
+                    "widthPdf": 612,
+                    "heightPdf": 792,
+                    "blocks": [{"text": "Body"}],
+                }
+            ]
+        },
+    )
+
+    assert qa["status"] == "failed"
+    assert qa["missingTitleSource"] is True
 
 
 def test_pdf_qa_fails_closed_for_broken_local_references(tmp_path: Path):

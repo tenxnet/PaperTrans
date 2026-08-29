@@ -822,6 +822,140 @@ def test_promotes_top_unnumbered_first_heading_to_missing_title() -> None:
     assert semantic["title"]["original"] == "A Simple Paper"
 
 
+def test_promotes_centered_title_before_distant_abstract_and_preserves_front_matter() -> None:
+    document = sample_docling_document()
+    title = document["texts"][0]
+    title["label"] = "section_header"
+    title["level"] = 3
+    title["orig"] = title["text"] = "A Long Paper Title"
+    title["prov"][0]["charspan"] = [0, len("A Long Paper Title")]
+
+    front_specs = [
+        ("author", "Ada Example"),
+        ("affiliation", "Example University"),
+        *[("text", f"Unclassified front matter {index}") for index in range(7)],
+    ]
+    front_refs = []
+    for offset, (label, text) in enumerate(front_specs):
+        index = len(document["texts"])
+        ref = f"#/texts/{index}"
+        top = 700 - offset * 14
+        document["texts"].append(
+            {
+                "self_ref": ref,
+                "label": label,
+                "orig": text,
+                "text": text,
+                "prov": [
+                    {
+                        "page_no": 1,
+                        "bbox": {
+                            "l": 150,
+                            "t": top,
+                            "r": 450,
+                            "b": top - 10,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, len(text)],
+                    }
+                ],
+            }
+        )
+        front_refs.append({"$ref": ref})
+
+    abstract_index = len(document["texts"])
+    abstract_ref = f"#/texts/{abstract_index}"
+    document["texts"].append(
+        {
+            "self_ref": abstract_ref,
+            "label": "section_header",
+            "level": 1,
+            "orig": "Abstract",
+            "text": "Abstract",
+            "prov": [
+                {
+                    "page_no": 1,
+                    "bbox": {
+                        "l": 270,
+                        "t": 550,
+                        "r": 330,
+                        "b": 535,
+                        "coord_origin": "BOTTOMLEFT",
+                    },
+                    "charspan": [0, len("Abstract")],
+                }
+            ],
+        }
+    )
+    document["body"]["children"] = [
+        {"$ref": "#/texts/0"},
+        *front_refs,
+        {"$ref": abstract_ref},
+        {"$ref": "#/groups/0"},
+    ]
+    document["texts"][2]["prov"][0]["page_no"] = 2
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+
+    assert assignments["dl-texts-0"]["role"] == "title"
+    assert assignments["dl-texts-0"]["warnings"] == [
+        "Docling labeled the page-one title as a section header; it was conservatively promoted."
+    ]
+    assert assignments["dl-texts-11"]["role"] == "author"
+    assert assignments["dl-texts-12"]["role"] == "affiliation"
+    assert assignments["dl-texts-13"]["role"] == "paragraph"
+    assert "sec-texts-0" not in {section["sectionId"] for section in structure["sections"]}
+    assert structure["sections"][0]["titleBlockId"] == f"dl-texts-{abstract_index}"
+
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    assert semantic["title"]["original"] == "A Long Paper Title"
+    assert semantic["title"]["sourceBlockIds"] == ["dl-texts-0"]
+    assert semantic["frontMatter"]["authors"][0]["original"] == "Ada Example"
+    assert semantic["frontMatter"]["affiliations"][0]["original"] == "Example University"
+    preamble = next(section for section in semantic["sections"] if section["id"] == "sec-preamble")
+    assert any(
+        item["type"] == "unit"
+        and item["value"]["original"] == "Unclassified front matter 0"
+        for item in preamble["content"]
+    )
+
+
+def test_does_not_promote_left_aligned_unnumbered_first_section() -> None:
+    document = sample_docling_document()
+    candidate = document["texts"][0]
+    candidate["label"] = "section_header"
+    candidate["orig"] = candidate["text"] = "Executive Summary"
+    candidate["prov"][0]["charspan"] = [0, len("Executive Summary")]
+    candidate["prov"][0]["bbox"]["l"] = 60
+    candidate["prov"][0]["bbox"]["r"] = 260
+
+    _evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+
+    assert assignments["dl-texts-0"]["role"] == "heading"
+    assert structure["sections"][0]["titleBlockId"] == "dl-texts-0"
+
+
+def test_does_not_promote_centered_unnumbered_section_without_front_boundary() -> None:
+    document = sample_docling_document()
+    candidate = document["texts"][0]
+    candidate["label"] = "section_header"
+    candidate["orig"] = candidate["text"] = "Executive Summary"
+    candidate["prov"][0]["charspan"] = [0, len("Executive Summary")]
+    first_numbered = document["texts"][2]
+    first_numbered["orig"] = first_numbered["text"] = "1 Methods"
+    first_numbered["prov"][0]["charspan"] = [0, len("1 Methods")]
+
+    _evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+
+    assert assignments["dl-texts-0"]["role"] == "heading"
+    assert structure["sections"][0]["titleBlockId"] == "dl-texts-0"
+
+
 def test_heading_number_excludes_delimiter_and_sets_real_depth() -> None:
     assert adapter._heading_details("1. Introduction", {"level": 1}) == ("1", 1)
     assert adapter._heading_details("3.1. Details", {"level": 1}) == ("3.1", 2)

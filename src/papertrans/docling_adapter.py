@@ -825,6 +825,8 @@ def _promote_missing_title(records: list[dict[str, Any]]) -> None:
         return
     text = re.sub(r"\s+", " ", first_heading["text"]).strip()
     normalized = text.rstrip(":").lower()
+    bbox = first_heading["bboxNormalized"]
+    horizontally_centered = abs((float(bbox[0]) + float(bbox[2])) / 2 - 0.5) <= 0.12
     special_headings = {
         "abstract",
         "acknowledgment",
@@ -836,26 +838,34 @@ def _promote_missing_title(records: list[dict[str, Any]]) -> None:
     }
     if (
         not 3 <= len(text) <= 240
-        or float(first_heading["bboxNormalized"][1]) >= 0.2
+        or float(bbox[1]) >= 0.2
+        or not horizontally_centered
         or normalized in special_headings
         or _NUMBERED_HEADING.match(text)
         or _APPENDIX_HEADING.match(text)
     ):
         return
     start = records.index(first_heading)
-    lookahead: list[dict[str, Any]] = []
+    confirmed_by_front_matter_boundary = False
     for record in records[start + 1 :]:
-        if record["pageNumber"] != 1:
-            break
-        if record["furniture"]:
+        if record["pageNumber"] != 1 or record["furniture"]:
             continue
-        lookahead.append(record)
-        if len(lookahead) >= 6:
+        if (
+            record["bboxValid"]
+            and float(record["bboxNormalized"][1]) <= float(bbox[1])
+        ):
+            continue
+        if record["role"] == "abstract":
+            confirmed_by_front_matter_boundary = True
             break
-    if not any(
-        record["role"] == "heading" and _NUMBERED_HEADING.match(record["text"])
-        for record in lookahead
-    ):
+        if record["role"] != "heading":
+            continue
+        number, _level = _heading_details(record["text"], record["item"])
+        heading_title = _normalized_section_title(record["text"], number)
+        if heading_title in {"abstract", "introduction"}:
+            confirmed_by_front_matter_boundary = True
+            break
+    if not confirmed_by_front_matter_boundary:
         return
     first_heading["role"] = "title"
     first_heading["paragraphId"] = "front-title"

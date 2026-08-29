@@ -225,7 +225,13 @@ def write_semantic_pdf_qa(
         if not page.get("blocks")
     ]
     all_text_pages_empty = bool(evidence_pages) and len(empty_text_pages) == len(evidence_pages)
-    represented_blocks: set[str] = set(document.get("title", {}).get("sourceBlockIds", []))
+    title_source_block_ids = {
+        block_id.strip()
+        for block_id in document.get("title", {}).get("sourceBlockIds", [])
+        if isinstance(block_id, str) and block_id.strip()
+    }
+    missing_title_source = pdf_parser == "docling" and not title_source_block_ids
+    represented_blocks: set[str] = set(title_source_block_ids)
     for collection in ("authors", "affiliations", "metadata"):
         for value in document.get("frontMatter", {}).get(collection, []):
             represented_blocks.update(str(item) for item in value.get("sourceBlockIds", []))
@@ -371,6 +377,7 @@ def write_semantic_pdf_qa(
             and not missing_assets
             and not invalid_geometry_pages
             and not all_text_pages_empty
+            and not missing_title_source
             and not missing_semantic_blocks
             and not leaked_visual_text_blocks
             and not duplicate_visual_caption_blocks
@@ -395,6 +402,7 @@ def write_semantic_pdf_qa(
         "invalidPageGeometry": invalid_geometry_pages,
         "emptyTextPages": empty_text_pages,
         "allTextPagesEmpty": all_text_pages_empty,
+        "missingTitleSource": missing_title_source,
         "semanticSourceBlocks": len(expected_blocks),
         "representedSemanticBlocks": len(expected_blocks & represented_blocks),
         "missingSemanticBlocks": missing_semantic_blocks,
