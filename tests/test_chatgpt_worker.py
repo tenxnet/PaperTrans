@@ -88,6 +88,7 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
     prepared = store.prepare("2508.19843", "paper-chatgpt", max_characters=1000)
     assert prepared["status"] == "prepared"
+    assert prepared["targetLanguage"] == "ja"
     assert prepared["chunks"] == {"completed": 0, "total": 2, "remaining": 2}
     assert prepared["paper"]["authors"] == ["Ada Lovelace", "Alan Turing"]
     assert prepared["paper"]["publishedAt"] == "17 Nov 2025"
@@ -109,6 +110,11 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     assert replay["idempotentReplay"] is True
 
     manifest_path = tmp_path / "output/paper-chatgpt/work/chatgpt-job.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["settings"]["targetLanguage"] == "ja"
+    assert json.loads(
+        (tmp_path / "output/paper-chatgpt/work/html-document.json").read_text(encoding="utf-8")
+    )["targetLanguage"] == "ja"
     before_read = manifest_path.read_text(encoding="utf-8")
     restarted = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
     assert restarted.status("paper-chatgpt")["chunks"]["completed"] == 1
@@ -124,9 +130,16 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     assert finalized["status"] == "completed"
     assert finalized["usage"]["available"] is False
     assert Path(finalized["indexPath"]).exists()
+    assert '<html lang="ja">' in Path(finalized["indexPath"]).read_text(encoding="utf-8")
     assert Path(finalized["bundlePath"]).exists()
     assert json.loads(Path(finalized["qaPath"]).read_text(encoding="utf-8"))["status"] == "passed"
     assert restarted.finalize("paper-chatgpt") == finalized
+
+
+def test_chatgpt_worker_rejects_unsupported_target_language(tmp_path: Path):
+    store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+    with pytest.raises(TranslationJobError, match="PaperTrans v1"):
+        store.prepare("2508.19843", target_language="en")
 
 
 def test_mcp_tools_expose_structured_schemas_and_accurate_annotations():

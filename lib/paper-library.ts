@@ -18,6 +18,7 @@ export type PaperSummary = {
   resolvedArxivId: string;
   sourceUrl: string;
   provider: string;
+  targetLanguage: "ja";
   status: PaperStatus;
   progress: { completed: number; total: number };
   tags: string[];
@@ -44,6 +45,9 @@ type Manifest = {
   jobId?: string;
   status?: string;
   provider?: string;
+  settings?: {
+    targetLanguage?: string;
+  };
   paper?: {
     requestedArxivId?: string;
     resolvedArxivId?: string;
@@ -178,6 +182,10 @@ function normalizeStatus(status: string | undefined): PaperStatus {
   return "needs_review";
 }
 
+function normalizeTargetLanguage(targetLanguage: string | undefined): "ja" {
+  return targetLanguage === "ja" ? targetLanguage : "ja";
+}
+
 function displayTitle(value: string): string {
   return value
     .replace(/\s*¯\s*\\overline\{\\hbox\{\{[^{}]+\}\}\}/g, "")
@@ -297,6 +305,7 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
           resolvedArxivId: manifest.paper.resolvedArxivId ?? manifest.paper.requestedArxivId ?? "",
           sourceUrl: manifest.paper.sourceUrl ?? "",
           provider: manifest.provider ?? "unknown",
+          targetLanguage: normalizeTargetLanguage(manifest.settings?.targetLanguage),
           status: normalizeStatus(manifest.status),
           progress: { completed, total: chunks.length },
           tags: libraryState.tags,

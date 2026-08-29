@@ -20,6 +20,8 @@ from .render import create_bundle
 
 JOB_SCHEMA_VERSION = "1.0"
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+DEFAULT_TARGET_LANGUAGE = "ja"
+SUPPORTED_TARGET_LANGUAGES = {DEFAULT_TARGET_LANGUAGE}
 
 
 class TranslationJobError(RuntimeError):
@@ -111,9 +113,14 @@ class ChatGPTTranslationStore:
         arxiv_id: str,
         job_id: str | None = None,
         max_characters: int = 9000,
+        target_language: str = DEFAULT_TARGET_LANGUAGE,
     ) -> dict[str, Any]:
         if max_characters < 1000 or max_characters > 30000:
             raise TranslationJobError("max_characters must be between 1000 and 30000")
+        if target_language not in SUPPORTED_TARGET_LANGUAGES:
+            raise TranslationJobError(
+                "target_language must be 'ja' in PaperTrans v1"
+            )
         requested_arxiv_id = normalize_arxiv_id(arxiv_id)
         selected_job_id = self._validate_job_id(job_id or _default_job_id(requested_arxiv_id))
         paths = self._paths(selected_job_id)
@@ -122,6 +129,13 @@ class ChatGPTTranslationStore:
             if manifest["paper"]["requestedArxivId"] != requested_arxiv_id:
                 raise TranslationJobError(
                     f"job {selected_job_id} already belongs to {manifest['paper']['requestedArxivId']}"
+                )
+            existing_target = manifest.get("settings", {}).get(
+                "targetLanguage", DEFAULT_TARGET_LANGUAGE
+            )
+            if existing_target != target_language:
+                raise TranslationJobError(
+                    f"job {selected_job_id} already targets {existing_target}"
                 )
             document = self._load_document(paths)
             previous_status = manifest["status"]
@@ -148,6 +162,7 @@ class ChatGPTTranslationStore:
             metrics_path=paths["metrics"],
         )
         document["model"] = {"translation": "chatgpt", "reasoningEffort": None}
+        document["targetLanguage"] = target_language
         _atomic_write_json(paths["document"], document)
         chunks = _section_chunks(document["units"], max_characters)
         if not chunks:
@@ -166,7 +181,10 @@ class ChatGPTTranslationStore:
                 "authors": list(acquisition.get("metadata", {}).get("authors", [])),
                 "publishedAt": acquisition.get("metadata", {}).get("publishedAt"),
             },
-            "settings": {"maxCharacters": max_characters},
+            "settings": {
+                "maxCharacters": max_characters,
+                "targetLanguage": target_language,
+            },
             "chunks": [
                 {
                     "chunkId": f"chunk-{index:03d}",
@@ -193,6 +211,9 @@ class ChatGPTTranslationStore:
         return {
             "jobId": manifest["jobId"],
             "status": manifest["status"],
+            "targetLanguage": manifest.get("settings", {}).get(
+                "targetLanguage", DEFAULT_TARGET_LANGUAGE
+            ),
             "paper": manifest["paper"],
             "chunks": {
                 "completed": completed,

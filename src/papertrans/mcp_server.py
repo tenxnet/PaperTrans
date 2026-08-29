@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -49,6 +49,7 @@ class ChunkStatus(BaseModel):
 class JobSummary(BaseModel):
     jobId: str
     status: str
+    targetLanguage: Literal["ja"] = "ja"
     paper: PaperInfo
     chunks: ChunkProgress
     artifactRoute: str
@@ -161,9 +162,12 @@ def prepare_arxiv_translation(
     arxiv_id: str,
     job_id: str | None = None,
     max_characters: int = 9000,
+    target_language: Literal["ja"] = "ja",
 ) -> JobSummary:
     """Prepare a resumable official-arXiv-HTML translation job."""
-    return JobSummary.model_validate(_store().prepare(arxiv_id, job_id, max_characters))
+    return JobSummary.model_validate(
+        _store().prepare(arxiv_id, job_id, max_characters, target_language)
+    )
 
 
 @server.tool(

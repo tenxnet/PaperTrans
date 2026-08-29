@@ -19,19 +19,17 @@ import {
 } from "@phosphor-icons/react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { PaperStatus, PaperSummary } from "@/lib/paper-library";
+import {
+  APP_LOCALE_STORAGE_KEY,
+  DEFAULT_APP_LOCALE,
+  isAppLocale,
+  UI_TEXT,
+  type AppLocale,
+} from "@/lib/i18n";
 
 type Filter = "all" | "active" | "review" | "unread" | "favorites";
 type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
 type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
-
-const STATUS_LABEL: Record<PaperStatus, string> = {
-  prepared: "準備済み",
-  translating: "翻訳中",
-  ready_to_finalize: "出力待ち",
-  completed: "完了",
-  needs_review: "要確認",
-  failed: "失敗",
-};
 
 function isActive(paper: PaperSummary) {
   return ["prepared", "translating", "ready_to_finalize"].includes(paper.status);
@@ -41,9 +39,9 @@ function needsReview(paper: PaperSummary) {
   return paper.status === "needs_review" || paper.status === "failed" || paper.qa.status === "failed";
 }
 
-function formatDate(value: string) {
+function formatDate(value: string, locale: AppLocale) {
   const date = new Date(value);
-  return new Intl.DateTimeFormat("ja-JP", {
+  return new Intl.DateTimeFormat(locale, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
@@ -51,18 +49,19 @@ function formatDate(value: string) {
   }).format(date);
 }
 
-function formatPaperDate(value: string | null) {
+function formatPaperDate(value: string | null, locale: AppLocale) {
   if (!value) return "—";
-  return new Intl.DateTimeFormat("ja-JP", {
+  return new Intl.DateTimeFormat(locale, {
     year: "numeric",
     month: "short",
     day: "numeric",
   }).format(new Date(value));
 }
 
-function authorLabel(paper: PaperSummary) {
-  if (!paper.authors.length) return "著者情報なし";
-  return paper.authors.length > 1 ? `${paper.authors[0]} ほか` : paper.authors[0];
+function authorLabel(paper: PaperSummary, locale: AppLocale) {
+  const text = UI_TEXT[locale];
+  if (!paper.authors.length) return text.noAuthor;
+  return paper.authors.length > 1 ? text.otherAuthors(paper.authors[0]) : paper.authors[0];
 }
 
 function progressPercent(paper: PaperSummary) {
@@ -79,6 +78,7 @@ function StatusIcon({ paper }: { paper: PaperSummary }) {
 }
 
 export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] }) {
+  const [locale, setLocale] = useState<AppLocale>(DEFAULT_APP_LOCALE);
   const [papers, setPapers] = useState(initialPapers);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
@@ -91,6 +91,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [showRequest, setShowRequest] = useState(false);
   const [arxivDraft, setArxivDraft] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
+  const text = UI_TEXT[locale];
 
   const selected = papers.find((paper) => paper.slug === selectedSlug) ?? null;
   const counts = useMemo(() => ({
@@ -124,13 +125,27 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       })
       .sort((a, b) => {
         if (sort === "title") return a.title.localeCompare(b.title, "en");
-        if (sort === "author") return authorLabel(a).localeCompare(authorLabel(b), "en");
+        if (sort === "author") return authorLabel(a, locale).localeCompare(authorLabel(b, locale), locale);
         if (sort === "tag") return (a.tags[0] ?? "\uffff").localeCompare(b.tags[0] ?? "\uffff", "ja");
         if (sort === "added") return Date.parse(b.createdAt) - Date.parse(a.createdAt);
         if (sort === "published") return Date.parse(b.publishedAt ?? "1970-01-01") - Date.parse(a.publishedAt ?? "1970-01-01");
         return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
       });
-  }, [papers, query, filter, tagFilter, sort]);
+  }, [papers, query, filter, tagFilter, sort, locale]);
+
+  useEffect(() => {
+    const savedLocale = window.localStorage.getItem(APP_LOCALE_STORAGE_KEY);
+    if (isAppLocale(savedLocale)) setLocale(savedLocale);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
+
+  function changeLocale(nextLocale: AppLocale) {
+    setLocale(nextLocale);
+    window.localStorage.setItem(APP_LOCALE_STORAGE_KEY, nextLocale);
+  }
 
   async function refresh(silent = false) {
     try {
@@ -138,9 +153,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       if (!response.ok) throw new Error("refresh failed");
       const body = (await response.json()) as { papers: PaperSummary[] };
       setPapers(body.papers);
-      if (!silent) setNotice("ライブラリを更新しました");
+      if (!silent) setNotice(text.refreshSuccess);
     } catch {
-      if (!silent) setNotice("更新できませんでした");
+      if (!silent) setNotice(text.refreshFailed);
     }
   }
 
@@ -186,7 +201,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
         error?: string;
       };
       if (!response.ok || !body.tags || typeof body.isRead !== "boolean" || typeof body.favorite !== "boolean") {
-        throw new Error(body.error ?? "ライブラリ情報を保存できませんでした");
+        throw new Error(body.error ?? text.librarySaveFailed);
       }
       setPapers((current) => current.map((paper) => (
         paper.slug === slug
@@ -195,14 +210,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       )));
       if (!silent) setNotice(successMessage);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "ライブラリ情報を保存できませんでした");
+      setNotice(error instanceof Error ? error.message : text.librarySaveFailed);
     } finally {
       setLibrarySaving(false);
     }
   }
 
   function persistTags(slug: string, nextTags: string[]) {
-    return persistLibraryState(slug, { tags: nextTags }, "タグを保存しました");
+    return persistLibraryState(slug, { tags: nextTags }, text.tagSaved);
   }
 
   function addTag(event: FormEvent) {
@@ -220,11 +235,11 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   async function copyRequest() {
     const id = arxivDraft.trim() || "2510.09023v1";
     try {
-      await navigator.clipboard.writeText(`arXiv:${id} をPaperTransで全文日本語訳してください。`);
-      setNotice("ChatGPTへの依頼文をコピーしました");
+      await navigator.clipboard.writeText(text.translationPrompt(id));
+      setNotice(text.requestCopied);
       setShowRequest(false);
     } catch {
-      setNotice("コピーできませんでした。依頼文を選択してコピーしてください");
+      setNotice(text.requestCopyFailed);
     }
   }
 
@@ -251,42 +266,42 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
 
         <button className="request-card" type="button" onClick={() => setShowRequest(true)}>
           <ChatCircleDots weight="duotone" aria-hidden="true" />
-          <span><strong>ChatGPTで翻訳</strong><small>arXiv HTMLから作成</small></span>
+          <span><strong>{text.translateWithChatGPT}</strong><small>{text.createFromArxiv}</small></span>
         </button>
 
-        <nav aria-label="ライブラリ">
-          <p className="nav-heading">ライブラリ</p>
+        <nav aria-label={text.library}>
+          <p className="nav-heading">{text.library}</p>
           <button className={filter === "all" && !tagFilter ? "nav-item active" : "nav-item"} onClick={() => setNavigation("all")}>
-            <FileText aria-hidden="true" /><span>すべての論文</span><b>{counts.all}</b>
+            <FileText aria-hidden="true" /><span>{text.allPapers}</span><b>{counts.all}</b>
           </button>
           <button className={filter === "unread" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("unread")}>
-            <BookOpenText aria-hidden="true" /><span>未読</span><b>{counts.unread}</b>
+            <BookOpenText aria-hidden="true" /><span>{text.unread}</span><b>{counts.unread}</b>
           </button>
           <button className={filter === "favorites" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("favorites")}>
-            <Star weight="fill" aria-hidden="true" /><span>お気に入り</span><b>{counts.favorites}</b>
+            <Star weight="fill" aria-hidden="true" /><span>{text.favorites}</span><b>{counts.favorites}</b>
           </button>
           <button className={filter === "active" ? "nav-item active" : "nav-item"} onClick={() => setNavigation("active")}>
-            <SpinnerGap aria-hidden="true" /><span>翻訳中</span><b>{counts.active}</b>
+            <SpinnerGap aria-hidden="true" /><span>{text.translating}</span><b>{counts.active}</b>
           </button>
         </nav>
 
         {counts.review > 0 && (
-          <section className="sidebar-notices" aria-label="お知らせ">
-            <p className="nav-heading">お知らせ</p>
+          <section className="sidebar-notices" aria-label={text.notices}>
+            <p className="nav-heading">{text.notices}</p>
             <button
               className={filter === "review" ? "review-notice active" : "review-notice"}
               type="button"
               onClick={() => setNavigation("review")}
             >
               <WarningCircle weight="fill" aria-hidden="true" />
-              <span><strong>確認が必要です</strong><small>{counts.review}件の論文に問題があります</small></span>
+              <span><strong>{text.reviewRequired}</strong><small>{text.reviewCount(counts.review)}</small></span>
               <b>{counts.review}</b>
             </button>
           </section>
         )}
 
         <div className="tag-nav">
-          <p className="nav-heading"><span>タグ</span><Tag aria-hidden="true" /></p>
+          <p className="nav-heading"><span>{text.tags}</span><Tag aria-hidden="true" /></p>
           {tags.length ? tags.map(([tag, count]) => (
             <button
               key={tag}
@@ -295,12 +310,12 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             >
               <span>{tag}</span><b>{count}</b>
             </button>
-          )) : <p className="tag-empty">論文を開いてタグを追加できます</p>}
+          )) : <p className="tag-empty">{text.tagEmpty}</p>}
         </div>
 
         <div className="sidebar-footer">
-          <p><span className="local-dot" />ローカル保存</p>
-          <small>論文と翻訳はこのMac内だけに保存されます</small>
+          <p><span className="local-dot" />{text.localStorage}</p>
+          <small>{text.localStorageNote}</small>
         </div>
       </aside>
 
@@ -312,18 +327,25 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
               ref={searchRef}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="タイトル、著者、arXiv ID、タグを検索…"
-              aria-label="論文を検索"
+              placeholder={text.searchPlaceholder}
+              aria-label={text.searchLabel}
             />
             <kbd>⌘ K</kbd>
           </label>
           <div className="workspace-actions">
             {notice && <span className="notice" role="status">{notice}</span>}
-            <button className="icon-button" type="button" onClick={() => void refresh()} title="更新">
+            <label className="locale-control">
+              <span>{text.language}</span>
+              <select value={locale} onChange={(event) => changeLocale(event.target.value as AppLocale)} aria-label={text.language}>
+                <option value="ja">日本語</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <button className="icon-button" type="button" onClick={() => void refresh()} title={text.refresh}>
               <ClockCounterClockwise aria-hidden="true" />
             </button>
             <button className="primary-button" type="button" onClick={() => setShowRequest(true)}>
-              <Plus aria-hidden="true" />新しい翻訳
+              <Plus aria-hidden="true" />{text.newTranslation}
             </button>
           </div>
         </header>
@@ -333,7 +355,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <div className="reader-main">
               <div className="reader-header">
                 <button className="back-button" type="button" onClick={() => setSelectedSlug(null)}>
-                  <ArrowLeft aria-hidden="true" />ライブラリ
+                  <ArrowLeft aria-hidden="true" />{text.backToLibrary}
                 </button>
                 <div className="reader-title">
                   <small>arXiv:{selected.resolvedArxivId}</small>
@@ -345,36 +367,36 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     type="button"
                     disabled={librarySaving}
                     aria-pressed={selected.favorite}
-                    onClick={() => void persistLibraryState(selected.slug, { favorite: !selected.favorite }, selected.favorite ? "お気に入りから外しました" : "お気に入りに追加しました")}
+                    onClick={() => void persistLibraryState(selected.slug, { favorite: !selected.favorite }, selected.favorite ? text.removedFavorite : text.addedFavorite)}
                   >
                     <Star weight={selected.favorite ? "fill" : "regular"} aria-hidden="true" />
-                    {selected.favorite ? "お気に入り" : "お気に入りに追加"}
+                    {selected.favorite ? text.favorites : text.addFavorite}
                   </button>
                   <button
                     className="secondary-button"
                     type="button"
                     disabled={librarySaving}
-                    onClick={() => void persistLibraryState(selected.slug, { isRead: !selected.isRead }, selected.isRead ? "未読に戻しました" : "既読にしました")}
+                    onClick={() => void persistLibraryState(selected.slug, { isRead: !selected.isRead }, selected.isRead ? text.markedUnread : text.markedRead)}
                   >
-                    <BookOpenText aria-hidden="true" />{selected.isRead ? "未読に戻す" : "既読にする"}
+                    <BookOpenText aria-hidden="true" />{selected.isRead ? text.markUnread : text.markRead}
                   </button>
                   {selected.artifactUrl && (
                     <a className="primary-button" href={selected.artifactUrl} target="_blank" rel="noreferrer">
-                      <ArrowSquareOut aria-hidden="true" />別タブで開く
+                      <ArrowSquareOut aria-hidden="true" />{text.openNewTab}
                     </a>
                   )}
                 </div>
               </div>
               {selected.artifactUrl ? (
-                <iframe className="paper-frame" title={`${selected.title} 日本語訳`} src={`${selected.artifactUrl}?embed=1`} />
+                <iframe className="paper-frame" title={text.translatedPaperFrame(selected.title)} src={`${selected.artifactUrl}?embed=1`} />
               ) : (
-                <div className="reader-empty"><SpinnerGap className="spin" /><p>翻訳HTMLの完成を待っています</p></div>
+                <div className="reader-empty"><SpinnerGap className="spin" /><p>{text.waitingForHtml}</p></div>
               )}
             </div>
 
             <aside className="inspector">
               <section>
-                <p className="inspector-label">タグ</p>
+                <p className="inspector-label">{text.tags}</p>
                 <div className="paper-tags">
                   {selected.tags.map((tag) => (
                     <button key={tag} className="tag-chip removable" disabled={librarySaving} onClick={() => void persistTags(selected.slug, selected.tags.filter((item) => item !== tag))}>
@@ -383,21 +405,21 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   ))}
                 </div>
                 <form className="tag-form" onSubmit={addTag}>
-                  <input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="タグを追加" maxLength={32} />
-                  <button type="submit" disabled={librarySaving || !tagDraft.trim()} title="タグを追加"><Plus aria-hidden="true" /></button>
+                  <input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder={text.addTag} maxLength={32} />
+                  <button type="submit" disabled={librarySaving || !tagDraft.trim()} title={text.addTag}><Plus aria-hidden="true" /></button>
                 </form>
               </section>
 
               <section className="paper-meta">
-                <p className="inspector-label">論文情報</p>
+                <p className="inspector-label">{text.paperInformation}</p>
                 <dl>
-                  <div><dt>Provider</dt><dd>{selected.provider}</dd></div>
-                  <div><dt>著者</dt><dd>{selected.authors.join(" / ") || "—"}</dd></div>
-                  <div><dt>公開日</dt><dd>{formatPaperDate(selected.publishedAt)}</dd></div>
-                  <div><dt>追加日</dt><dd>{formatPaperDate(selected.createdAt)}</dd></div>
-                  <div><dt>更新</dt><dd>{formatDate(selected.updatedAt)}</dd></div>
+                  <div><dt>{text.provider}</dt><dd>{selected.provider}</dd></div>
+                  <div><dt>{text.authors}</dt><dd>{selected.authors.join(" / ") || "—"}</dd></div>
+                  <div><dt>{text.publishedAt}</dt><dd>{formatPaperDate(selected.publishedAt, locale)}</dd></div>
+                  <div><dt>{text.addedAt}</dt><dd>{formatPaperDate(selected.createdAt, locale)}</dd></div>
+                  <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
-                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">arXiv原文を開く<ArrowSquareOut /></a>}
+                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{text.openArxivSource}<ArrowSquareOut /></a>}
               </section>
             </aside>
           </section>
@@ -405,18 +427,18 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
           <section className="library-view">
             <div className="library-heading">
               <div>
-                <p className="eyebrow">LOCAL PAPER LIBRARY</p>
-                <h1>{tagFilter ? `# ${tagFilter}` : filter === "active" ? "翻訳中" : filter === "review" ? "要確認" : filter === "unread" ? "未読の論文" : filter === "favorites" ? "お気に入り" : "論文ライブラリ"}</h1>
-                <p>{visiblePapers.length}件の論文を表示しています</p>
+                <p className="eyebrow">{text.localPaperLibrary}</p>
+                <h1>{tagFilter ? `# ${tagFilter}` : filter === "active" ? text.headingActive : filter === "review" ? text.headingReview : filter === "unread" ? text.headingUnread : filter === "favorites" ? text.headingFavorites : text.headingLibrary}</h1>
+                <p>{text.visibleCount(visiblePapers.length)}</p>
               </div>
-              <label className="sort-control"><FunnelSimple aria-hidden="true" /><span>並べ替え</span>
+              <label className="sort-control"><FunnelSimple aria-hidden="true" /><span>{text.sort}</span>
                 <select value={sort} onChange={(event) => setSort(event.target.value as Sort)}>
-                  <option value="updated">更新が新しい順</option>
-                  <option value="added">追加が新しい順</option>
-                  <option value="published">公開が新しい順</option>
-                  <option value="author">著者名順</option>
-                  <option value="title">タイトル順</option>
-                  <option value="tag">タグ順</option>
+                  <option value="updated">{text.sortUpdated}</option>
+                  <option value="added">{text.sortAdded}</option>
+                  <option value="published">{text.sortPublished}</option>
+                  <option value="author">{text.sortAuthor}</option>
+                  <option value="title">{text.sortTitle}</option>
+                  <option value="tag">{text.sortTag}</option>
                 </select>
               </label>
             </div>
@@ -424,20 +446,20 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <div className="paper-list" role="list">
               {visiblePapers.map((paper) => (
                 <article key={paper.slug} className="paper-row" role="listitem">
-                  <button className="paper-open" type="button" onClick={() => openPaper(paper)} aria-label={`${paper.title}を開く`}>
+                  <button className="paper-open" type="button" onClick={() => openPaper(paper)} aria-label={text.openPaper(paper.title)}>
                     <span className="paper-type"><FileText weight="duotone" aria-hidden="true" /></span>
                     <span className="paper-copy">
                       <span className="paper-kicker">
                         <span>arXiv:{paper.resolvedArxivId}</span>
-                        <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{STATUS_LABEL[paper.status]}</span>
+                        <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{text.status[paper.status]}</span>
                       </span>
                       <strong>{paper.title}</strong>
-                      <span className="paper-authors">{authorLabel(paper)}</span>
+                      <span className="paper-authors">{authorLabel(paper, locale)}</span>
                       <span className="paper-subline">
-                        <span>{paper.progress.completed}/{paper.progress.total} チャンク</span>
-                        <span>公開 {formatPaperDate(paper.publishedAt)}</span>
-                        <span>追加 {formatPaperDate(paper.createdAt)}</span>
-                        {paper.qa.status === "passed" && <span>QA通過</span>}
+                        <span>{paper.progress.completed}/{paper.progress.total} {text.chunks}</span>
+                        <span>{text.published} {formatPaperDate(paper.publishedAt, locale)}</span>
+                        <span>{text.added} {formatPaperDate(paper.createdAt, locale)}</span>
+                        {paper.qa.status === "passed" && <span>{text.qaPassed}</span>}
                       </span>
                       {paper.tags.length > 0 && <span className="paper-tag-row">{paper.tags.map((tag) => <span className="tag-chip" key={tag}>{tag}</span>)}</span>}
                     </span>
@@ -446,35 +468,35 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div className="row-actions">
                     <button
                       type="button"
-                      aria-label="タグを編集"
+                      aria-label={text.editTags}
                       onClick={() => setSelectedSlug(paper.slug)}
                     ><Tag aria-hidden="true" /></button>
                     <button
                       className={paper.favorite ? "active favorite" : ""}
                       type="button"
                       disabled={librarySaving}
-                      aria-label={paper.favorite ? "お気に入りから外す" : "お気に入りに追加"}
+                      aria-label={paper.favorite ? text.removeFavorite : text.addFavorite}
                       aria-pressed={paper.favorite}
-                      onClick={() => void persistLibraryState(paper.slug, { favorite: !paper.favorite }, paper.favorite ? "お気に入りから外しました" : "お気に入りに追加しました")}
+                      onClick={() => void persistLibraryState(paper.slug, { favorite: !paper.favorite }, paper.favorite ? text.removedFavorite : text.addedFavorite)}
                     ><Star weight={paper.favorite ? "fill" : "regular"} aria-hidden="true" /></button>
                     <button
                       className={paper.isRead ? "active" : ""}
                       type="button"
                       disabled={librarySaving}
-                      aria-label={paper.isRead ? "未読に戻す" : "既読にする"}
+                      aria-label={paper.isRead ? text.markUnread : text.markRead}
                       aria-pressed={paper.isRead}
-                      onClick={() => void persistLibraryState(paper.slug, { isRead: !paper.isRead }, paper.isRead ? "未読に戻しました" : "既読にしました")}
+                      onClick={() => void persistLibraryState(paper.slug, { isRead: !paper.isRead }, paper.isRead ? text.markedUnread : text.markedRead)}
                     ><BookOpenText aria-hidden="true" /></button>
-                    {paper.artifactUrl && <a href={paper.artifactUrl} target="_blank" rel="noreferrer" title="別タブで開く"><ArrowSquareOut aria-hidden="true" /></a>}
+                    {paper.artifactUrl && <a href={paper.artifactUrl} target="_blank" rel="noreferrer" title={text.openNewTab}><ArrowSquareOut aria-hidden="true" /></a>}
                   </div>
                 </article>
               ))}
               {!visiblePapers.length && (
                 <div className="empty-state">
                   <MagnifyingGlass aria-hidden="true" />
-                  <h2>一致する論文がありません</h2>
-                  <p>検索語やフィルターを変更してみてください。</p>
-                  <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setTagFilter(null); }}>条件をクリア</button>
+                  <h2>{text.noMatches}</h2>
+                  <p>{text.noMatchesHint}</p>
+                  <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setTagFilter(null); }}>{text.clearConditions}</button>
                 </div>
               )}
             </div>
@@ -485,14 +507,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       {showRequest && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowRequest(false)}>
           <section className="request-modal" role="dialog" aria-modal="true" aria-labelledby="request-title" onMouseDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" type="button" onClick={() => setShowRequest(false)} title="閉じる"><X aria-hidden="true" /></button>
+            <button className="modal-close" type="button" onClick={() => setShowRequest(false)} title={text.close}><X aria-hidden="true" /></button>
             <span className="modal-icon"><ChatCircleDots weight="duotone" aria-hidden="true" /></span>
-            <p className="eyebrow">CHATGPT CONNECTOR</p>
-            <h2 id="request-title">新しい翻訳を依頼</h2>
-            <p>arXiv IDを入力すると、ChatGPTへ渡す依頼文をコピーします。接続済みのChatGPTで貼り付けて実行してください。</p>
-            <label><span>arXiv ID</span><input autoFocus value={arxivDraft} onChange={(event) => setArxivDraft(event.target.value)} placeholder="例: 2510.09023v1" /></label>
-            <div className="prompt-preview">arXiv:{arxivDraft.trim() || "2510.09023v1"} をPaperTransで全文日本語訳してください。</div>
-            <button className="primary-button wide" type="button" onClick={() => void copyRequest()}>依頼文をコピー</button>
+            <p className="eyebrow">{text.connector}</p>
+            <h2 id="request-title">{text.requestTranslation}</h2>
+            <p>{text.requestHelp}</p>
+            <label><span>{text.arxivId}</span><input autoFocus value={arxivDraft} onChange={(event) => setArxivDraft(event.target.value)} placeholder={text.arxivExample} /></label>
+            <div className="prompt-preview">{text.translationPrompt(arxivDraft.trim() || "2510.09023v1")}</div>
+            <button className="primary-button wide" type="button" onClick={() => void copyRequest()}>{text.copyRequest}</button>
           </section>
         </div>
       )}

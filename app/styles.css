@@ -76,6 +76,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .search-field kbd { padding: 3px 5px; color: #8b9199; background: #f4f4f2; border: 1px solid #e4e4e1; border-radius: 4px; font: 10px/1 ui-monospace, monospace; }
 .workspace-actions, .reader-actions { display: flex; align-items: center; gap: 9px; }
 .notice { max-width: 260px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.locale-control { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.locale-control > span { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.locale-control select { height: 36px; padding: 0 24px 0 9px; color: #4f5863; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; font-size: 11px; cursor: pointer; }
 .icon-button, .row-actions a, .row-actions button, .modal-close { width: 36px; height: 36px; display: grid; place-items: center; color: #5d6672; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
 .icon-button:hover, .row-actions a:hover, .row-actions button:hover, .modal-close:hover { color: var(--blue); border-color: #adc0e1; background: var(--blue-soft); }
 .icon-button svg, .row-actions svg { width: 18px; height: 18px; }
