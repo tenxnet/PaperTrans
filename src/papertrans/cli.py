@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .arxiv_html import run_arxiv_html_pipeline
+from .chatgpt_worker import MCPTranslationStore
 from .deterministic_structure import analyze_layout_deterministic, evaluate_structure
 from .extract import extract_document
 from .hybrid_structure import refine_structure_with_llm
@@ -167,11 +168,35 @@ def _parser() -> argparse.ArgumentParser:
     arxiv_html_pipeline.add_argument("--translation-workers", type=int, default=4)
     arxiv_html_pipeline.add_argument("--max-characters", type=int, default=14000)
     arxiv_html_pipeline.add_argument("--skip-translation", action="store_true")
+
+    prepare_mcp_job = subparsers.add_parser(
+        "prepare-mcp-job",
+        help="Acquire official arXiv HTML and prepare a job for an MCP translation worker",
+    )
+    prepare_mcp_job.add_argument("arxiv_id")
+    prepare_mcp_job.add_argument("--job-id")
+    prepare_mcp_job.add_argument("--output-root", type=Path, default=Path("output"))
+    prepare_mcp_job.add_argument("--repo-root", type=Path, default=Path.cwd())
+    prepare_mcp_job.add_argument("--max-characters", type=int, default=9000)
+    prepare_mcp_job.add_argument("--target-language", choices=("ja",), default="ja")
     return parser
 
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "prepare-mcp-job":
+        store = MCPTranslationStore(
+            args.repo_root.resolve(),
+            args.output_root.resolve(),
+        )
+        result = store.prepare(
+            args.arxiv_id,
+            job_id=args.job_id,
+            max_characters=args.max_characters,
+            target_language=args.target_language,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return
     if args.command == "arxiv-html-pipeline":
         result = run_arxiv_html_pipeline(
             args.arxiv_id,

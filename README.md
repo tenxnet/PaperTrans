@@ -25,42 +25,37 @@ PaperTransは、学術論文の構造、MathML数式、図、表、引用、相�
 - macOSまたはLinux
 - Python 3.10以上と[uv](https://docs.astral.sh/uv/)
 - Node.js 22以上とpnpm 11
-- Codex翻訳を使う場合は、ログイン済みのCodex CLI
 
 ```bash
 git clone https://github.com/tenxnet/PaperTrans.git
 cd PaperTrans
-uv sync --extra test
+uv sync --extra chatgpt --extra test
 pnpm install --frozen-lockfile
 ```
 
-公式arXiv HTMLをCodexで翻訳します。
+ローカルMCPサーバーを起動します。
 
 ```bash
-.venv/bin/papertrans arxiv-html-pipeline 2508.19843 \
-  --slug arxiv-2508.19843 \
-  --repo-root "$PWD"
+.venv/bin/papertrans-mcp --host 127.0.0.1 --port 8000
 ```
 
-ローカルWebアプリを起動します。
+別のターミナルでWebアプリを起動します。
 
 ```bash
 pnpm dev --hostname 127.0.0.1
 ```
 
-`http://127.0.0.1:3000`を開きます。ポートを変更する場合は、末尾に`--port 3100`を追加してください。`output/`にある完成済みジョブは自動的にライブラリへ表示されます。
+`http://127.0.0.1:3000`を開き、「新しい翻訳」からarXiv IDを登録します。PaperTransが公式arXiv HTMLと翻訳チャンクを準備し、接続済みのMCPクライアントが翻訳を進めます。ポートを変更する場合は、起動コマンドの末尾に`--port 3100`を追加してください。
 
 ## 翻訳方法
 
 | 方法 | v0.1での位置付け | Tunnel | 費用・利用枠 |
 | --- | --- | --- | --- |
-| Codex CLI | 標準のローカル経路 | 不要 | Codex利用枠 |
-| ChatGPT Connector | 実験機能 | 必要 | ChatGPT側の利用枠 |
+| MCP翻訳ワーカー | v0.1の標準経路 | クライアントによる | MCPクライアント側の利用枠 |
+| Codex CLI | 開発・検証用の実験経路 | 不要 | Codex利用枠 |
 | OpenAI API | 未実装 | 不要 | API従量課金 |
 
-Web UIのサイドバーにある「Provider設定」から、ChatGPT ConnectorとCodex CLIを切り替えられます。Codex CLIを選ぶと、モデルと推論強度を指定した実行コマンドを生成します。詳しくは[Provider設定](docs/providers.md)を参照してください。
-
-ChatGPTを翻訳ワーカーとして使う場合は、ローカルMCPサーバーとSecure MCP Tunnelの設定が必要です。PaperTransからChatGPTの会話を直接開始することはできません。詳しい責任範囲、公開データ、起動方法は[ChatGPT翻訳ワーカー](docs/chatgpt-worker.md)を参照してください。
+Web UIはMCP接続状態、ジョブ準備、進捗、成果物を管理します。使用モデルはMCPクライアント側で選択します。ChatGPTから接続する場合はSecure MCP Tunnelが必要です。詳しくは[MCP翻訳サーバー](docs/mcp-server.md)を参照してください。
 
 ## 対象範囲
 
@@ -81,8 +76,7 @@ ChatGPTを翻訳ワーカーとして使う場合は、ローカルMCPサーバ�
 ## ドキュメント
 
 - [ドキュメント索引](docs/README.md)
-- [ChatGPT翻訳ワーカー](docs/chatgpt-worker.md)
-- [Provider設定](docs/providers.md)
+- [MCP翻訳サーバー](docs/mcp-server.md)
 - [実験的PDFパイプライン](docs/pdf-pipeline.md)
 - [トラブルシューティング](docs/troubleshooting.md)
 - [コントリビューション](CONTRIBUTING.md)

@@ -9,7 +9,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from .chatgpt_worker import ChatGPTTranslationStore
+from .chatgpt_worker import MCPTranslationStore
 
 
 SERVER_INSTRUCTIONS = """
@@ -117,16 +117,16 @@ class FinalizeResult(JobSummary):
     usage: UsageAvailability
 
 
-_store_instance: ChatGPTTranslationStore | None = None
+_store_instance: MCPTranslationStore | None = None
 
 
-def configure_store(repo_root: Path, output_root: Path) -> ChatGPTTranslationStore:
+def configure_store(repo_root: Path, output_root: Path) -> MCPTranslationStore:
     global _store_instance
-    _store_instance = ChatGPTTranslationStore(repo_root, output_root)
+    _store_instance = MCPTranslationStore(repo_root, output_root)
     return _store_instance
 
 
-def _store() -> ChatGPTTranslationStore:
+def _store() -> MCPTranslationStore:
     if _store_instance is None:
         repo_root = Path(os.environ.get("PAPERTRANS_REPO_ROOT", Path.cwd()))
         output_root = Path(os.environ.get("PAPERTRANS_OUTPUT_ROOT", repo_root / "output"))

@@ -288,7 +288,10 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
       .filter((entry) => entry.isDirectory() && JOB_ID.test(entry.name))
       .map(async (entry): Promise<PaperSummary | null> => {
         const root = path.join(OUTPUT_ROOT, entry.name);
-        const manifest = await readJson<Manifest>(path.join(root, "work", "chatgpt-job.json"));
+        const manifest = (
+          await readJson<Manifest>(path.join(root, "work", "mcp-job.json"))
+          ?? await readJson<Manifest>(path.join(root, "work", "chatgpt-job.json"))
+        );
         if (!manifest?.paper?.title || !manifest.jobId) return null;
         const qa = await readJson<QaDocument>(path.join(root, "html", "qa.json"));
         const sourceMetadata = await readSourceMetadata(root);

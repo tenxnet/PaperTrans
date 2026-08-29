@@ -25,42 +25,37 @@ Papers, translations, and library state stay on the local machine and are exclud
 - macOS or Linux
 - Python 3.10+ and [uv](https://docs.astral.sh/uv/)
 - Node.js 22+ and pnpm 11
-- A signed-in Codex CLI when using Codex translation
 
 ```bash
 git clone https://github.com/tenxnet/PaperTrans.git
 cd PaperTrans
-uv sync --extra test
+uv sync --extra chatgpt --extra test
 pnpm install --frozen-lockfile
 ```
 
-Translate official arXiv HTML with Codex:
+Start the local MCP server:
 
 ```bash
-.venv/bin/papertrans arxiv-html-pipeline 2508.19843 \
-  --slug arxiv-2508.19843 \
-  --repo-root "$PWD"
+.venv/bin/papertrans-mcp --host 127.0.0.1 --port 8000
 ```
 
-Start the local web app:
+Start the web app in another terminal:
 
 ```bash
 pnpm dev --hostname 127.0.0.1
 ```
 
-Open `http://127.0.0.1:3000`. Add `--port 3100` if you need a different port. Completed jobs under `output/` are discovered automatically.
+Open `http://127.0.0.1:3000` and register an arXiv ID under **New translation**. PaperTrans prepares official arXiv HTML and stable translation chunks for a connected MCP client. Add `--port 3100` to the web command if you need a different port.
 
 ## Translation methods
 
 | Method | v0.1 status | Tunnel | Billing or quota |
 | --- | --- | --- | --- |
-| Codex CLI | Supported local path | Not required | Codex usage |
-| ChatGPT Connector | Experimental | Required | ChatGPT usage |
+| MCP translation worker | Supported v0.1 path | Depends on client | MCP client usage |
+| Codex CLI | Experimental development path | Not required | Codex usage |
 | OpenAI API | Not implemented | Not required | API usage billing |
 
-Use **Provider settings** in the Web UI sidebar to switch between ChatGPT Connector and Codex CLI. The Codex CLI path generates a command with the selected model and reasoning effort. See [Provider settings](docs/providers.md) for details.
-
-Using ChatGPT as the translation worker requires the local MCP server and a Secure MCP Tunnel. PaperTrans cannot start a ChatGPT conversation directly. See [ChatGPT translation worker](docs/chatgpt-worker.md) for the trust boundary, exposed data, and setup.
+The Web UI manages MCP status, job preparation, progress, and artifacts. Model selection belongs to the MCP client. ChatGPT connections require a Secure MCP Tunnel. See [MCP translation server](docs/mcp-server.md) for setup and the trust boundary.
 
 ## Scope
 
@@ -81,8 +76,7 @@ Using ChatGPT as the translation worker requires the local MCP server and a Secu
 ## Documentation
 
 - [Documentation index](docs/README.md)
-- [ChatGPT translation worker](docs/chatgpt-worker.md)
-- [Provider settings](docs/providers.md)
+- [MCP translation server](docs/mcp-server.md)
 - [Experimental PDF pipeline](docs/pdf-pipeline.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)

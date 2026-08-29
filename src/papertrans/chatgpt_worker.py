@@ -41,11 +41,11 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
 
 def _default_job_id(arxiv_id: str) -> str:
     normalized = normalize_arxiv_id(arxiv_id)
-    return f"arxiv-{normalized}-chatgpt"
+    return f"arxiv-{normalized}-mcp"
 
 
-class ChatGPTTranslationStore:
-    """Persist arXiv HTML translation jobs while ChatGPT supplies translations."""
+class MCPTranslationStore:
+    """Persist arXiv HTML translation jobs while an MCP client supplies translations."""
 
     def __init__(self, repo_root: Path, output_root: Path) -> None:
         self.repo_root = repo_root.resolve()
@@ -66,7 +66,8 @@ class ChatGPTTranslationStore:
             "work": root / "work",
             "html": root / "html",
             "document": root / "work" / "html-document.json",
-            "manifest": root / "work" / "chatgpt-job.json",
+            "manifest": root / "work" / "mcp-job.json",
+            "legacy_manifest": root / "work" / "chatgpt-job.json",
             "results": root / "work" / "chatgpt-translations",
             "metrics": root / "run-metrics.json",
             "bundle": root / f"{safe_id}-html.zip",
@@ -74,9 +75,14 @@ class ChatGPTTranslationStore:
 
     def _load_manifest(self, job_id: str) -> tuple[dict[str, Any], dict[str, Path]]:
         paths = self._paths(job_id)
-        if not paths["manifest"].exists():
+        manifest_path = (
+            paths["manifest"]
+            if paths["manifest"].exists()
+            else paths["legacy_manifest"]
+        )
+        if not manifest_path.exists():
             raise TranslationJobError(f"translation job does not exist: {job_id}")
-        manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("schemaVersion") != JOB_SCHEMA_VERSION:
             raise TranslationJobError(f"unsupported job schema for {job_id}")
         return manifest, paths
@@ -124,7 +130,7 @@ class ChatGPTTranslationStore:
         requested_arxiv_id = normalize_arxiv_id(arxiv_id)
         selected_job_id = self._validate_job_id(job_id or _default_job_id(requested_arxiv_id))
         paths = self._paths(selected_job_id)
-        if paths["manifest"].exists():
+        if paths["manifest"].exists() or paths["legacy_manifest"].exists():
             manifest, _ = self._load_manifest(selected_job_id)
             if manifest["paper"]["requestedArxivId"] != requested_arxiv_id:
                 raise TranslationJobError(
@@ -161,7 +167,7 @@ class ChatGPTTranslationStore:
             paths["document"],
             metrics_path=paths["metrics"],
         )
-        document["model"] = {"translation": "chatgpt", "reasoningEffort": None}
+        document["model"] = {"translation": "mcp-worker", "reasoningEffort": None}
         document["targetLanguage"] = target_language
         _atomic_write_json(paths["document"], document)
         chunks = _section_chunks(document["units"], max_characters)
@@ -172,7 +178,7 @@ class ChatGPTTranslationStore:
             "schemaVersion": JOB_SCHEMA_VERSION,
             "jobId": selected_job_id,
             "status": "prepared",
-            "provider": "chatgpt",
+            "provider": "mcp",
             "paper": {
                 "requestedArxivId": requested_arxiv_id,
                 "resolvedArxivId": acquisition["resolvedArxivId"],
@@ -238,10 +244,18 @@ class ChatGPTTranslationStore:
         if not self.output_root.exists():
             return []
         jobs: list[dict[str, Any]] = []
-        for manifest_path in self.output_root.glob("*/work/chatgpt-job.json"):
+        manifest_paths = [
+            *self.output_root.glob("*/work/mcp-job.json"),
+            *self.output_root.glob("*/work/chatgpt-job.json"),
+        ]
+        seen: set[str] = set()
+        for manifest_path in manifest_paths:
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 job_id = str(manifest["jobId"])
+                if job_id in seen:
+                    continue
+                seen.add(job_id)
                 paths = self._paths(job_id)
                 document = self._load_document(paths)
                 previous_status = manifest["status"]
@@ -271,7 +285,6 @@ class ChatGPTTranslationStore:
             for chunk in manifest["chunks"]
         ]
         return summary
-
     def next_chunk(self, job_id: str, chunk_id: str | None = None) -> dict[str, Any]:
         manifest, paths = self._load_manifest(job_id)
         document = self._load_document(paths)
@@ -374,13 +387,13 @@ class ChatGPTTranslationStore:
                 unit["preservedTerms"] = item["preservedTerms"]
                 unit["warnings"] = item["warnings"]
             document["status"] = "translating"
-            document["model"] = {"translation": "chatgpt", "reasoningEffort": None}
+            document["model"] = {"translation": "mcp-worker", "reasoningEffort": None}
             _atomic_write_json(paths["document"], document)
             result_record = {
                 "jobId": job_id,
                 "chunkId": chunk_id,
                 "savedAt": _now(),
-                "provider": "chatgpt",
+                "provider": "mcp",
                 "translations": normalized,
             }
             _atomic_write_json(paths["results"] / f"{chunk_id}.json", result_record)
@@ -415,7 +428,7 @@ class ChatGPTTranslationStore:
                     "warnings": manifest.get("artifacts", {}).get("warnings", 0),
                     "usage": {
                         "available": False,
-                        "reason": "ChatGPT token usage is not exposed to the local MCP server.",
+                        "reason": "Token usage is not exposed to the local MCP server.",
                     },
                 }
             )
@@ -454,8 +467,12 @@ class ChatGPTTranslationStore:
                 "warnings": len(warnings),
                 "usage": {
                     "available": False,
-                    "reason": "ChatGPT token usage is not exposed to the local MCP server.",
+                    "reason": "Token usage is not exposed to the local MCP server.",
                 },
             }
         )
         return summary
+
+
+# Backward-compatible import for code written against the initial ChatGPT-specific name.
+ChatGPTTranslationStore = MCPTranslationStore

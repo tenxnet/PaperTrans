@@ -7,7 +7,6 @@ import {
   CheckCircle,
   ChatCircleDots,
   ClockCounterClockwise,
-  Code,
   FileText,
   FunnelSimple,
   Gear,
@@ -35,43 +34,16 @@ type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
 type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
 type TocEntry = { id: string; label: string; level: 2 | 3 };
 type ConnectorHealth = "checking" | "online" | "offline";
-type TranslationProvider = "chatgpt_connector" | "codex_cli";
-type CodexStatus = "checking" | "available" | "unavailable";
-type CodexModel = "gpt-5.6-luna" | "gpt-5.3-codex-spark";
-type ReasoningEffort = "low" | "medium" | "high";
-type ProviderStatusResponse = {
-  defaultProvider: "chatgpt_connector";
-  providers: {
-    chatgpt_connector: {
-      enabled: boolean;
-      mcpServer: "online" | "offline";
-      mcpUrl: string;
-      startsInApp: false;
-    };
-    codex_cli: {
-      enabled: boolean;
-      command: string;
-      status: Exclude<CodexStatus, "checking">;
-      startsInApp: false;
-    };
-  };
+type McpStatusResponse = {
+  status: Exclude<ConnectorHealth, "checking">;
+  url: string;
 };
-
-const PROVIDER_STORAGE_KEY = "papertrans.translation-provider";
-const CODEX_MODEL_STORAGE_KEY = "papertrans.codex-model";
-const CODEX_REASONING_STORAGE_KEY = "papertrans.codex-reasoning-effort";
-
-function isTranslationProvider(value: string | null): value is TranslationProvider {
-  return value === "chatgpt_connector" || value === "codex_cli";
-}
-
-function isCodexModel(value: string | null): value is CodexModel {
-  return value === "gpt-5.6-luna" || value === "gpt-5.3-codex-spark";
-}
-
-function isReasoningEffort(value: string | null): value is ReasoningEffort {
-  return value === "low" || value === "medium" || value === "high";
-}
+type CreatedJob = {
+  jobId: string;
+  status: string;
+  chunks: { completed: number; total: number; remaining: number };
+  paper: { title: string; requestedArxivId: string; resolvedArxivId: string };
+};
 
 function arxivIdFromInput(value: string) {
   return value.trim().match(/(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.[1] ?? "";
@@ -135,16 +107,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [librarySaving, setLibrarySaving] = useState(false);
   const [notice, setNotice] = useState("");
   const [showRequest, setShowRequest] = useState(false);
-  const [showProviderSettings, setShowProviderSettings] = useState(false);
+  const [showMcpStatus, setShowMcpStatus] = useState(false);
   const [arxivDraft, setArxivDraft] = useState("");
   const [requestCopied, setRequestCopied] = useState(false);
-  const [translationProvider, setTranslationProvider] = useState<TranslationProvider>("chatgpt_connector");
+  const [jobCreating, setJobCreating] = useState(false);
+  const [createdJob, setCreatedJob] = useState<CreatedJob | null>(null);
+  const [jobError, setJobError] = useState("");
   const [connectorHealth, setConnectorHealth] = useState<ConnectorHealth>("checking");
   const [mcpUrl, setMcpUrl] = useState("http://127.0.0.1:8000/mcp");
-  const [codexStatus, setCodexStatus] = useState<CodexStatus>("checking");
-  const [codexCommand, setCodexCommand] = useState("codex");
-  const [codexModel, setCodexModel] = useState<CodexModel>("gpt-5.6-luna");
-  const [codexReasoning, setCodexReasoning] = useState<ReasoningEffort>("low");
   const [tocEntries, setTocEntries] = useState<TocEntry[]>([]);
   const [activeTocId, setActiveTocId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -153,17 +123,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const tocCleanupRef = useRef<(() => void) | null>(null);
   const text = UI_TEXT[locale];
   const requestedArxivId = arxivIdFromInput(arxivDraft);
-  const selectedProviderName = translationProvider === "chatgpt_connector" ? text.chatgptConnector : text.codexCli;
-  const selectedProviderStatus = translationProvider === "chatgpt_connector"
-    ? text.connectorStatus[connectorHealth]
-    : text.codexStatus[codexStatus];
-  const generatedCodexCommand = requestedArxivId ? [
-    `.venv/bin/papertrans arxiv-html-pipeline ${requestedArxivId} \\`,
-    `  --slug arxiv-${requestedArxivId.toLowerCase()}-codex \\`,
-    `  --repo-root "$PWD" \\`,
-    `  --translation-model ${codexModel} \\`,
-    `  --translation-reasoning-effort ${codexReasoning}`,
-  ].join("\n") : "";
 
   const selected = papers.find((paper) => paper.slug === selectedSlug) ?? null;
   const counts = useMemo(() => ({
@@ -208,37 +167,28 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   useEffect(() => {
     const savedLocale = window.localStorage.getItem(APP_LOCALE_STORAGE_KEY);
     if (isAppLocale(savedLocale)) setLocale(savedLocale);
-    const savedProvider = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
-    if (isTranslationProvider(savedProvider)) setTranslationProvider(savedProvider);
-    const savedModel = window.localStorage.getItem(CODEX_MODEL_STORAGE_KEY);
-    if (isCodexModel(savedModel)) setCodexModel(savedModel);
-    const savedReasoning = window.localStorage.getItem(CODEX_REASONING_STORAGE_KEY);
-    if (isReasoningEffort(savedReasoning)) setCodexReasoning(savedReasoning);
   }, []);
 
   useEffect(() => {
     document.documentElement.lang = locale;
   }, [locale]);
 
-  async function refreshProviderStatus() {
+  async function refreshMcpStatus() {
     setConnectorHealth("checking");
     try {
-      const response = await fetch("/api/providers", { cache: "no-store" });
-      if (!response.ok) throw new Error("provider status failed");
-      const body = (await response.json()) as ProviderStatusResponse;
-      setConnectorHealth(body.providers.chatgpt_connector.mcpServer);
-      setMcpUrl(body.providers.chatgpt_connector.mcpUrl);
-      setCodexStatus(body.providers.codex_cli.status);
-      setCodexCommand(body.providers.codex_cli.command);
+      const response = await fetch("/api/mcp/status", { cache: "no-store" });
+      if (!response.ok) throw new Error("MCP status failed");
+      const body = (await response.json()) as McpStatusResponse;
+      setConnectorHealth(body.status);
+      setMcpUrl(body.url);
     } catch {
       setConnectorHealth("offline");
-      setCodexStatus("unavailable");
     }
   }
 
   useEffect(() => {
-    void refreshProviderStatus();
-    const timer = window.setInterval(() => void refreshProviderStatus(), 15_000);
+    void refreshMcpStatus();
+    const timer = window.setInterval(() => void refreshMcpStatus(), 15_000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -263,24 +213,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   function changeLocale(nextLocale: AppLocale) {
     setLocale(nextLocale);
     window.localStorage.setItem(APP_LOCALE_STORAGE_KEY, nextLocale);
-  }
-
-  function changeProvider(provider: TranslationProvider) {
-    setTranslationProvider(provider);
-    setRequestCopied(false);
-    window.localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
-  }
-
-  function changeCodexModel(model: CodexModel) {
-    setCodexModel(model);
-    setRequestCopied(false);
-    window.localStorage.setItem(CODEX_MODEL_STORAGE_KEY, model);
-  }
-
-  function changeCodexReasoning(effort: ReasoningEffort) {
-    setCodexReasoning(effort);
-    setRequestCopied(false);
-    window.localStorage.setItem(CODEX_REASONING_STORAGE_KEY, effort);
   }
 
   async function refresh(silent = false) {
@@ -308,14 +240,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
         searchRef.current?.focus();
       }
       if (event.key === "Escape") {
-        if (showProviderSettings) setShowProviderSettings(false);
+        if (showMcpStatus) setShowMcpStatus(false);
         else if (showRequest) setShowRequest(false);
         else if (selectedSlug) setSelectedSlug(null);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedSlug, showRequest, showProviderSettings]);
+  }, [selectedSlug, showRequest, showMcpStatus]);
 
   async function persistLibraryState(
     slug: string,
@@ -369,23 +301,47 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     void persistTags(selected.slug, [...selected.tags, next]);
   }
 
-  async function copyTranslationAction() {
-    if (!requestedArxivId) return;
+  async function createTranslationJob() {
+    if (!requestedArxivId || jobCreating) return;
+    setJobCreating(true);
+    setCreatedJob(null);
+    setJobError("");
+    setRequestCopied(false);
     try {
-      const value = translationProvider === "chatgpt_connector"
-        ? text.translationPrompt(requestedArxivId)
-        : generatedCodexCommand;
-      await navigator.clipboard.writeText(value);
+      const response = await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ arxivId: requestedArxivId }),
+      });
+      const body = (await response.json()) as CreatedJob & { error?: string };
+      if (!response.ok || !body.jobId) throw new Error(body.error ?? text.jobCreateFailed);
+      setCreatedJob(body);
+      setNotice(text.jobCreated(body.jobId));
+      await refresh(true);
+    } catch (error) {
+      setJobError(error instanceof Error ? error.message : text.jobCreateFailed);
+    } finally {
+      setJobCreating(false);
+    }
+  }
+
+  async function copyWorkerRequest() {
+    if (!createdJob) return;
+    try {
+      await navigator.clipboard.writeText(text.workerPrompt(createdJob.jobId));
       setRequestCopied(true);
-      setNotice(translationProvider === "chatgpt_connector" ? text.requestCopied : text.commandCopied);
+      setNotice(text.workerRequestCopied);
     } catch {
       setNotice(text.requestCopyFailed);
     }
   }
 
   function openTranslationRequest() {
+    setArxivDraft("");
     setRequestCopied(false);
-    setShowProviderSettings(false);
+    setCreatedJob(null);
+    setJobError("");
+    setShowMcpStatus(false);
     setShowRequest(true);
   }
 
@@ -532,16 +488,16 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
           )) : <p className="tag-empty">{text.tagEmpty}</p>}
         </div>
 
-        <section className="provider-summary" aria-label={text.translationProvider}>
+        <section className="provider-summary" aria-label={text.mcpConnection}>
           <div className="provider-summary-copy">
-            <span className={`connection-dot ${translationProvider === "chatgpt_connector" ? connectorHealth : codexStatus === "available" ? "online" : codexStatus === "checking" ? "checking" : "offline"}`} aria-hidden="true" />
+            <span className={`connection-dot ${connectorHealth}`} aria-hidden="true" />
             <span>
-              <strong>{selectedProviderName}</strong>
-              <small>{selectedProviderStatus}</small>
+              <strong>{text.mcpServer}</strong>
+              <small>{text.connectorStatus[connectorHealth]}</small>
             </span>
           </div>
-          <button type="button" onClick={() => setShowProviderSettings(true)}>
-            <Gear aria-hidden="true" />{text.providerSettings}
+          <button type="button" onClick={() => setShowMcpStatus(true)}>
+            <Gear aria-hidden="true" />{text.mcpConnection}
           </button>
         </section>
 
@@ -761,8 +717,8 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowRequest(false)}>
           <section className="request-modal" role="dialog" aria-modal="true" aria-labelledby="request-title" onMouseDown={(event) => event.stopPropagation()}>
             <button className="modal-close" type="button" onClick={() => setShowRequest(false)} title={text.close}><X aria-hidden="true" /></button>
-            <span className="modal-icon">{translationProvider === "chatgpt_connector" ? <ChatCircleDots weight="duotone" aria-hidden="true" /> : <Code weight="duotone" aria-hidden="true" />}</span>
-            <p className="eyebrow">{text.connector}</p>
+            <span className="modal-icon"><Plus aria-hidden="true" /></span>
+            <p className="eyebrow">{text.mcpTranslationJob}</p>
             <h2 id="request-title">{text.requestTranslation}</h2>
             <p>{text.requestHelp}</p>
             <label>
@@ -770,110 +726,79 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
               <input
                 autoFocus
                 value={arxivDraft}
-                onChange={(event) => { setArxivDraft(event.target.value); setRequestCopied(false); }}
+                onChange={(event) => {
+                  setArxivDraft(event.target.value);
+                  setCreatedJob(null);
+                  setJobError("");
+                  setRequestCopied(false);
+                }}
                 placeholder={text.arxivExample}
+                disabled={jobCreating}
               />
             </label>
             {arxivDraft && !requestedArxivId && <p className="field-error">{text.invalidArxiv}</p>}
             <div className="provider-choice">
-              <span className="provider-choice-icon">{translationProvider === "chatgpt_connector" ? <ChatCircleDots weight="duotone" aria-hidden="true" /> : <Code weight="duotone" aria-hidden="true" />}</span>
-              <span><strong>{selectedProviderName}</strong><small>{selectedProviderStatus}</small></span>
-              <span className="provider-badge">{text.selectedProvider}</span>
+              <span className="provider-choice-icon"><ChatCircleDots weight="duotone" aria-hidden="true" /></span>
+              <span><strong>{text.mcpServer}</strong><small>{text.connectorStatus[connectorHealth]}</small></span>
+              <span className={`connection-dot ${connectorHealth}`} aria-hidden="true" />
             </div>
-            <div className={`prompt-preview${translationProvider === "codex_cli" ? " command-preview" : ""}`}>
-              {translationProvider === "chatgpt_connector"
-                ? requestedArxivId ? text.translationPrompt(requestedArxivId) : text.promptAppearsHere
-                : generatedCodexCommand || text.commandAppearsHere}
-            </div>
-            {requestCopied && (
+            {jobCreating && (
+              <div className="job-preparing" role="status">
+                <SpinnerGap className="spin" aria-hidden="true" />
+                <span><strong>{text.preparingJob}</strong><small>{text.preparingJobHelp}</small></span>
+              </div>
+            )}
+            {jobError && <p className="job-error" role="alert">{jobError}</p>}
+            {createdJob && (
               <div className="copy-success" role="status">
                 <CheckCircle weight="fill" aria-hidden="true" />
                 <span>
-                  <strong>{translationProvider === "chatgpt_connector" ? text.requestReady : text.commandReady}</strong>
-                  <small>{translationProvider === "chatgpt_connector" ? text.requestReadyHelp : text.commandReadyHelp}</small>
+                  <strong>{text.jobReady}</strong>
+                  <small><code>{createdJob.jobId}</code> · {createdJob.chunks.total} {text.chunks}</small>
                 </span>
               </div>
             )}
+            {createdJob && requestCopied && <p className="worker-request-copied">{text.workerRequestCopied}</p>}
             <div className="modal-actions">
-              <button className="secondary-button" type="button" onClick={() => { setShowRequest(false); setShowProviderSettings(true); }}>
-                <Gear aria-hidden="true" />{text.providerSettings}
+              <button className="secondary-button" type="button" onClick={() => { setShowRequest(false); setShowMcpStatus(true); }}>
+                <Gear aria-hidden="true" />{text.mcpConnection}
               </button>
-              <button className="primary-button" type="button" disabled={!requestedArxivId} onClick={() => void copyTranslationAction()}>
-                {translationProvider === "chatgpt_connector" ? text.copyRequest : text.copyCommand}
+              <button
+                className="primary-button"
+                type="button"
+                disabled={!requestedArxivId || jobCreating}
+                onClick={() => void (createdJob ? copyWorkerRequest() : createTranslationJob())}
+              >
+                {jobCreating ? <SpinnerGap className="spin" aria-hidden="true" /> : createdJob ? <ChatCircleDots aria-hidden="true" /> : <Plus aria-hidden="true" />}
+                {jobCreating ? text.preparing : createdJob ? text.copyWorkerRequest : text.createJob}
               </button>
             </div>
-            {requestCopied && translationProvider === "chatgpt_connector" && (
-              <a className="open-chatgpt" href="https://chatgpt.com/" target="_blank" rel="noreferrer">
-                {text.openChatGPT}<ArrowSquareOut aria-hidden="true" />
-              </a>
-            )}
           </section>
         </div>
       )}
 
-      {showProviderSettings && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowProviderSettings(false)}>
-          <section className="request-modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="provider-title" onMouseDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" type="button" onClick={() => setShowProviderSettings(false)} title={text.close}><X aria-hidden="true" /></button>
-            <span className="modal-icon"><Gear weight="duotone" aria-hidden="true" /></span>
+      {showMcpStatus && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowMcpStatus(false)}>
+          <section className="request-modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="mcp-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="modal-close" type="button" onClick={() => setShowMcpStatus(false)} title={text.close}><X aria-hidden="true" /></button>
+            <span className="modal-icon"><ChatCircleDots weight="duotone" aria-hidden="true" /></span>
             <p className="eyebrow">{text.settings}</p>
-            <h2 id="provider-title">{text.translationProvider}</h2>
-            <p>{text.providerHelp}</p>
-            <div className="provider-setting-list" role="group" aria-label={text.translationProvider}>
-              <button
-                className={`provider-setting-card${translationProvider === "chatgpt_connector" ? " selected" : ""}`}
-                type="button"
-                aria-pressed={translationProvider === "chatgpt_connector"}
-                onClick={() => changeProvider("chatgpt_connector")}
-              >
-                <span className={`connection-dot ${connectorHealth}`} aria-hidden="true" />
-                <span><strong>{text.chatgptConnector}</strong><small>{text.connectorStatus[connectorHealth]}</small></span>
-                {translationProvider === "chatgpt_connector" && <span className="provider-badge">{text.selectedProvider}</span>}
-              </button>
-              <button
-                className={`provider-setting-card${translationProvider === "codex_cli" ? " selected" : ""}`}
-                type="button"
-                aria-pressed={translationProvider === "codex_cli"}
-                onClick={() => changeProvider("codex_cli")}
-              >
-                <span className={`connection-dot ${codexStatus === "available" ? "online" : codexStatus === "checking" ? "checking" : "offline"}`} aria-hidden="true" />
-                <span><strong>{text.codexCli}</strong><small>{text.codexStatus[codexStatus]}</small></span>
-                {translationProvider === "codex_cli" && <span className="provider-badge">{text.selectedProvider}</span>}
-              </button>
+            <h2 id="mcp-title">{text.mcpConnection}</h2>
+            <p>{text.mcpStatusHelp}</p>
+            <div className="provider-setting-card selected">
+              <span className={`connection-dot ${connectorHealth}`} aria-hidden="true" />
+              <span><strong>{text.mcpServer}</strong><small>{text.connectorStatus[connectorHealth]}</small></span>
             </div>
             <dl className="provider-details">
-              {translationProvider === "chatgpt_connector" ? <>
-                <div><dt>{text.localMcpServer}</dt><dd><code>{mcpUrl}</code></dd></div>
-                <div><dt>{text.executionMethod}</dt><dd>{text.chatgptPullWorker}</dd></div>
-              </> : <>
-                <div><dt>{text.codexExecutable}</dt><dd><code>{codexCommand}</code></dd></div>
-                <div><dt>{text.executionMethod}</dt><dd>{text.codexCommandWorker}</dd></div>
-              </>}
+              <div><dt>{text.localMcpServer}</dt><dd><code>{mcpUrl}</code></dd></div>
+              <div><dt>{text.executionMethod}</dt><dd>{text.mcpPullWorker}</dd></div>
             </dl>
-            {translationProvider === "codex_cli" && (
-              <div className="codex-options">
-                <label><span>{text.translationModel}</span>
-                  <select value={codexModel} onChange={(event) => changeCodexModel(event.target.value as CodexModel)}>
-                    <option value="gpt-5.6-luna">gpt-5.6-luna</option>
-                    <option value="gpt-5.3-codex-spark">gpt-5.3-codex-spark</option>
-                  </select>
-                </label>
-                <label><span>{text.reasoningEffort}</span>
-                  <select value={codexReasoning} onChange={(event) => changeCodexReasoning(event.target.value as ReasoningEffort)}>
-                    <option value="low">{text.low}</option>
-                    <option value="medium">{text.medium}</option>
-                    <option value="high">{text.high}</option>
-                  </select>
-                </label>
-              </div>
-            )}
-            <div className="provider-note"><WarningCircle aria-hidden="true" /><p>{translationProvider === "chatgpt_connector" ? text.providerLimitation : text.codexLimitation}</p></div>
-            <p className="future-providers">{text.futureProviders}</p>
+            <div className="provider-note"><WarningCircle aria-hidden="true" /><p>{text.mcpStatusLimitation}</p></div>
             <div className="modal-actions end">
-              <button className="secondary-button" type="button" onClick={() => void refreshProviderStatus()} disabled={connectorHealth === "checking" || codexStatus === "checking"}>
+              <button className="secondary-button" type="button" onClick={() => void refreshMcpStatus()} disabled={connectorHealth === "checking"}>
                 <ClockCounterClockwise aria-hidden="true" />{text.checkConnection}
               </button>
-              <button className="primary-button" type="button" onClick={() => { setShowProviderSettings(false); openTranslationRequest(); }}>
+              <button className="primary-button" type="button" onClick={() => { setShowMcpStatus(false); openTranslationRequest(); }}>
                 <Plus aria-hidden="true" />{text.newTranslation}
               </button>
             </div>

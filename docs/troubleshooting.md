@@ -32,7 +32,7 @@ Confirm all three layers:
 2. Secure MCP Tunnel is running with the configured PaperTrans profile.
 3. The Connector exists in the intended ChatGPT workspace.
 
-Do not expose the unauthenticated local MCP server directly to the internet. Review the data boundary in [ChatGPT translation worker](chatgpt-worker.md) before starting a tunnel.
+Do not expose the unauthenticated local MCP server directly to the internet. Review the data boundary in [MCP translation server](mcp-server.md) before starting a tunnel.
 
 ## macOS reports `Operation not permitted` under `Documents`
 

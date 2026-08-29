@@ -109,7 +109,7 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     replay = store.save_chunk("paper-chatgpt", first["chunkId"], valid)
     assert replay["idempotentReplay"] is True
 
-    manifest_path = tmp_path / "output/paper-chatgpt/work/chatgpt-job.json"
+    manifest_path = tmp_path / "output/paper-chatgpt/work/mcp-job.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["settings"]["targetLanguage"] == "ja"
     assert json.loads(
@@ -140,6 +140,28 @@ def test_chatgpt_worker_rejects_unsupported_target_language(tmp_path: Path):
     store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
     with pytest.raises(TranslationJobError, match="PaperTrans v1"):
         store.prepare("2508.19843", target_language="en")
+
+
+def test_mcp_job_defaults_are_provider_neutral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(chatgpt_worker, "acquire_official_arxiv_html", _fake_acquire)
+    store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+    prepared = store.prepare("2508.19843")
+
+    assert prepared["jobId"] == "arxiv-2508.19843-mcp"
+    manifest = json.loads(
+        (tmp_path / "output/arxiv-2508.19843-mcp/work/mcp-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    document = json.loads(
+        (tmp_path / "output/arxiv-2508.19843-mcp/work/html-document.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["provider"] == "mcp"
+    assert document["model"]["translation"] == "mcp-worker"
 
 
 def test_mcp_tools_expose_structured_schemas_and_accurate_annotations():
