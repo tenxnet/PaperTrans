@@ -1,0 +1,4 @@
+interface:
+  display_name: "Academic Paper Source Router"
+  short_description: "Choose the cheapest reliable source before parsing and translation"
+  default_prompt: "Use $academic-paper-source-router to select the highest-fidelity, lowest-cost acquisition route for this paper."

@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://papertrans.local/schemas/source-route.schema.json",
+  "title": "Academic paper source routing manifest and result",
+  "$defs": {
+    "candidateKind": {
+      "enum": [
+        "publisher_jats",
+        "publisher_html",
+        "official_arxiv_html",
+        "ar5iv_html",
+        "latex_source",
+        "pdf"
+      ]
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "available",
+        "access",
+        "identityMatch",
+        "validation"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/$defs/candidateKind" },
+        "url": { "type": "string" },
+        "available": { "type": "boolean" },
+        "access": { "enum": ["open", "authorized", "restricted", "unknown"] },
+        "identityMatch": { "enum": ["exact", "equivalent", "unknown", "mismatch"] },
+        "validation": { "enum": ["passed", "degraded", "failed", "not_run"] },
+        "fullText": { "type": "boolean", "default": false },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pageCount": { "type": "integer", "minimum": 0 },
+            "sectionCount": { "type": "integer", "minimum": 0 },
+            "paragraphCount": { "type": "integer", "minimum": 0 },
+            "unresolvedAssetCount": { "type": "integer", "minimum": 0 },
+            "fatalErrorCount": { "type": "integer", "minimum": 0 },
+            "pagesWithUsableTextRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "garbledCharacterRatio": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "paper", "candidates"],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "paper": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "arxivId": { "type": "string" },
+            "doi": { "type": "string" },
+            "title": { "type": "string" },
+            "requestedArtifact": {
+              "enum": ["arxiv_revision", "version_of_record", "accepted_manuscript", "best_available"]
+            }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowEquivalentPreprint": { "type": "boolean", "default": false },
+            "pdfTextPageThreshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.8 },
+            "pdfGarbledTextThreshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.1 }
+          }
+        },
+        "candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidate" }
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "status", "selected", "fallbackOrder", "rejections", "resources", "warnings"],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "status": { "enum": ["selected", "unresolved"] },
+        "selected": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["candidateId", "kind", "route", "reason"],
+              "properties": {
+                "candidateId": { "type": "string" },
+                "kind": { "$ref": "#/$defs/candidateKind" },
+                "route": {
+                  "enum": [
+                    "publisher_jats",
+                    "publisher_html",
+                    "official_arxiv_html",
+                    "ar5iv_html",
+                    "latex_source",
+                    "pdf_text",
+                    "pdf_ocr"
+                  ]
+                },
+                "reason": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "fallbackOrder": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "rejections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["candidateId", "reason"],
+            "properties": {
+              "candidateId": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["llmRouting", "structureModel", "vision", "ocr", "translationUnit"],
+          "properties": {
+            "llmRouting": { "const": "disabled" },
+            "structureModel": { "enum": ["disabled", "low_confidence_only", "required"] },
+            "vision": { "enum": ["disabled", "low_confidence_only", "required"] },
+            "ocr": { "enum": ["disabled", "missing_text_pages_only", "required"] },
+            "translationUnit": { "const": "section" }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/input" },
+    { "$ref": "#/$defs/result" }
+  ]
+}
