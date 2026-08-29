@@ -249,6 +249,106 @@ def _internal_link_metrics(article: Tag) -> tuple[int, list[str]]:
     return len(set(missing)), sorted(set(missing))
 
 
+def _section_level(section: Tag) -> int:
+    classes = set(section.get("class", []))
+    if "ltx_subparagraph" in classes:
+        return 6
+    if "ltx_paragraph" in classes:
+        return 5
+    if "ltx_subsubsection" in classes:
+        return 4
+    if "ltx_subsection" in classes:
+        return 3
+    return 2
+
+
+def _repair_verbatim_boundaries(article: Tag) -> int:
+    moved_nodes = 0
+    for code in article.select("code.ltx_verbatim"):
+        visual = next(
+            (
+                child
+                for child in code.children
+                if isinstance(child, Tag) and "ltx_inline-block" in child.get("class", [])
+            ),
+            None,
+        )
+        if visual is None:
+            continue
+        trailing = list(visual.next_siblings)
+        anchor: Tag | NavigableString = code
+        for node in trailing:
+            extracted = node.extract()
+            anchor.insert_after(extracted)
+            anchor = extracted
+            if isinstance(extracted, Tag) or str(extracted).strip():
+                moved_nodes += 1
+    return moved_nodes
+
+
+def _repair_list_hierarchy(article: Tag) -> int:
+    moved_items = 0
+    for list_node in reversed(article.find_all(["ul", "ol"])):
+        items = [
+            item
+            for item in list_node.find_all("li")
+            if item.find_parent(["ul", "ol"]) is list_node
+        ]
+        moved_items += sum(1 for item in items if item.parent is not list_node)
+        for item in reversed(items):
+            item.extract()
+        for item in items:
+            list_node.append(item)
+    return moved_items
+
+
+def _repair_section_hierarchy(article: Tag) -> dict[str, int]:
+    """Rebuild semantic section nesting from document order.
+
+    Some official arXiv HTML contains LaTeXML ``code.ltx_verbatim`` elements
+    whose end tags appear only near the end of the article. A permissive parser
+    retains the paper, but a browser then nests later sections inside ``code``
+    and may eject them from the article. Detaching every semantic section first
+    and rebuilding its hierarchy by section level produces browser-stable HTML
+    without changing block ids or paper content.
+    """
+
+    initial_sections = list(article.find_all("section"))
+    nested_before = sum(
+        1 for section in initial_sections if section.find_parent("code") is not None
+    )
+    verbatim_nodes_moved = _repair_verbatim_boundaries(article)
+    list_items_moved = _repair_list_hierarchy(article)
+    sections = list(article.find_all("section"))
+    if not sections:
+        return {
+            "sections": 0,
+            "nestedInCodeBefore": 0,
+            "nestedInCodeAfter": 0,
+            "verbatimNodesMoved": verbatim_nodes_moved,
+            "listItemsMoved": list_items_moved,
+        }
+    for section in reversed(sections):
+        section.extract()
+
+    stack: list[tuple[int, Tag]] = [(1, article)]
+    for section in sections:
+        level = _section_level(section)
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        parent = stack[-1][1] if stack else article
+        parent.append(section)
+        stack.append((level, section))
+    nested_after = sum(1 for section in sections if section.find_parent("code") is not None)
+    return {
+        "sections": len(sections),
+        "nestedInCodeBefore": nested_before,
+        "nestedInCodeAfter": nested_after,
+        "verbatimNodesMoved": verbatim_nodes_moved,
+        "listItemsMoved": list_items_moved,
+    }
+
+
 def acquire_official_arxiv_html(
     arxiv_id: str,
     work_dir: Path,
@@ -267,6 +367,7 @@ def acquire_official_arxiv_html(
     article = soup.find("article", class_="ltx_document")
     if article is None:
         raise ValueError("official arXiv response does not contain a LaTeXML article")
+    hierarchy_repair = _repair_section_hierarchy(article)
     _sanitize_tree(article)
     resolved = _find_resolved_id(soup, requested)
     title = article.find("h1", class_="ltx_title_document")
@@ -370,6 +471,7 @@ def acquire_official_arxiv_html(
             "unresolvedInternalLinks": missing_link_count,
             "missingInternalLinkTargets": missing_links,
             "assetFailures": assets["failures"],
+            "hierarchyRepair": hierarchy_repair,
         },
         "assets": assets["downloaded"],
         "route": route,
@@ -487,6 +589,7 @@ def normalize_article_document(
     article = soup.find("article", class_="ltx_document")
     if article is None:
         raise ValueError("normalized article source is missing")
+    hierarchy_repair = _repair_section_hierarchy(article)
     opaque_regions = 0
     for error in article.select(".ltx_ERROR, .ltx_error"):
         container = error.find_parent(class_="ltx_para")
@@ -527,7 +630,12 @@ def normalize_article_document(
         section_id = _top_section_id(node, article)
         section = article.find("section", id=section_id)
         section_heading = section.find(re.compile(r"^h[1-6]$"), class_="ltx_title") if section else None
-        anchor = section_id if section_id != "front" else str(node.get("id") or "paper-top")
+        nearest_section = node.find_parent("section")
+        anchor = (
+            str(nearest_section.get("id") or section_id)
+            if nearest_section is not None
+            else str(node.get("id") or "paper-top")
+        )
         units.append(
             {
                 "id": unit_id,
@@ -578,6 +686,7 @@ def normalize_article_document(
             "figures": acquisition["validation"]["figures"],
             "tables": acquisition["validation"]["tables"],
             "opaqueDegradedRegions": opaque_regions,
+            "hierarchyRepair": hierarchy_repair,
         },
     )
     return document
@@ -946,6 +1055,26 @@ def _translation_plain(unit: dict[str, Any]) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def _refresh_unit_structure(document: dict[str, Any], article: Tag) -> None:
+    """Refresh section and TOC anchors after repairing a persisted article."""
+
+    for unit in document.get("units", []):
+        target = article.find(attrs={"data-papertrans-id": unit.get("id")})
+        if target is None:
+            continue
+        section_id = _top_section_id(target, article)
+        section = article.find("section", id=section_id)
+        heading = section.find(re.compile(r"^h[1-6]$"), class_="ltx_title") if section else None
+        nearest_section = target.find_parent("section")
+        unit["sectionId"] = section_id
+        unit["sectionTitle"] = heading.get_text(" ", strip=True) if heading else "Front matter"
+        unit["anchorId"] = (
+            str(nearest_section.get("id") or section_id)
+            if nearest_section is not None
+            else str(target.get("id") or "paper-top")
+        )
+
+
 def _render_unit(article: Tag, unit: dict[str, Any], include_original: bool = True) -> None:
     target = article.find(attrs={"data-papertrans-id": unit["id"]})
     if target is None or not unit.get("japanese"):
@@ -1013,6 +1142,45 @@ def _validate_rendered_html(source_article: Tag, output_soup: BeautifulSoup) -> 
     ids = [str(tag.get("id")) for tag in output_article.find_all(id=True)]
     duplicates = sorted(value for value, count in Counter(ids).items() if count > 1)
     missing_link_count, missing_links = _internal_link_metrics(output_article)
+    browser_soup = BeautifulSoup(str(output_soup), "html5lib")
+    browser_article = browser_soup.find("article", class_="ltx_document")
+    expected_section_ids = [
+        str(section.get("id"))
+        for section in source_article.find_all("section", id=True)
+    ]
+    outside_article: list[str] = []
+    nested_in_code: list[str] = []
+    for section_id in expected_section_ids:
+        browser_section = browser_soup.find("section", id=section_id)
+        if browser_section is None or browser_section.find_parent(
+            "article", class_="ltx_document"
+        ) is None:
+            outside_article.append(section_id)
+        if browser_section is not None and browser_section.find_parent("code") is not None:
+            nested_in_code.append(section_id)
+    browser_counts = {
+        "sections": len(browser_article.find_all("section")) if browser_article else 0,
+        "figures": len(browser_article.find_all("figure", class_="ltx_figure"))
+        if browser_article
+        else 0,
+        "tables": len(browser_article.find_all("figure", class_="ltx_table"))
+        if browser_article
+        else 0,
+        "visibleMath": len(
+            [
+                node
+                for node in browser_article.find_all("math")
+                if not node.find_parent("details")
+            ]
+        )
+        if browser_article
+        else 0,
+        "bibliographyEntries": len(
+            browser_article.select(".ltx_bibliography .ltx_bibitem")
+        )
+        if browser_article
+        else 0,
+    }
     local_assets = []
     for tag, attribute in [
         *((value, "src") for value in output_article.find_all("img", src=True)),
@@ -1028,6 +1196,13 @@ def _validate_rendered_html(source_article: Tag, output_soup: BeautifulSoup) -> 
         and source_counts["bibliographyEntries"] == output_counts["bibliographyEntries"]
         and not duplicates
         and missing_link_count == 0
+        and browser_counts["sections"] == len(expected_section_ids)
+        and browser_counts["figures"] == source_counts["figures"]
+        and browser_counts["tables"] == source_counts["tables"]
+        and browser_counts["visibleMath"] == source_counts["math"]
+        and browser_counts["bibliographyEntries"] == source_counts["bibliographyEntries"]
+        and not outside_article
+        and not nested_in_code
     )
     return {
         "status": "passed" if passed else "failed",
@@ -1037,6 +1212,12 @@ def _validate_rendered_html(source_article: Tag, output_soup: BeautifulSoup) -> 
         "unresolvedInternalLinks": missing_link_count,
         "missingInternalLinkTargets": missing_links,
         "localAssets": sorted(set(local_assets)),
+        "browserDom": {
+            "parser": "html5lib",
+            "output": browser_counts,
+            "sectionsOutsideArticle": outside_article,
+            "sectionsNestedInCode": nested_in_code,
+        },
     }
 
 
@@ -1053,6 +1234,8 @@ def render_arxiv_html_document(
     source_article = source_soup.find("article", class_="ltx_document")
     if source_article is None:
         raise ValueError("article-normalized.html is invalid")
+    _repair_section_hierarchy(source_article)
+    _refresh_unit_structure(document, source_article)
     article_soup = BeautifulSoup(str(source_article), "html.parser")
     article = article_soup.find("article", class_="ltx_document")
     assert article is not None

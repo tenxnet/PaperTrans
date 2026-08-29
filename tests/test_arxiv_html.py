@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 
 from papertrans.arxiv_html import (
     _parse_codex_jsonl,
+    _repair_section_hierarchy,
     _section_chunks,
     _tokenize_node,
     _validate_rendered_html,
@@ -91,6 +92,61 @@ def test_normalizer_leaves_failed_table_environment_opaque(tmp_path: Path):
     normalized = (work / "article-normalized.html").read_text(encoding="utf-8")
     assert "raw table options" in normalized
     assert 'data-papertrans-opaque="true"' in normalized
+
+
+def test_repairs_sections_nested_by_unclosed_latex_verbatim_code():
+    malformed = """
+    <article class="ltx_document">
+      <section id="S1" class="ltx_section">
+        <h2 class="ltx_title ltx_title_section">One</h2>
+        <code class="ltx_verbatim"><span class="ltx_inline-block">print(1)</span>
+          <section id="S2" class="ltx_section">
+            <h2 class="ltx_title ltx_title_section">Two</h2>
+            <section id="S2.SS1" class="ltx_subsection">
+              <h3 class="ltx_title ltx_title_subsection">Details</h3>
+            </section>
+          </section>
+        </code>
+      </section>
+    </article>
+    """
+    soup = BeautifulSoup(malformed, "html.parser")
+    article = soup.article
+    assert article is not None
+    metrics = _repair_section_hierarchy(article)
+    assert metrics == {
+        "sections": 3,
+        "nestedInCodeBefore": 2,
+        "nestedInCodeAfter": 0,
+        "verbatimNodesMoved": 1,
+        "listItemsMoved": 0,
+    }
+    assert [section.get("id") for section in article.find_all("section", recursive=False)] == [
+        "S1",
+        "S2",
+    ]
+    second = article.find("section", id="S2")
+    assert second is not None
+    assert second.find("section", id="S2.SS1", recursive=False) is not None
+    assert not article.select("code section")
+
+
+def test_repairs_list_items_nested_by_unclosed_latex_verbatim_code():
+    malformed = """
+    <article class="ltx_document"><ul id="I1"><li id="I1.i1"><div>
+      <code class="ltx_verbatim"><span class="ltx_inline-block">print(1)</span>
+        <li id="I1.i2">Second</li>
+      </code>
+    </div></li></ul></article>
+    """
+    soup = BeautifulSoup(malformed, "html.parser")
+    article = soup.article
+    assert article is not None
+    metrics = _repair_section_hierarchy(article)
+    items = article.select("#I1 > li")
+    assert [item.get("id") for item in items] == ["I1.i1", "I1.i2"]
+    assert metrics["verbatimNodesMoved"] == 1
+    assert metrics["listItemsMoved"] == 1
 
 
 def test_chunks_pack_complete_small_sections_without_splitting_them():
@@ -207,11 +263,15 @@ def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
     assert source_article is not None
     qa = _validate_rendered_html(source_article, rendered)
     assert qa["status"] == "passed"
+    assert qa["browserDom"]["sectionsOutsideArticle"] == []
+    assert qa["browserDom"]["sectionsNestedInCode"] == []
     assert len([math for math in rendered.find_all("math") if not math.find_parent("details")]) == 1
     assert rendered.find("a", href="#bib.b1") is not None
     layout_css = rendered.style.get_text() if rendered.style is not None else ""
     assert "grid-template-columns:minmax(0,1fr)" in layout_css
-    assert ".ptx-main .ltx_table{max-width:100%;overflow-x:auto" in layout_css
+    assert ".ptx-main .ltx_table,.ptx-main .ltx_figure_panel:has(table){max-width:100%;overflow-x:auto" in layout_css
+    assert ".ptx-ja .ltx_cite{white-space:normal}" in layout_css
+    assert ".ptx-main .ltx_url{white-space:normal!important" in layout_css
     assert ".ptx-main .ltx_equationgroup" in layout_css
     assert "@media(max-width:1200px)" in layout_css
     assert "width:max-content;min-width:100%" not in layout_css
