@@ -1,4 +1,6 @@
-# ChatGPT translation worker experiment
+# ChatGPT translation worker (experimental)
+
+> This integration lets a configured ChatGPT workspace read translation chunks and write validated translations through PaperTrans MCP tools. Starting a tunnel expands access beyond the local machine; review the data boundary below first.
 
 ## Responsibility boundary
 
@@ -24,6 +26,12 @@ PaperTrans local storage
 
 This first experiment is a tool-only MCP server. It deliberately has no ChatGPT widget because the reading UI and artifacts remain owned by the local PaperTrans web app.
 
+## Data exposed through the Connector
+
+A connected ChatGPT workspace can access paper metadata, translation source chunks, job status, per-chunk translation state, and generated artifact metadata. It can save translations and finalize eligible jobs. The MCP server does not expose arbitrary filesystem paths, but it does operate on every job below the configured PaperTrans output root.
+
+Only connect a ChatGPT workspace that you trust with those papers and translations. PaperTrans does not independently verify the workspace identity shown by the tunnel configuration.
+
 ## Start locally
 
 ```bash
@@ -37,6 +45,8 @@ uv sync --extra chatgpt --extra test
 The MCP endpoint is `http://127.0.0.1:8000/mcp`. Configuration can also be supplied through `PAPERTRANS_REPO_ROOT`, `PAPERTRANS_OUTPUT_ROOT`, `PAPERTRANS_MCP_HOST`, `PAPERTRANS_MCP_PORT`, and `PAPERTRANS_MCP_TRANSPORT`.
 
 ChatGPT requires a public HTTPS MCP endpoint. Use OpenAI's Secure MCP Tunnel for local development or deploy the server behind authentication and HTTPS. Then enable Developer mode in ChatGPT and register the resulting `/mcp` URL. Availability of Developer mode can depend on the account or workspace policy.
+
+The PaperTrans Web UI reports only whether the local MCP port is listening. It does not prove that the tunnel is running or that ChatGPT has registered the Connector.
 
 ## Exposed tools
 

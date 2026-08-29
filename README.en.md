@@ -2,40 +2,39 @@
 
 [日本語](README.md) | English
 
-> **Pre-release preview (v0.1)** — The supported v1 path converts official arXiv HTML into Japanese reading HTML. PDF processing and the ChatGPT MCP worker remain experimental.
+> **Pre-release preview (v0.1)** — The supported v1 input is official arXiv HTML. The ChatGPT MCP worker and PDF processing remain experimental.
 
-PaperTrans is a local-first academic paper translation workspace. It preserves the source document's structure, MathML equations, figures, tables, citations, cross-references, identifiers, and bibliography while translating academic prose into Japanese.
+PaperTrans is a local-first academic paper translation workspace. It translates prose into Japanese while preserving document structure, MathML equations, figures, tables, citations, cross-references, identifiers, and bibliography entries.
 
-## What works today
+## What works in v0.1
 
-- Acquire and sanitize official arXiv HTML.
-- Split translatable prose into stable semantic chunks.
-- Preserve MathML, figures, tables, citations, links, and protected terminology.
-- Translate chunks with Codex CLI or the experimental ChatGPT MCP worker.
+- Acquire and sanitize official arXiv HTML from an arXiv ID.
+- Split only translatable prose into stable semantic units.
+- Preserve equations, figures, tables, citation links, DOIs, and protected terms.
+- Translate with Codex CLI or the experimental ChatGPT Connector.
 - Validate block identity and protected tokens before rendering.
-- Read completed papers in a local Next.js library with search, tags, unread state, and favorites.
-- Keep papers, translations, and library metadata on the local machine.
+- Manage search, tags, unread state, and favorites in a local library.
+- Read papers inside the app with a navigable section outline.
 
-## Requirements
+Papers, translations, and library state stay on the local machine and are excluded from Git by default.
+
+## Quick start
+
+### Requirements
 
 - macOS or Linux
 - Python 3.10+ and [uv](https://docs.astral.sh/uv/)
 - Node.js 22+ and pnpm 11
-- A signed-in Codex CLI when using the Codex translation path
-
-## Quick start
+- A signed-in Codex CLI when using Codex translation
 
 ```bash
 git clone https://github.com/tenxnet/PaperTrans.git
 cd PaperTrans
 uv sync --extra test
 pnpm install --frozen-lockfile
-pnpm dev --hostname 127.0.0.1
 ```
 
-Open `http://127.0.0.1:3000`. If that port is occupied, add `--port 3100` to the development command.
-
-Run the official-arXiv-HTML pipeline with Codex:
+Translate official arXiv HTML with Codex:
 
 ```bash
 .venv/bin/papertrans arxiv-html-pipeline 2508.19843 \
@@ -43,40 +42,58 @@ Run the official-arXiv-HTML pipeline with Codex:
   --repo-root "$PWD"
 ```
 
-The local library discovers completed jobs under `output/`. Papers, generated artifacts, local state, and `.env*` files are intentionally excluded from Git.
-
-## ChatGPT translation worker (experimental)
-
-Run the local MCP server with:
+Start the local web app:
 
 ```bash
-uv sync --extra chatgpt --extra test
-.venv/bin/papertrans-mcp --transport streamable-http --port 8000
+pnpm dev --hostname 127.0.0.1
 ```
 
-The web app uses **New translation** as the single entry point for translation requests. It accepts an arXiv ID or an `arxiv.org/abs/...` URL, normalizes the ID, and copies a request for ChatGPT. PaperTrans cannot start a ChatGPT conversation directly, so paste the copied request into a connected ChatGPT conversation to run the worker.
+Open `http://127.0.0.1:3000`. Add `--port 3100` if you need a different port. Completed jobs under `output/` are discovered automatically.
 
-The bottom of the sidebar shows ChatGPT Connector as the default provider and checks whether the local MCP server is listening. **Connection settings** shows the MCP URL and execution model. This check does not verify the Secure MCP Tunnel or the connector registration inside ChatGPT. OpenAI API and `codex exec` are future provider options and are not selectable in the v1 UI.
+## Translation methods
 
-## Scope and safety
+| Method | v0.1 status | Tunnel | Billing or quota |
+| --- | --- | --- | --- |
+| Codex CLI | Supported local path | Not required | Codex usage |
+| ChatGPT Connector | Experimental | Required | ChatGPT usage |
+| OpenAI API | Not implemented | Not required | API usage billing |
 
-- Official arXiv HTML is the supported v1 source. ar5iv, LaTeXML, and PDF fallbacks are future or experimental paths.
-- The web app and MCP server are single-user local tools. They do not provide user authentication or multi-tenant isolation.
-- Bind services to `127.0.0.1`. Do not expose the unauthenticated MCP server directly to the public internet.
+Using ChatGPT as the translation worker requires the local MCP server and a Secure MCP Tunnel. PaperTrans cannot start a ChatGPT conversation directly. See [ChatGPT translation worker](docs/chatgpt-worker.md) for the trust boundary, exposed data, and setup.
+
+## Scope
+
+- Official arXiv HTML is the supported v1 input.
+- ar5iv, LaTeXML, general PDF parsing, and PDF OCR are future or experimental paths.
+- Japanese is the only v1 translation target. The web UI itself supports Japanese and English.
+- The web app and MCP server are local, single-user tools.
+- Public artifact hosting and collaboration are out of scope.
+
+## Local data and safety
+
+- `data/`, `output/`, and `.env*` are excluded from Git.
+- Bind the web app and MCP server to `127.0.0.1`.
+- Never expose the unauthenticated MCP server directly to the public internet.
 - You are responsible for checking the source paper's license and applicable law before using or sharing a translation.
 - Generated translations and structural QA can be wrong. Verify important claims and citations against the source paper.
 
-## Development
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [ChatGPT translation worker](docs/chatgpt-worker.md)
+- [Experimental PDF pipeline](docs/pdf-pipeline.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Contributing](CONTRIBUTING.md)
+- [OSS release checklist](docs/oss-release-checklist.md)
+
+## Development and validation
 
 ```bash
-uv run pytest -q
+.venv/bin/pytest -q
 pnpm typecheck
 pnpm build
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Do not attach copyrighted paper files, generated translations, credentials, or private local data to issues or pull requests.
-
-The remaining public-release work is tracked in the [OSS release checklist](docs/oss-release-checklist.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. Do not attach paper PDFs, generated translations, API keys, or other secrets to issues or pull requests.
 
 ## License
 

@@ -7,7 +7,7 @@ Thank you for helping improve PaperTrans. The project is currently a v0.1 previe
 - Search existing issues first.
 - Remove paper text, unpublished material, credentials, private paths, and personal data from logs and screenshots.
 - Do not upload source PDFs or generated translations unless you have the right to redistribute them.
-- For security-sensitive reports, follow `SECURITY.md` once the public reporting channel is configured.
+- Do not publish actionable vulnerability details until the repository has a configured private reporting channel. The release checklist tracks this requirement.
 
 ## Development setup
 
@@ -33,6 +33,8 @@ pnpm build
 ```
 
 Changes to a repository Skill should also pass its quick validation where applicable.
+
+Documentation changes should keep the Japanese and English root READMEs aligned and avoid duplicating detailed setup that belongs under `docs/`.
 
 ## Pull requests
 

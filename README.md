@@ -2,141 +2,90 @@
 
 [English](README.en.md) | 日本語
 
-> **公開前プレビュー（v0.1）** — v1は公式arXiv HTMLから日本語HTMLを作るローカル用途を主対象とします。PDF経路とChatGPT MCPワーカーは実験機能です。
+> **公開前プレビュー（v0.1）** — v1の正式対象は、公式arXiv HTMLから日本語の閲覧用HTMLを作るローカル用途です。ChatGPT MCPワーカーとPDF解析は実験機能です。
 
-学術論文を構造化して日本語訳し、原文の図・表・数式・引用リンクを保持したオフラインHTMLへ変換するローカルWebアプリです。v1では低コストな公式arXiv HTML経路を優先し、PDF経路は実験機能として扱います。
+PaperTransは、学術論文の構造、MathML数式、図、表、引用、相互参照、識別子、参考文献を保持しながら、本文を日本語へ翻訳するローカルファーストのWebアプリです。
 
-## 現在のMVP
+## v0.1でできること
 
-- PyMuPDFのテキスト層、フォント、座標、描画クラスタから章、段落、図、表、数式を決定論的に抽出
-- 各ページへconfidenceを付け、低信頼ページだけを`academic-paper-structure` SkillとCodexで補正
-- 図表・キャプション・数式は翻訳せず、PDFから高解像度画像として埋込み
-- 検出漏れに備え、全ページの原文画像を折りたたみ表示で保持
-- `.agents/skills/academic-paper-translator/`のSkillを指定してCodex CLIで節単位翻訳
-- blockId、引用、DOI、保護語、翻訳量を検査し、失敗したチャンクだけ再試行
-- 日本語本文、章・段落単位の原文、警告、原文PDFを含むオフラインHTML/ZIP生成
-- Next.jsのローカルライブラリで翻訳済み論文、進捗、QA、タグ、未読・既読、お気に入りを一覧管理
-- タイトル・著者・arXiv ID・タグの検索、追加日・公開日・著者名・タグによる並べ替え、アプリ内HTML閲覧
-- UIの日本語・英語切替とブラウザ内の選択保持（論文の翻訳先はV1では日本語のみ）
+- arXiv IDから公式HTMLを取得し、安全なローカル文書へ正規化
+- 翻訳対象だけを安定した意味単位へ分割
+- 数式、図表、引用リンク、DOI、保護語を原文のまま保持
+- Codex CLI、または実験的なChatGPT Connectorで日本語へ翻訳
+- block IDと保護トークンを検査してからHTMLを生成
+- ローカルライブラリで検索、タグ、未読・既読、お気に入りを管理
+- 論文本文を章・節目次付きでアプリ内閲覧
 
-## セットアップ
+論文、翻訳、ライブラリ情報はローカルに保存され、既定ではGitへ追加されません。
+
+## Quick Start
 
 ### 必要なもの
 
 - macOSまたはLinux
 - Python 3.10以上と[uv](https://docs.astral.sh/uv/)
 - Node.js 22以上とpnpm 11
-- Codex経路を使う場合は、ログイン済みのCodex CLI
+- Codex翻訳を使う場合は、ログイン済みのCodex CLI
 
 ```bash
+git clone https://github.com/tenxnet/PaperTrans.git
+cd PaperTrans
 uv sync --extra test
 pnpm install --frozen-lockfile
 ```
 
-Codex CLIへログイン済みであることが必要です。PDFと生成物はローカルの`data/`と`output/`へ保存され、Gitには入りません。
-
-## LLMmapサンプルの再生成
+公式arXiv HTMLをCodexで翻訳します。
 
 ```bash
-.venv/bin/papertrans pipeline data/papers/llmmap/source.pdf \
-  --slug llmmap \
+.venv/bin/papertrans arxiv-html-pipeline 2508.19843 \
+  --slug arxiv-2508.19843 \
   --repo-root "$PWD"
 ```
 
-## ハイブリッド学術翻訳パイプライン
-
-既定では、全ページをLLMへ送らず、機械解析で低信頼になったページだけをCodexで3並列確認します。翻訳も章構造を固定してから3並列で実行します。
-
-```bash
-.venv/bin/papertrans semantic-pipeline path/to/paper.pdf \
-  --slug paper-name \
-  --repo-root "$PWD" \
-  --structure-mode hybrid \
-  --structure-review-workers 3 \
-  --translation-workers 3
-```
-
-比較のため、従来の全ページLLM構造解析を使う場合は`--structure-mode llm`を指定します。各工程の実時間、モデル呼び出し回数、キャッシュヒット、翻訳チャンク時間は`output/<slug>/run-metrics.json`へ保存されます。
-
-翻訳済みの`DocumentIR`からHTMLだけを作り直す場合:
-
-```bash
-.venv/bin/papertrans render output/llmmap/work/document.json \
-  --work-dir output/llmmap/work \
-  --output-dir output/llmmap/html \
-  --source-pdf data/papers/llmmap/source.pdf \
-  --zip output/llmmap/LLMmap-ja-html.zip
-```
-
-## Webアプリ
+ローカルWebアプリを起動します。
 
 ```bash
 pnpm dev --hostname 127.0.0.1
 ```
 
-`http://127.0.0.1:3000`を開きます。ポートが使用中なら`pnpm dev --port 3100`のように変更できます。
+`http://127.0.0.1:3000`を開きます。ポートを変更する場合は、末尾に`--port 3100`を追加してください。`output/`にある完成済みジョブは自動的にライブラリへ表示されます。
 
-Webアプリは`output/*/work/chatgpt-job.json`を自動検出するため、既存のChatGPT翻訳ジョブは追加操作なしでライブラリへ表示されます。論文を選ぶと、次の情報と操作を1画面で利用できます。
+## 翻訳方法
 
-- 翻訳チャンクの進捗と完了状態
-- 図、表、数式、参考文献の構造QA
-- 翻訳HTMLのアプリ内埋め込み閲覧
-- 人間が論文ごとに付けるローカルタグの追加・削除とタグ絞り込み
-- 未読・既読、お気に入りの切り替えと専用フィルター
-- arXiv HTMLから著者と公開日を取得し、既存の成果物にも自動で補完
-- arXiv原文へのリンク
+| 方法 | v0.1での位置付け | Tunnel | 費用・利用枠 |
+| --- | --- | --- | --- |
+| Codex CLI | 標準のローカル経路 | 不要 | Codex利用枠 |
+| ChatGPT Connector | 実験機能 | 必要 | ChatGPT側の利用枠 |
+| OpenAI API | 未実装 | 不要 | API従量課金 |
 
-タグ、未読・既読、お気に入りは`data/library.json`へ保存され、論文、翻訳、ライブラリ情報はいずれもGitへ追加されません。V1のUIは公式arXiv HTML経路を対象にしており、PDF取込APIとPDFパイプラインは実験機能です。
+ChatGPTを翻訳ワーカーとして使う場合は、ローカルMCPサーバーとSecure MCP Tunnelの設定が必要です。PaperTransからChatGPTの会話を直接開始することはできません。詳しい責任範囲、公開データ、起動方法は[ChatGPT翻訳ワーカー](docs/chatgpt-worker.md)を参照してください。
 
-表示言語と論文の翻訳先は独立しています。表示言語は日本語または英語から選べますが、翻訳ジョブの`targetLanguage`はV1では`ja`のみをサポートします。将来の翻訳言語追加時も既存ジョブを判別できるよう、言語はジョブと生成HTMLへ明示的に保存されます。
+## 対象範囲
 
-## ChatGPTを翻訳ワーカーとして使う（実験機能）
+- v1の正式な入力は公式arXiv HTMLです。
+- ar5iv、LaTeXML、一般PDF解析、PDF OCRは将来候補または実験機能です。
+- 翻訳先はv1では日本語のみです。Web UIは日本語と英語を切り替えられます。
+- WebアプリとMCPサーバーは単独利用のローカル実行を前提としています。
+- 公開成果物のホスティングや共同編集は対象外です。
 
-PaperTransをMCPサーバーとして起動すると、ChatGPTは章単位の翻訳だけを担当し、PaperTransが取得、ジョブ状態、保護トークン検査、HTML/ZIP生成、視覚要素QAを管理します。ローカルのCodex SkillはChatGPTへ直接読み込ませず、同じ重要規則をMCPサーバーの指示と各ツールのスキーマで強制します。
+## ローカルデータと安全性
 
-```bash
-uv sync --extra chatgpt --extra test
-.venv/bin/papertrans-mcp --transport streamable-http --port 8000
-```
+- `data/`、`output/`、`.env*`はGit管理外です。
+- WebアプリとMCPサーバーは`127.0.0.1`へバインドしてください。
+- 認証なしのMCPサーバーを直接インターネットへ公開しないでください。
+- 論文と翻訳物の利用・共有可否は、利用者が原論文のライセンスと適用法を確認してください。
+- 翻訳と構造QAは誤る可能性があります。研究や引用に使う前に原文と照合してください。
 
-ローカルのMCP URLは`http://127.0.0.1:8000/mcp`です。ChatGPTから接続する際は、公式のSecure MCP Tunnelまたは自分で用意した公開HTTPS URLを介し、ChatGPTのDeveloper modeでコネクタとして登録します。認証なしの試作サーバーをそのまま公開インターネットへ露出しないでください。
+## ドキュメント
 
-接続後は、ChatGPTに「arXiv 2508.19843をPaperTransで全文翻訳して」のように依頼します。ChatGPTは次の順序でツールを反復します。
+- [ドキュメント索引](docs/README.md)
+- [ChatGPT翻訳ワーカー](docs/chatgpt-worker.md)
+- [実験的PDFパイプライン](docs/pdf-pipeline.md)
+- [トラブルシューティング](docs/troubleshooting.md)
+- [コントリビューション](CONTRIBUTING.md)
+- [OSSリリースチェックリスト](docs/oss-release-checklist.md)
 
-1. `prepare_arxiv_translation`
-2. `get_translation_chunk`
-3. 返された全ブロックを翻訳
-4. `save_translation_chunk`
-5. 残りがゼロになるまで2〜4を反復
-6. `finalize_translation_html`
-
-途中で会話が止まっても、`list_translation_jobs`と`get_translation_status`から再開できます。状態は`output/<job-id>/work/chatgpt-job.json`、チャンク成果は`work/chatgpt-translations/`、完成物は`html/index.html`と`<job-id>-html.zip`へ保存されます。Webアプリをポート3100で動かしている場合、完成HTMLは`http://127.0.0.1:3100/api/artifacts/<job-id>/index.html`から閲覧できます。
-
-ChatGPT会話のトークン使用量はローカルMCPサーバーへ通知されないため、PaperTrans側では取得できません。PaperTransが記録するのはチャンク数、文字数、状態、時刻、成果物、QA結果です。
-
-Webアプリでは、上部の「新しい翻訳」が翻訳リクエストの唯一の入口です。arXiv IDまたは`arxiv.org/abs/...` URLを入力すると、IDを正規化してChatGPT向け依頼文をコピーできます。PaperTransからChatGPTの会話を直接開始することはできないため、コピー後は接続済みのChatGPTへ貼り付けて実行してください。翻訳中のジョブがある場合、ライブラリ画面は進捗を定期的に再読込します。
-
-左サイドバー下部には、既定プロバイダーのChatGPT ConnectorとローカルMCPサーバーの稼働状態を表示します。「接続設定」ではMCP URLと実行方式を確認できます。この表示が確認するのはローカルMCPポートであり、Secure MCP TunnelやChatGPT側Connectorの登録完了までは検証しません。OpenAI APIと`codex exec`は将来の切替候補であり、v1 UIでは選択できません。
-
-## プロジェクトの境界
-
-- v1の正式経路は公式arXiv HTMLです。ar5iv、LaTeXML、PDF解析は今後の候補または実験機能です。
-- WebアプリとMCPサーバーは単独利用のローカル実行を前提とし、利用者認証やマルチテナント分離を提供しません。
-- `data/`、`output/`、`.env*`には論文、翻訳、認証情報が入り得るためGit管理外です。
-- 論文や翻訳物の利用・共有可否は、利用者が原論文のライセンスと適用法を確認してください。
-- 翻訳と構造QAは誤りを含む可能性があります。研究・引用に使う前に原文と照合してください。
-
-## コントリビューション
-
-バグ報告や機能提案を歓迎します。開発環境、テスト、PRの方針は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。論文PDF、翻訳成果物、APIキーなどの秘密情報はIssueやPRへ添付しないでください。
-
-公開前の残作業は[OSSリリースチェックリスト](docs/oss-release-checklist.md)で管理します。
-
-## ライセンス
-
-PaperTransのソースコード、リポジトリ内Skills、テンプレート、ドキュメントは[Apache License 2.0](LICENSE)で提供します。利用者が取得した論文、論文中の図表、生成された翻訳HTMLには、このライセンスが自動的に適用されるわけではありません。
-
-## 検証
+## 開発と検証
 
 ```bash
 .venv/bin/pytest -q
@@ -144,10 +93,8 @@ pnpm typecheck
 pnpm build
 ```
 
-Skill単体の形式検証:
+変更を送る前に[CONTRIBUTING.md](CONTRIBUTING.md)を確認してください。論文PDF、生成された翻訳、APIキー、秘密情報をIssueやPull Requestへ添付しないでください。
 
-```bash
-.venv/bin/python \
-  "$CODEX_HOME/skills/.system/skill-creator/scripts/quick_validate.py" \
-  .agents/skills/academic-paper-translator
-```
+## ライセンス
+
+PaperTransのソースコード、リポジトリ内Skills、テンプレート、ドキュメントは[Apache License 2.0](LICENSE)で提供します。このライセンスは、利用者が取得した論文、論文中の図表、生成された翻訳成果物には自動的に適用されません。
