@@ -1,4 +1,8 @@
-# PaperTrans MVP
+# PaperTrans
+
+[English](README.en.md) | 日本語
+
+> **公開前プレビュー（v0.1）** — v1は公式arXiv HTMLから日本語HTMLを作るローカル用途を主対象とします。PDF経路とChatGPT MCPワーカーは実験機能です。
 
 学術論文を構造化して日本語訳し、原文の図・表・数式・引用リンクを保持したオフラインHTMLへ変換するローカルWebアプリです。v1では低コストな公式arXiv HTML経路を優先し、PDF経路は実験機能として扱います。
 
@@ -17,9 +21,16 @@
 
 ## セットアップ
 
+### 必要なもの
+
+- macOSまたはLinux
+- Python 3.10以上と[uv](https://docs.astral.sh/uv/)
+- Node.js 22以上とpnpm 11
+- Codex経路を使う場合は、ログイン済みのCodex CLI
+
 ```bash
 uv sync --extra test
-pnpm install
+pnpm install --frozen-lockfile
 ```
 
 Codex CLIへログイン済みであることが必要です。PDFと生成物はローカルの`data/`と`output/`へ保存され、Gitには入りません。
@@ -60,7 +71,7 @@ Codex CLIへログイン済みであることが必要です。PDFと生成物�
 ## Webアプリ
 
 ```bash
-pnpm dev
+pnpm dev --hostname 127.0.0.1
 ```
 
 `http://127.0.0.1:3000`を開きます。ポートが使用中なら`pnpm dev --port 3100`のように変更できます。
@@ -104,6 +115,20 @@ uv sync --extra chatgpt --extra test
 ChatGPT会話のトークン使用量はローカルMCPサーバーへ通知されないため、PaperTrans側では取得できません。PaperTransが記録するのはチャンク数、文字数、状態、時刻、成果物、QA結果です。
 
 Webアプリの「新しい翻訳」から、arXiv IDを含むChatGPT向け依頼文をコピーできます。翻訳中のジョブがある場合、ライブラリ画面は進捗を定期的に再読込します。
+
+## プロジェクトの境界
+
+- v1の正式経路は公式arXiv HTMLです。ar5iv、LaTeXML、PDF解析は今後の候補または実験機能です。
+- WebアプリとMCPサーバーは単独利用のローカル実行を前提とし、利用者認証やマルチテナント分離を提供しません。
+- `data/`、`output/`、`.env*`には論文、翻訳、認証情報が入り得るためGit管理外です。
+- 論文や翻訳物の利用・共有可否は、利用者が原論文のライセンスと適用法を確認してください。
+- 翻訳と構造QAは誤りを含む可能性があります。研究・引用に使う前に原文と照合してください。
+
+## コントリビューション
+
+バグ報告や機能提案を歓迎します。開発環境、テスト、PRの方針は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。論文PDF、翻訳成果物、APIキーなどの秘密情報はIssueやPRへ添付しないでください。
+
+公開前の残作業は[OSSリリースチェックリスト](docs/oss-release-checklist.md)で管理します。
 
 ## 検証
 
