@@ -251,8 +251,17 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
 
   function openPaper(paper: PaperSummary) {
     setSelectedSlug(paper.slug);
+    window.scrollTo({ top: 0, left: 0 });
     if (!paper.isRead) {
       void persistLibraryState(paper.slug, { isRead: true }, "", true);
+    }
+  }
+
+  function resetEmbeddedPaper(iframe: HTMLIFrameElement) {
+    try {
+      iframe.contentWindow?.scrollTo({ top: 0, left: 0 });
+    } catch {
+      // The local artifact is same-origin; fail safely if deployment changes that assumption.
     }
   }
 
@@ -383,7 +392,13 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 </div>
               </div>
               {selected.artifactUrl ? (
-                <iframe className="paper-frame" title={text.translatedPaperFrame(selected.title)} src={`${selected.artifactUrl}?embed=1`} />
+                <iframe
+                  key={selected.slug}
+                  className="paper-frame"
+                  title={text.translatedPaperFrame(selected.title)}
+                  src={`${selected.artifactUrl}?embed=1`}
+                  onLoad={(event) => resetEmbeddedPaper(event.currentTarget)}
+                />
               ) : (
                 <div className="reader-empty"><SpinnerGap className="spin" /><p>{text.waitingForHtml}</p></div>
               )}
