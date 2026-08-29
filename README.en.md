@@ -45,6 +45,19 @@ Run the official-arXiv-HTML pipeline with Codex:
 
 The local library discovers completed jobs under `output/`. Papers, generated artifacts, local state, and `.env*` files are intentionally excluded from Git.
 
+## ChatGPT translation worker (experimental)
+
+Run the local MCP server with:
+
+```bash
+uv sync --extra chatgpt --extra test
+.venv/bin/papertrans-mcp --transport streamable-http --port 8000
+```
+
+The web app uses **New translation** as the single entry point for translation requests. It accepts an arXiv ID or an `arxiv.org/abs/...` URL, normalizes the ID, and copies a request for ChatGPT. PaperTrans cannot start a ChatGPT conversation directly, so paste the copied request into a connected ChatGPT conversation to run the worker.
+
+The bottom of the sidebar shows ChatGPT Connector as the default provider and checks whether the local MCP server is listening. **Connection settings** shows the MCP URL and execution model. This check does not verify the Secure MCP Tunnel or the connector registration inside ChatGPT. OpenAI API and `codex exec` are future provider options and are not selectable in the v1 UI.
+
 ## Scope and safety
 
 - Official arXiv HTML is the supported v1 source. ar5iv, LaTeXML, and PDF fallbacks are future or experimental paths.

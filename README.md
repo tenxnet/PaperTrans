@@ -114,7 +114,9 @@ uv sync --extra chatgpt --extra test
 
 ChatGPT会話のトークン使用量はローカルMCPサーバーへ通知されないため、PaperTrans側では取得できません。PaperTransが記録するのはチャンク数、文字数、状態、時刻、成果物、QA結果です。
 
-Webアプリの「新しい翻訳」から、arXiv IDを含むChatGPT向け依頼文をコピーできます。翻訳中のジョブがある場合、ライブラリ画面は進捗を定期的に再読込します。
+Webアプリでは、上部の「新しい翻訳」が翻訳リクエストの唯一の入口です。arXiv IDまたは`arxiv.org/abs/...` URLを入力すると、IDを正規化してChatGPT向け依頼文をコピーできます。PaperTransからChatGPTの会話を直接開始することはできないため、コピー後は接続済みのChatGPTへ貼り付けて実行してください。翻訳中のジョブがある場合、ライブラリ画面は進捗を定期的に再読込します。
+
+左サイドバー下部には、既定プロバイダーのChatGPT ConnectorとローカルMCPサーバーの稼働状態を表示します。「接続設定」ではMCP URLと実行方式を確認できます。この表示が確認するのはローカルMCPポートであり、Secure MCP TunnelやChatGPT側Connectorの登録完了までは検証しません。OpenAI APIと`codex exec`は将来の切替候補であり、v1 UIでは選択できません。
 
 ## プロジェクトの境界
 
