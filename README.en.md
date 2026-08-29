@@ -80,6 +80,7 @@ The Web UI manages MCP status, job preparation, progress, and artifacts. Model s
 - [MCP translation server](docs/mcp-server.md)
 - [Experimental PDF pipeline](docs/pdf-pipeline.md)
 - [Dependency license audit](docs/dependency-licenses.md)
+- [Security policy](SECURITY.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)
 - [OSS release checklist](docs/oss-release-checklist.md)

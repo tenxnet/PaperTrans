@@ -80,6 +80,7 @@ Web UIはMCP接続状態、ジョブ準備、進捗、成果物を管理しま�
 - [MCP翻訳サーバー](docs/mcp-server.md)
 - [実験的PDFパイプライン](docs/pdf-pipeline.md)
 - [依存ライセンス監査](docs/dependency-licenses.md)
+- [セキュリティポリシー](SECURITY.md)
 - [トラブルシューティング](docs/troubleshooting.md)
 - [コントリビューション](CONTRIBUTING.md)
 - [OSSリリースチェックリスト](docs/oss-release-checklist.md)

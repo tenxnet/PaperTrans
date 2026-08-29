@@ -5,7 +5,8 @@ This checklist tracks the remaining work before making PaperTrans public as a v0
 ## Required before public visibility
 
 - [x] Select and add the Apache License 2.0 project license.
-- [ ] Add and approve the root `SECURITY.md` policy and a private reporting channel.
+- [x] Add and approve the root `SECURITY.md` policy.
+- [ ] Enable GitHub Private Vulnerability Reporting when the repository becomes public.
 - [x] Keep `.env*`, `data/`, `output/`, browser traces, caches, and local databases out of Git.
 - [x] Add reproducible Python and Node validation in GitHub Actions.
 - [x] Add contribution guidance, a code of conduct, issue forms, and a pull-request template.
