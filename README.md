@@ -1,6 +1,6 @@
 # PaperTrans MVP
 
-学術PDFを構造化し、Codexで全文を日本語訳して、原文の図・表・数式を保持したオフラインHTMLへ変換するローカルWebアプリです。
+学術論文を構造化して日本語訳し、原文の図・表・数式・引用リンクを保持したオフラインHTMLへ変換するローカルWebアプリです。v1では低コストな公式arXiv HTML経路を優先し、PDF経路は実験機能として扱います。
 
 ## 現在のMVP
 
@@ -62,6 +62,30 @@ pnpm dev
 ```
 
 `http://127.0.0.1:3000`を開きます。ポートが使用中なら`pnpm dev --port 3100`のように変更できます。
+
+## ChatGPTを翻訳ワーカーとして使う（実験機能）
+
+PaperTransをMCPサーバーとして起動すると、ChatGPTは章単位の翻訳だけを担当し、PaperTransが取得、ジョブ状態、保護トークン検査、HTML/ZIP生成、視覚要素QAを管理します。ローカルのCodex SkillはChatGPTへ直接読み込ませず、同じ重要規則をMCPサーバーの指示と各ツールのスキーマで強制します。
+
+```bash
+uv sync --extra chatgpt --extra test
+.venv/bin/papertrans-mcp --transport streamable-http --port 8000
+```
+
+ローカルのMCP URLは`http://127.0.0.1:8000/mcp`です。ChatGPTから接続する際は、公式のSecure MCP Tunnelまたは自分で用意した公開HTTPS URLを介し、ChatGPTのDeveloper modeでコネクタとして登録します。認証なしの試作サーバーをそのまま公開インターネットへ露出しないでください。
+
+接続後は、ChatGPTに「arXiv 2508.19843をPaperTransで全文翻訳して」のように依頼します。ChatGPTは次の順序でツールを反復します。
+
+1. `prepare_arxiv_translation`
+2. `get_translation_chunk`
+3. 返された全ブロックを翻訳
+4. `save_translation_chunk`
+5. 残りがゼロになるまで2〜4を反復
+6. `finalize_translation_html`
+
+途中で会話が止まっても、`list_translation_jobs`と`get_translation_status`から再開できます。状態は`output/<job-id>/work/chatgpt-job.json`、チャンク成果は`work/chatgpt-translations/`、完成物は`html/index.html`と`<job-id>-html.zip`へ保存されます。Webアプリをポート3100で動かしている場合、完成HTMLは`http://127.0.0.1:3100/api/artifacts/<job-id>/index.html`から閲覧できます。
+
+ChatGPT会話のトークン使用量はローカルMCPサーバーへ通知されないため、PaperTrans側では取得できません。PaperTransが記録するのはチャンク数、文字数、状態、時刻、成果物、QA結果です。
 
 ## 検証
 
