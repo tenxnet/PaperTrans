@@ -1,4 +1,8 @@
-# PaperTrans
+<p align="center">
+  <img src="docs/assets/papertrans-logo.png" alt="PaperTrans logo" width="160">
+</p>
+
+<h1 align="center">PaperTrans</h1>
 
 [日本語](README.md) | English
 
@@ -6,7 +10,7 @@
 
 PaperTrans is a local-first academic paper translation workspace. It translates prose into Japanese while preserving document structure, MathML equations, figures, tables, citations, cross-references, identifiers, and bibliography entries.
 
-## What works in v0.1
+## What works
 
 - Acquire and sanitize official arXiv HTML from an arXiv ID.
 - Split only translatable prose into stable semantic units.

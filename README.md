@@ -1,4 +1,8 @@
-# PaperTrans
+<p align="center">
+  <img src="docs/assets/papertrans-logo.png" alt="PaperTrans logo" width="160">
+</p>
+
+<h1 align="center">PaperTrans</h1>
 
 [English](README.en.md) | 日本語
 
@@ -6,7 +10,7 @@
 
 PaperTransは、学術論文の構造、MathML数式、図、表、引用、相互参照、識別子、参考文献を保持しながら、本文を日本語へ翻訳するローカルファーストのWebアプリです。
 
-## v0.1でできること
+## できること
 
 - arXiv IDから公式HTMLを取得し、安全なローカル文書へ正規化
 - 翻訳対象だけを安定した意味単位へ分割
