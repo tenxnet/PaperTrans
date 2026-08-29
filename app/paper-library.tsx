@@ -9,6 +9,7 @@ import {
   ClockCounterClockwise,
   FileText,
   FunnelSimple,
+  Gear,
   ListBullets,
   MagnifyingGlass,
   Plus,
@@ -32,6 +33,22 @@ type Filter = "all" | "active" | "review" | "unread" | "favorites";
 type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
 type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
 type TocEntry = { id: string; label: string; level: 2 | 3 };
+type ConnectorHealth = "checking" | "online" | "offline";
+type ProviderStatusResponse = {
+  defaultProvider: "chatgpt_connector";
+  providers: {
+    chatgpt_connector: {
+      enabled: boolean;
+      mcpServer: "online" | "offline";
+      mcpUrl: string;
+      startsInApp: false;
+    };
+  };
+};
+
+function arxivIdFromInput(value: string) {
+  return value.trim().match(/(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.[1] ?? "";
+}
 
 function isActive(paper: PaperSummary) {
   return ["prepared", "translating", "ready_to_finalize"].includes(paper.status);
@@ -91,7 +108,11 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [librarySaving, setLibrarySaving] = useState(false);
   const [notice, setNotice] = useState("");
   const [showRequest, setShowRequest] = useState(false);
+  const [showProviderSettings, setShowProviderSettings] = useState(false);
   const [arxivDraft, setArxivDraft] = useState("");
+  const [requestCopied, setRequestCopied] = useState(false);
+  const [connectorHealth, setConnectorHealth] = useState<ConnectorHealth>("checking");
+  const [mcpUrl, setMcpUrl] = useState("http://127.0.0.1:8000/mcp");
   const [tocEntries, setTocEntries] = useState<TocEntry[]>([]);
   const [activeTocId, setActiveTocId] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -99,6 +120,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const tocListRef = useRef<HTMLElement>(null);
   const tocCleanupRef = useRef<(() => void) | null>(null);
   const text = UI_TEXT[locale];
+  const requestedArxivId = arxivIdFromInput(arxivDraft);
 
   const selected = papers.find((paper) => paper.slug === selectedSlug) ?? null;
   const counts = useMemo(() => ({
@@ -149,6 +171,25 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     document.documentElement.lang = locale;
   }, [locale]);
 
+  async function refreshProviderStatus() {
+    setConnectorHealth("checking");
+    try {
+      const response = await fetch("/api/providers", { cache: "no-store" });
+      if (!response.ok) throw new Error("provider status failed");
+      const body = (await response.json()) as ProviderStatusResponse;
+      setConnectorHealth(body.providers.chatgpt_connector.mcpServer);
+      setMcpUrl(body.providers.chatgpt_connector.mcpUrl);
+    } catch {
+      setConnectorHealth("offline");
+    }
+  }
+
+  useEffect(() => {
+    void refreshProviderStatus();
+    const timer = window.setInterval(() => void refreshProviderStatus(), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     tocCleanupRef.current?.();
     tocCleanupRef.current = null;
@@ -197,13 +238,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
         searchRef.current?.focus();
       }
       if (event.key === "Escape") {
-        if (showRequest) setShowRequest(false);
+        if (showProviderSettings) setShowProviderSettings(false);
+        else if (showRequest) setShowRequest(false);
         else if (selectedSlug) setSelectedSlug(null);
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedSlug, showRequest]);
+  }, [selectedSlug, showRequest, showProviderSettings]);
 
   async function persistLibraryState(
     slug: string,
@@ -258,14 +300,20 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   }
 
   async function copyRequest() {
-    const id = arxivDraft.trim() || "2510.09023v1";
+    if (!requestedArxivId) return;
     try {
-      await navigator.clipboard.writeText(text.translationPrompt(id));
+      await navigator.clipboard.writeText(text.translationPrompt(requestedArxivId));
+      setRequestCopied(true);
       setNotice(text.requestCopied);
-      setShowRequest(false);
     } catch {
       setNotice(text.requestCopyFailed);
     }
+  }
+
+  function openTranslationRequest() {
+    setRequestCopied(false);
+    setShowProviderSettings(false);
+    setShowRequest(true);
   }
 
   function setNavigation(next: Filter) {
@@ -367,11 +415,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
           <span>PaperTrans</span>
         </div>
 
-        <button className="request-card" type="button" onClick={() => setShowRequest(true)}>
-          <ChatCircleDots weight="duotone" aria-hidden="true" />
-          <span><strong>{text.translateWithChatGPT}</strong><small>{text.createFromArxiv}</small></span>
-        </button>
-
         <nav aria-label={text.library}>
           <p className="nav-heading">{text.library}</p>
           <button className={filter === "all" && !tagFilter ? "nav-item active" : "nav-item"} onClick={() => setNavigation("all")}>
@@ -416,6 +459,19 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
           )) : <p className="tag-empty">{text.tagEmpty}</p>}
         </div>
 
+        <section className="provider-summary" aria-label={text.translationProvider}>
+          <div className="provider-summary-copy">
+            <span className={`connection-dot ${connectorHealth}`} aria-hidden="true" />
+            <span>
+              <strong>{text.chatgptConnector}</strong>
+              <small>{text.connectorStatus[connectorHealth]}</small>
+            </span>
+          </div>
+          <button type="button" onClick={() => setShowProviderSettings(true)}>
+            <Gear aria-hidden="true" />{text.providerSettings}
+          </button>
+        </section>
+
         <div className="sidebar-footer">
           <p><span className="local-dot" />{text.localStorage}</p>
           <small>{text.localStorageNote}</small>
@@ -447,7 +503,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <button className="icon-button" type="button" onClick={() => void refresh()} title={text.refresh}>
               <ClockCounterClockwise aria-hidden="true" />
             </button>
-            <button className="primary-button" type="button" onClick={() => setShowRequest(true)}>
+            <button className="primary-button new-translation-button" type="button" onClick={openTranslationRequest} aria-label={text.newTranslation} title={text.newTranslation}>
               <Plus aria-hidden="true" />{text.newTranslation}
             </button>
           </div>
@@ -636,9 +692,72 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             <p className="eyebrow">{text.connector}</p>
             <h2 id="request-title">{text.requestTranslation}</h2>
             <p>{text.requestHelp}</p>
-            <label><span>{text.arxivId}</span><input autoFocus value={arxivDraft} onChange={(event) => setArxivDraft(event.target.value)} placeholder={text.arxivExample} /></label>
-            <div className="prompt-preview">{text.translationPrompt(arxivDraft.trim() || "2510.09023v1")}</div>
-            <button className="primary-button wide" type="button" onClick={() => void copyRequest()}>{text.copyRequest}</button>
+            <label>
+              <span>{text.arxivIdOrUrl}</span>
+              <input
+                autoFocus
+                value={arxivDraft}
+                onChange={(event) => { setArxivDraft(event.target.value); setRequestCopied(false); }}
+                placeholder={text.arxivExample}
+              />
+            </label>
+            {arxivDraft && !requestedArxivId && <p className="field-error">{text.invalidArxiv}</p>}
+            <div className="provider-choice">
+              <span className="provider-choice-icon"><ChatCircleDots weight="duotone" aria-hidden="true" /></span>
+              <span><strong>{text.chatgptConnector}</strong><small>{text.connectorStatus[connectorHealth]}</small></span>
+              <span className="provider-badge">{text.defaultProvider}</span>
+            </div>
+            <div className="prompt-preview">
+              {requestedArxivId ? text.translationPrompt(requestedArxivId) : text.promptAppearsHere}
+            </div>
+            {requestCopied && (
+              <div className="copy-success" role="status">
+                <CheckCircle weight="fill" aria-hidden="true" />
+                <span><strong>{text.requestReady}</strong><small>{text.requestReadyHelp}</small></span>
+              </div>
+            )}
+            <div className="modal-actions">
+              <button className="secondary-button" type="button" onClick={() => { setShowRequest(false); setShowProviderSettings(true); }}>
+                <Gear aria-hidden="true" />{text.providerSettings}
+              </button>
+              <button className="primary-button" type="button" disabled={!requestedArxivId} onClick={() => void copyRequest()}>{text.copyRequest}</button>
+            </div>
+            {requestCopied && (
+              <a className="open-chatgpt" href="https://chatgpt.com/" target="_blank" rel="noreferrer">
+                {text.openChatGPT}<ArrowSquareOut aria-hidden="true" />
+              </a>
+            )}
+          </section>
+        </div>
+      )}
+
+      {showProviderSettings && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowProviderSettings(false)}>
+          <section className="request-modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="provider-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="modal-close" type="button" onClick={() => setShowProviderSettings(false)} title={text.close}><X aria-hidden="true" /></button>
+            <span className="modal-icon"><Gear weight="duotone" aria-hidden="true" /></span>
+            <p className="eyebrow">{text.settings}</p>
+            <h2 id="provider-title">{text.translationProvider}</h2>
+            <p>{text.providerHelp}</p>
+            <div className="provider-setting-card selected">
+              <span className={`connection-dot ${connectorHealth}`} aria-hidden="true" />
+              <span><strong>{text.chatgptConnector}</strong><small>{text.connectorStatus[connectorHealth]}</small></span>
+              <span className="provider-badge">{text.defaultProvider}</span>
+            </div>
+            <dl className="provider-details">
+              <div><dt>{text.localMcpServer}</dt><dd><code>{mcpUrl}</code></dd></div>
+              <div><dt>{text.executionMethod}</dt><dd>{text.chatgptPullWorker}</dd></div>
+            </dl>
+            <div className="provider-note"><WarningCircle aria-hidden="true" /><p>{text.providerLimitation}</p></div>
+            <p className="future-providers">{text.futureProviders}</p>
+            <div className="modal-actions end">
+              <button className="secondary-button" type="button" onClick={() => void refreshProviderStatus()} disabled={connectorHealth === "checking"}>
+                <ClockCounterClockwise aria-hidden="true" />{text.checkConnection}
+              </button>
+              <button className="primary-button" type="button" onClick={() => { setShowProviderSettings(false); openTranslationRequest(); }}>
+                <Plus aria-hidden="true" />{text.newTranslation}
+              </button>
+            </div>
           </section>
         </div>
       )}
