@@ -66,6 +66,18 @@ The Web UI manages job preparation, progress, and artifacts. Model selection and
 - The web app and MCP server are local, single-user tools.
 - Public artifact hosting and collaboration are out of scope.
 
+## Roadmap (planned or under consideration)
+
+Priorities and specifications may change as experiments and issues provide new evidence.
+
+- [ ] Fall back to ar5iv or LaTeXML when official arXiv HTML is unavailable.
+- [ ] Preserve structure, equations, figures, tables, and citations in general PDFs such as IEEE papers.
+- [ ] Add glossary editing, per-paper rules, and section-level retranslation.
+- [ ] Add navigable links between prose, citations, references, figures, and tables.
+- [ ] Add translation parallelism, caching, and processing-time or usage metrics.
+- [ ] Improve library management with folders, full-text search, and batch actions.
+- [ ] Support translation targets beyond Japanese and optional external translation providers.
+
 ## Local data and safety
 
 - `data/`, `output/`, and `.env*` are excluded from Git.
