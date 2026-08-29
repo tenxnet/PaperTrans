@@ -58,6 +58,8 @@ pnpm dev --hostname 127.0.0.1
 | ChatGPT Connector | 実験機能 | 必要 | ChatGPT側の利用枠 |
 | OpenAI API | 未実装 | 不要 | API従量課金 |
 
+Web UIのサイドバーにある「Provider設定」から、ChatGPT ConnectorとCodex CLIを切り替えられます。Codex CLIを選ぶと、モデルと推論強度を指定した実行コマンドを生成します。詳しくは[Provider設定](docs/providers.md)を参照してください。
+
 ChatGPTを翻訳ワーカーとして使う場合は、ローカルMCPサーバーとSecure MCP Tunnelの設定が必要です。PaperTransからChatGPTの会話を直接開始することはできません。詳しい責任範囲、公開データ、起動方法は[ChatGPT翻訳ワーカー](docs/chatgpt-worker.md)を参照してください。
 
 ## 対象範囲
@@ -80,6 +82,7 @@ ChatGPTを翻訳ワーカーとして使う場合は、ローカルMCPサーバ�
 
 - [ドキュメント索引](docs/README.md)
 - [ChatGPT翻訳ワーカー](docs/chatgpt-worker.md)
+- [Provider設定](docs/providers.md)
 - [実験的PDFパイプライン](docs/pdf-pipeline.md)
 - [トラブルシューティング](docs/troubleshooting.md)
 - [コントリビューション](CONTRIBUTING.md)

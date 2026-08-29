@@ -1,4 +1,5 @@
 import { createConnection } from "node:net";
+import { spawn } from "node:child_process";
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
@@ -28,9 +29,30 @@ function isListening(port: number) {
   });
 }
 
+function isRunnable(command: string) {
+  return new Promise<boolean>((resolve) => {
+    const child = spawn(command, ["--version"], { stdio: "ignore" });
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(false), 1_500);
+    child.once("error", () => finish(false));
+    child.once("exit", (code) => finish(code === 0));
+  });
+}
+
 export async function GET() {
   const port = mcpPort();
-  const online = await isListening(port);
+  const codexCommand = process.env.PAPERTRANS_CODEX_BIN?.trim() || "codex";
+  const [online, codexAvailable] = await Promise.all([
+    isListening(port),
+    isRunnable(codexCommand),
+  ]);
   return NextResponse.json({
     defaultProvider: "chatgpt_connector",
     providers: {
@@ -38,6 +60,12 @@ export async function GET() {
         enabled: true,
         mcpServer: online ? "online" : "offline",
         mcpUrl: `http://${MCP_HOST}:${port}/mcp`,
+        startsInApp: false,
+      },
+      codex_cli: {
+        enabled: true,
+        command: codexCommand,
+        status: codexAvailable ? "available" : "unavailable",
         startsInApp: false,
       },
     },

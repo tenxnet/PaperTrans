@@ -58,6 +58,8 @@ Open `http://127.0.0.1:3000`. Add `--port 3100` if you need a different port. Co
 | ChatGPT Connector | Experimental | Required | ChatGPT usage |
 | OpenAI API | Not implemented | Not required | API usage billing |
 
+Use **Provider settings** in the Web UI sidebar to switch between ChatGPT Connector and Codex CLI. The Codex CLI path generates a command with the selected model and reasoning effort. See [Provider settings](docs/providers.md) for details.
+
 Using ChatGPT as the translation worker requires the local MCP server and a Secure MCP Tunnel. PaperTrans cannot start a ChatGPT conversation directly. See [ChatGPT translation worker](docs/chatgpt-worker.md) for the trust boundary, exposed data, and setup.
 
 ## Scope
@@ -80,6 +82,7 @@ Using ChatGPT as the translation worker requires the local MCP server and a Secu
 
 - [Documentation index](docs/README.md)
 - [ChatGPT translation worker](docs/chatgpt-worker.md)
+- [Provider settings](docs/providers.md)
 - [Experimental PDF pipeline](docs/pdf-pipeline.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)

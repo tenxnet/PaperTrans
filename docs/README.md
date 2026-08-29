@@ -8,6 +8,7 @@
 | --- | --- |
 | [プロジェクトREADME](../README.md) | 対応範囲、Quick Start、翻訳方法の選択 |
 | [ChatGPT翻訳ワーカー](chatgpt-worker.md) | MCPの責任範囲、公開データ、起動、既知の制約 |
+| [Provider設定](providers.md) | ChatGPT ConnectorとCodex CLIの切替方法 |
 | [実験的PDFパイプライン](pdf-pipeline.md) | v1対象外のPDF解析と再レンダリング |
 | [トラブルシューティング](troubleshooting.md) | ポート、Connector、macOS権限、成果物検出 |
 | [コントリビューション](../CONTRIBUTING.md) | 開発環境、検証、Pull Requestの方針 |
@@ -19,6 +20,7 @@
 | --- | --- |
 | [Project README](../README.en.md) | Scope, quick start, and translation method selection |
 | [ChatGPT translation worker](chatgpt-worker.md) | MCP trust boundary, exposed data, startup, and limitations |
+| [Provider settings](providers.md) | Switching between ChatGPT Connector and Codex CLI |
 | [Experimental PDF pipeline](pdf-pipeline.md) | Out-of-scope PDF parsing and re-rendering |
 | [Troubleshooting](troubleshooting.md) | Ports, Connector setup, macOS permissions, and artifact discovery |
 | [Contributing](../CONTRIBUTING.md) | Development setup, validation, and pull-request policy |
