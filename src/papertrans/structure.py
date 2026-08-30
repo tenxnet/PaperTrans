@@ -576,6 +576,30 @@ def analyze_layout(
     return combined
 
 
+def is_near_certain_blank_pixmap(pixmap: fitz.Pixmap) -> bool:
+    """Return true only when a rendered RGB/gray crop contains no visible ink.
+
+    The deliberately strict test retains a crop as soon as any sample is darker
+    than near-white. This avoids discarding sparse rules, dots, or fine diagrams.
+    Unsupported color layouts fail open and are retained for human/QA review.
+    """
+
+    width = int(pixmap.width)
+    height = int(pixmap.height)
+    components = int(pixmap.n) - int(bool(pixmap.alpha))
+    if width <= 0 or height <= 0 or pixmap.alpha or components not in {1, 3}:
+        return False
+    row_bytes = width * components
+    samples = pixmap.samples_mv
+    if int(pixmap.stride) == row_bytes:
+        return re.search(rb"[\x00-\xf9]", samples) is None
+    for row_index in range(height):
+        start = row_index * int(pixmap.stride)
+        if re.search(rb"[\x00-\xf9]", samples[start : start + row_bytes]) is not None:
+            return False
+    return True
+
+
 def render_visual_objects(
     source: Path,
     structure: dict[str, Any],
@@ -587,6 +611,7 @@ def render_visual_objects(
     for page_result in structure["pages"]:
         page_number = int(page_result["pageNumber"])
         page = pdf[page_number - 1]
+        retained_visuals: list[dict[str, Any]] = []
         for visual in page_result["visualObjects"]:
             x0, y0, x1, y1 = [float(value) for value in visual["bboxNormalized"]]
             rect = fitz.Rect(
@@ -598,7 +623,29 @@ def render_visual_objects(
             safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", visual["objectId"]).strip("-")
             asset_name = f"page-{page_number:03d}-{safe_id}.png"
             pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), clip=rect, alpha=False)
-            pixmap.save(output_dir / asset_name)
+            asset_path = output_dir / asset_name
+            if is_near_certain_blank_pixmap(pixmap):
+                asset_path.unlink(missing_ok=True)
+                diagnostic = {
+                    "objectId": str(visual["objectId"]),
+                    "pageNumber": page_number,
+                    "kind": str(visual.get("kind", "unknown")),
+                    "bboxNormalized": list(visual["bboxNormalized"]),
+                    "reason": "Every rendered RGB sample was near-white (>= 250).",
+                }
+                structure.setdefault("renderDiagnostics", {}).setdefault(
+                    "filteredBlankVisuals", []
+                ).append(diagnostic)
+                warning = (
+                    f"Filtered near-certain blank visual {visual['objectId']} on page "
+                    f"{page_number}; embedded descendants remain suppressed."
+                )
+                warnings = structure.setdefault("warnings", [])
+                if warning not in warnings:
+                    warnings.append(warning)
+                continue
+            pixmap.save(asset_path)
+            retained_visuals.append(visual)
             rendered.append(
                 {
                     **visual,
@@ -607,6 +654,7 @@ def render_visual_objects(
                     "bboxPdf": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
                 }
             )
+        page_result["visualObjects"] = retained_visuals
     pdf.close()
     return rendered
 

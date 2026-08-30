@@ -74,6 +74,11 @@ type Manifest = {
   finalizedAt?: string | null;
 };
 
+type ValidManifest = Manifest & {
+  jobId: string;
+  paper: NonNullable<Manifest["paper"]> & { title: string };
+};
+
 type QaDocument = {
   status?: string;
   output?: {
@@ -129,10 +134,14 @@ async function readJson<T>(filename: string): Promise<T | null> {
   }
 }
 
-async function readManifest(root: string): Promise<Manifest | null> {
+async function readManifest(root: string): Promise<ValidManifest | null> {
   for (const filename of MANIFEST_FILENAMES) {
     const manifest = await readJson<Manifest>(path.join(root, "work", filename));
-    if (manifest?.paper?.title && manifest.jobId) return manifest;
+    if (
+      typeof manifest?.jobId === "string"
+      && typeof manifest.paper?.title === "string"
+      && manifest.paper.title.trim()
+    ) return manifest as ValidManifest;
   }
   return null;
 }
@@ -147,14 +156,21 @@ function defaultArtifact(slug: string, kind: ArtifactKind): string | null {
 /** Resolve a manifest-owned artifact without allowing absolute paths, traversal, or symlink escape. */
 export async function resolvePaperArtifact(
   root: string,
-  candidate: string | undefined,
+  candidate: unknown,
   fallback: string | null,
   kind: ArtifactKind,
 ): Promise<string | null> {
-  const relative = candidate?.trim() || fallback;
-  if (!relative || path.isAbsolute(relative) || path.extname(relative).toLowerCase() !== ARTIFACT_EXTENSIONS[kind]) {
-    return null;
-  }
+  const relative = candidate === undefined
+    ? fallback
+    : typeof candidate === "string"
+      ? candidate.trim()
+      : null;
+  if (
+    !relative
+    || path.isAbsolute(relative)
+    || path.extname(relative).toLowerCase() !== ARTIFACT_EXTENSIONS[kind]
+  ) return null;
+
   const resolvedRoot = path.resolve(root);
   const resolved = path.resolve(resolvedRoot, relative);
   if (resolved === resolvedRoot || !resolved.startsWith(`${resolvedRoot}${path.sep}`)) return null;
@@ -206,7 +222,7 @@ export async function findPaperArtifact(
   if (!JOB_ID.test(slug)) return null;
   const root = path.join(OUTPUT_ROOT, slug);
   const manifest = await readManifest(root);
-  if (!manifest || manifest.status !== "completed") return null;
+  if (!manifest || !["completed", "needs_review"].includes(manifest.status ?? "")) return null;
   return resolvePaperArtifact(
     root,
     manifest.artifacts?.[kind],
@@ -293,6 +309,17 @@ function normalizeStatus(status: string | undefined): PaperStatus {
 
 function normalizeTargetLanguage(targetLanguage: string | undefined): "ja" {
   return targetLanguage === "ja" ? targetLanguage : "ja";
+}
+
+function manifestSourceType(manifest: ValidManifest): string {
+  if (typeof manifest.sourceType === "string" && manifest.sourceType.trim()) {
+    return manifest.sourceType.trim().toLowerCase();
+  }
+  return manifest.paper.resolvedArxivId
+    || manifest.paper.requestedArxivId
+    || /^https?:\/\/(?:[^/]+\.)?arxiv\.org\//i.test(manifest.paper.sourceUrl ?? "")
+    ? "arxiv"
+    : "unknown";
 }
 
 function displayTitle(value: string): string {
@@ -398,25 +425,28 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
       .map(async (entry): Promise<PaperSummary | null> => {
         const root = path.join(OUTPUT_ROOT, entry.name);
         const manifest = await readManifest(root);
-        const paper = manifest?.paper;
-        if (!manifest || !paper?.title) return null;
+        if (!manifest) return null;
         const artifacts = await artifactPaths(root, entry.name, manifest);
         const qa = artifacts.qa ? await readJson<QaDocument>(artifacts.qa) : null;
         const sourceMetadata = await readSourceMetadata(root);
         const libraryState = currentPaperState(metadata, entry.name);
-        const chunks = manifest.chunks ?? [];
+        const chunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
         const completed = chunks.filter((chunk) => chunk.status === "completed").length;
-        const hasArtifact = manifest.status === "completed" && artifacts.html !== null && qa !== null;
+        const artifactStatus = ["completed", "needs_review"].includes(manifest.status ?? "");
+        const hasArtifact = artifactStatus && artifacts.html !== null && qa !== null;
         const htmlRoute = hasArtifact ? artifactRoute(entry.name, root, artifacts.html) : null;
+        const hasDownload = qa !== null
+          && artifactStatus
+          && artifacts.bundle !== null;
         return {
           slug: entry.name,
-          sourceType: manifest.sourceType ?? (paper.resolvedArxivId ? "arxiv" : "unknown"),
-          title: displayTitle(paper.title),
-          authors: paper.authors?.length ? paper.authors : sourceMetadata.authors,
-          publishedAt: normalizePublishedAt(paper.publishedAt ?? null) ?? sourceMetadata.publishedAt,
-          requestedArxivId: paper.requestedArxivId ?? "",
-          resolvedArxivId: paper.resolvedArxivId ?? paper.requestedArxivId ?? "",
-          sourceUrl: paper.sourceUrl ?? "",
+          sourceType: manifestSourceType(manifest),
+          title: displayTitle(manifest.paper.title),
+          authors: manifest.paper.authors?.length ? manifest.paper.authors : sourceMetadata.authors,
+          publishedAt: normalizePublishedAt(manifest.paper.publishedAt ?? null) ?? sourceMetadata.publishedAt,
+          requestedArxivId: manifest.paper.requestedArxivId ?? "",
+          resolvedArxivId: manifest.paper.resolvedArxivId ?? manifest.paper.requestedArxivId ?? "",
+          sourceUrl: manifest.paper.sourceUrl ?? "",
           provider: manifest.provider ?? "unknown",
           targetLanguage: normalizeTargetLanguage(manifest.settings?.targetLanguage),
           status: normalizeStatus(manifest.status),
@@ -428,7 +458,7 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
           createdAt: manifest.createdAt ?? manifest.updatedAt ?? new Date(0).toISOString(),
           finalizedAt: manifest.finalizedAt ?? null,
           artifactUrl: htmlRoute,
-          downloadUrl: hasArtifact && artifacts.bundle ? `/api/papers/${entry.name}/download` : null,
+          downloadUrl: hasDownload ? `/api/papers/${entry.name}/download` : null,
           qa: {
             status: qa?.status === "passed" ? "passed" : qa ? "failed" : "missing",
             figures: qa?.output?.figures ?? 0,

@@ -90,7 +90,7 @@ function authorLabel(paper: PaperSummary, locale: AppLocale) {
 function sourceLabel(paper: PaperSummary) {
   if (paper.resolvedArxivId) return `arXiv:${paper.resolvedArxivId}`;
   if (paper.sourceType === "pdf") return "PDF";
-  return paper.sourceType === "unknown" ? "PDF" : paper.sourceType.toUpperCase();
+  return paper.sourceType === "unknown" ? "DOCUMENT" : paper.sourceType.toUpperCase();
 }
 
 function progressPercent(paper: PaperSummary) {
@@ -640,7 +640,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div><dt>{text.addedAt}</dt><dd>{formatPaperDate(selected.createdAt, locale)}</dd></div>
                   <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
-                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{text.openSource}<ArrowSquareOut /></a>}
+                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{selected.sourceType === "arxiv" ? text.openArxivSource : text.openSource}<ArrowSquareOut /></a>}
               </section>
             </aside>
           </section>

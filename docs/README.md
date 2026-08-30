@@ -16,6 +16,8 @@
 | --- | --- |
 | [MCP翻訳サーバー](mcp-server.md) | MCPの責任範囲、公開データ、起動、既知の制約 |
 | [実験的PDFパイプライン](pdf-pipeline.md) | v1対象外のPDF解析と再レンダリング |
+| [Docling比較PoC](pdf-parser-poc-2026-08-30.md) | 公開論文10本・216ページの自動比較結果と残課題 |
+| [PDF翻訳バックエンド評価](pdf-translation-backends.md) | BabelDOC隔離案、harumi比較、成果物契約と採用基準 |
 | [依存ライセンス監査](dependency-licenses.md) | ロック済み依存のライセンス確認結果と注意点 |
 | [セキュリティポリシー](../SECURITY.md) | 脅威境界、報告手順、受容リスク |
 | [コントリビューション](../CONTRIBUTING.md) | 開発環境、検証、Pull Requestの方針 |
@@ -35,6 +37,8 @@
 | --- | --- |
 | [MCP translation server](mcp-server.md) | MCP trust boundary, exposed data, startup, and limitations |
 | [Experimental PDF pipeline](pdf-pipeline.md) | Out-of-scope PDF parsing and re-rendering |
+| [Docling comparison PoC](pdf-parser-poc-2026-08-30.md) | Automated results and remaining gates from 10 papers and 216 pages |
+| [PDF translation backend evaluation](pdf-translation-backends.md) | BabelDOC isolation, harumi comparison, artifact contract, and adoption gates |
 | [Dependency license audit](dependency-licenses.md) | License review results and caveats for locked dependencies |
 | [Security policy](../SECURITY.md) | Threat boundaries, reporting process, and accepted risk |
 | [Contributing](../CONTRIBUTING.md) | Development setup, validation, and pull-request policy |
