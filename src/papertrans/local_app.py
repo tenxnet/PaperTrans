@@ -27,6 +27,7 @@ from .local_setup import (
     setup_status,
     validate_repository,
 )
+from .pdf_import_status import inspect_pdf_import
 
 
 def _path(value: str) -> Path:
@@ -174,10 +175,15 @@ def _status(args: argparse.Namespace) -> int:
     state = read_runtime_state(paths)
     web_ready = probe_web(args.web_port)
     mcp_ready = probe_mcp(args.mcp_port)
+    pdf_import = inspect_pdf_import(paths.output_root)
     value = {
         "ready": web_ready and mcp_ready,
+        "safeToModifyArtifacts": (
+            not web_ready and not mcp_ready and pdf_import["active"] is False
+        ),
         "web": {"ready": web_ready, "url": f"http://127.0.0.1:{args.web_port}/"},
         "mcp": {"ready": mcp_ready, "url": f"http://127.0.0.1:{args.mcp_port}/mcp"},
+        "pdfImport": pdf_import,
         "state": state,
     }
     if args.json:
@@ -186,6 +192,14 @@ def _status(args: argparse.Namespace) -> int:
         print(f"PaperTrans services: {'ready' if value['ready'] else 'not ready'}")
         print(f"  Web: {'ready' if value['web']['ready'] else 'stopped'} — {value['web']['url']}")
         print(f"  MCP: {'ready' if value['mcp']['ready'] else 'stopped'} — {value['mcp']['url']}")
+        print(
+            "  PDF import: "
+            f"{pdf_import['state']} — {pdf_import['detail']}"
+        )
+        print(
+            "  Artifact maintenance: "
+            f"{'safe' if value['safeToModifyArtifacts'] else 'wait'}"
+        )
     return 0 if value["ready"] else 1
 
 
