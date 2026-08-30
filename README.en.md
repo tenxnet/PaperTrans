@@ -103,17 +103,20 @@ Priorities and specifications may change as experiments and issues provide new e
 ## Documentation
 
 - [MCP client setup](docs/mcp-client-setup.md)
+- [Updates, backups, and uninstalling](docs/local-data-lifecycle.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Documentation index](docs/README.md)
 - [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [Maintainer release runbook](RELEASING.md)
 
 ## Development and validation
 
 ```bash
-.venv/bin/pytest -q
+uv run --frozen --extra test pytest -q
 pnpm typecheck
+pnpm test:pdf-import-admission
 pnpm build
 ```
 

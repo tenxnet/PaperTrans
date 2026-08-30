@@ -34,14 +34,30 @@ To exercise the complete release-candidate runtime, including the Docling models
 Run the relevant checks before opening a pull request:
 
 ```bash
-uv run pytest -q
+uv run --frozen --extra test pytest -q
 pnpm typecheck
+pnpm test:pdf-import-admission
 pnpm build
 ```
 
-Changes to a repository Skill should also pass its quick validation where applicable.
+Changes to an experimental PDF worker also require its isolated checks:
+
+```bash
+PYTHONPATH=workers/babeldoc/worker/src uv run --frozen --extra test pytest -p no:cacheprovider workers/babeldoc/worker/tests -q
+docker buildx build --check workers/babeldoc
+docker buildx build --check workers/harumi
+cargo +1.88.0 test --locked --manifest-path workers/harumi/Cargo.toml
+```
+
+The BabelDOC command tests the adapter with metadata fakes and does not install
+or execute the evaluation engine. Changes to a repository Skill should also
+pass its quick validation where applicable.
 
 Documentation changes should keep the Japanese and English root READMEs aligned and avoid duplicating detailed setup that belongs under `docs/`.
+
+Maintainers preparing a tag must follow [RELEASING.md](RELEASING.md). A green
+run for an older commit, a setup using an existing model cache, or `--offline`
+without an actual network denial does not satisfy the RC release gate.
 
 ## Pull requests
 

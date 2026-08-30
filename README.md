@@ -103,17 +103,20 @@ Web UIはジョブ準備、進捗、成果物を管理します。使用モデ�
 ## ドキュメント
 
 - [MCPクライアント登録](docs/mcp-client-setup.md)
+- [更新・バックアップ・アンインストール](docs/local-data-lifecycle.md)
 - [トラブルシューティング](docs/troubleshooting.md)
 - [ドキュメント索引](docs/README.md)
 - [変更履歴](CHANGELOG.md)
 - [セキュリティポリシー](SECURITY.md)
 - [コントリビューション](CONTRIBUTING.md)
+- [メンテナー向けリリース手順](RELEASING.md)
 
 ## 開発と検証
 
 ```bash
-.venv/bin/pytest -q
+uv run --frozen --extra test pytest -q
 pnpm typecheck
+pnpm test:pdf-import-admission
 pnpm build
 ```
 

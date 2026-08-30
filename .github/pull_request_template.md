@@ -10,9 +10,11 @@ Describe the user-visible result.
 
 ## Validation
 
-- [ ] `uv run pytest -q`
+- [ ] `uv run --frozen --extra test pytest -q`
 - [ ] `pnpm typecheck`
+- [ ] `pnpm test:pdf-import-admission`
 - [ ] `pnpm build`
+- [ ] Experimental-worker checks are not applicable or passed as documented in `CONTRIBUTING.md`.
 - [ ] Relevant Firefox/Chromium behavior was checked when UI or generated HTML changed.
 
 ## Translation fidelity
