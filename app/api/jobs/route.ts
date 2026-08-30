@@ -11,7 +11,12 @@ const activeJobs = new Set<string>();
 
 function normalizeArxivId(value: unknown) {
   if (typeof value !== "string") return null;
-  return value.trim().match(/(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.[1] ?? null;
+  return (
+    value
+      .trim()
+      .match(/(?:arxiv:\s*)?((?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*\/\d{7})(?:v\d+)?)/i)?.[1]
+      ?.toLowerCase() ?? null
+  );
 }
 
 function resolvedRoot(configured: string | undefined, fallback: string) {
@@ -35,7 +40,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "有効なarXiv IDまたはURLを入力してください" }, { status: 400 });
   }
 
-  const jobId = `arxiv-${arxivId.toLowerCase()}-mcp`;
+  const jobId = `arxiv-${arxivId.replace("/", "-")}-mcp`;
   if (activeJobs.has(jobId)) {
     return NextResponse.json({ error: "この論文のジョブを準備中です", jobId }, { status: 409 });
   }

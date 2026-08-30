@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type PaperStatus =
@@ -11,6 +11,7 @@ export type PaperStatus =
 
 export type PaperSummary = {
   slug: string;
+  sourceType: string;
   title: string;
   authors: string[];
   publishedAt: string | null;
@@ -42,9 +43,11 @@ export type PaperSummary = {
 };
 
 type Manifest = {
+  schemaVersion?: string | number;
   jobId?: string;
   status?: string;
   provider?: string;
+  sourceType?: string;
   settings?: {
     targetLanguage?: string;
   };
@@ -57,6 +60,15 @@ type Manifest = {
     publishedAt?: string | null;
   };
   chunks?: Array<{ status?: string }>;
+  artifacts?: {
+    html?: string;
+    qa?: string;
+    bundle?: string;
+    translatedPdf?: string;
+    indexPath?: string;
+    bundlePath?: string;
+    artifactRoute?: string;
+  };
   createdAt?: string;
   updatedAt?: string;
   finalizedAt?: string | null;
@@ -68,6 +80,7 @@ type QaDocument = {
     figures?: number;
     tables?: number;
     visibleMath?: number;
+    math?: number;
     bibliographyEntries?: number;
   };
   unresolvedInternalLinks?: number;
@@ -97,6 +110,16 @@ const REPO_ROOT = process.cwd();
 const OUTPUT_ROOT = path.join(REPO_ROOT, "output");
 const DATA_ROOT = path.join(REPO_ROOT, "data");
 const LIBRARY_METADATA = path.join(DATA_ROOT, "library.json");
+const MANIFEST_FILENAMES = ["papertrans-job.json", "mcp-job.json", "chatgpt-job.json"] as const;
+
+type ArtifactKind = "html" | "qa" | "bundle" | "translatedPdf";
+
+const ARTIFACT_EXTENSIONS: Record<ArtifactKind, string> = {
+  html: ".html",
+  qa: ".json",
+  bundle: ".zip",
+  translatedPdf: ".pdf",
+};
 
 async function readJson<T>(filename: string): Promise<T | null> {
   try {
@@ -104,6 +127,92 @@ async function readJson<T>(filename: string): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+async function readManifest(root: string): Promise<Manifest | null> {
+  for (const filename of MANIFEST_FILENAMES) {
+    const manifest = await readJson<Manifest>(path.join(root, "work", filename));
+    if (manifest?.paper?.title && manifest.jobId) return manifest;
+  }
+  return null;
+}
+
+function defaultArtifact(slug: string, kind: ArtifactKind): string | null {
+  if (kind === "html") return "html/index.html";
+  if (kind === "qa") return "html/qa.json";
+  if (kind === "bundle") return `${slug}-html.zip`;
+  return null;
+}
+
+/** Resolve a manifest-owned artifact without allowing absolute paths, traversal, or symlink escape. */
+export async function resolvePaperArtifact(
+  root: string,
+  candidate: string | undefined,
+  fallback: string | null,
+  kind: ArtifactKind,
+): Promise<string | null> {
+  const relative = candidate?.trim() || fallback;
+  if (!relative || path.isAbsolute(relative) || path.extname(relative).toLowerCase() !== ARTIFACT_EXTENSIONS[kind]) {
+    return null;
+  }
+  const resolvedRoot = path.resolve(root);
+  const resolved = path.resolve(resolvedRoot, relative);
+  if (resolved === resolvedRoot || !resolved.startsWith(`${resolvedRoot}${path.sep}`)) return null;
+  try {
+    const [canonicalRoot, canonicalArtifact, artifactStat] = await Promise.all([
+      realpath(resolvedRoot),
+      realpath(resolved),
+      stat(resolved),
+    ]);
+    if (!artifactStat.isFile()) return null;
+    if (
+      canonicalArtifact === canonicalRoot
+      || !canonicalArtifact.startsWith(`${canonicalRoot}${path.sep}`)
+    ) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+async function artifactPaths(root: string, slug: string, manifest: Manifest) {
+  const entries = await Promise.all(
+    (["html", "qa", "bundle", "translatedPdf"] as const).map(async (kind) => [
+      kind,
+      await resolvePaperArtifact(
+        root,
+        manifest.artifacts?.[kind],
+        defaultArtifact(slug, kind),
+        kind,
+      ),
+    ] as const),
+  );
+  return Object.fromEntries(entries) as Record<ArtifactKind, string | null>;
+}
+
+function artifactRoute(slug: string, root: string, htmlArtifact: string | null): string | null {
+  if (!htmlArtifact) return null;
+  const publicationRoot = path.join(root, "html");
+  const relative = path.relative(publicationRoot, htmlArtifact);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+  const encoded = relative.split(path.sep).map(encodeURIComponent).join("/");
+  return `/api/artifacts/${encodeURIComponent(slug)}/${encoded}`;
+}
+
+export async function findPaperArtifact(
+  slug: string,
+  kind: "bundle" | "translatedPdf",
+): Promise<string | null> {
+  if (!JOB_ID.test(slug)) return null;
+  const root = path.join(OUTPUT_ROOT, slug);
+  const manifest = await readManifest(root);
+  if (!manifest || manifest.status !== "completed") return null;
+  return resolvePaperArtifact(
+    root,
+    manifest.artifacts?.[kind],
+    defaultArtifact(slug, kind),
+    kind,
+  );
 }
 
 async function loadMetadata(): Promise<LibraryMetadata> {
@@ -288,25 +397,26 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
       .filter((entry) => entry.isDirectory() && JOB_ID.test(entry.name))
       .map(async (entry): Promise<PaperSummary | null> => {
         const root = path.join(OUTPUT_ROOT, entry.name);
-        const manifest = (
-          await readJson<Manifest>(path.join(root, "work", "mcp-job.json"))
-          ?? await readJson<Manifest>(path.join(root, "work", "chatgpt-job.json"))
-        );
-        if (!manifest?.paper?.title || !manifest.jobId) return null;
-        const qa = await readJson<QaDocument>(path.join(root, "html", "qa.json"));
+        const manifest = await readManifest(root);
+        const paper = manifest?.paper;
+        if (!manifest || !paper?.title) return null;
+        const artifacts = await artifactPaths(root, entry.name, manifest);
+        const qa = artifacts.qa ? await readJson<QaDocument>(artifacts.qa) : null;
         const sourceMetadata = await readSourceMetadata(root);
         const libraryState = currentPaperState(metadata, entry.name);
         const chunks = manifest.chunks ?? [];
         const completed = chunks.filter((chunk) => chunk.status === "completed").length;
-        const hasArtifact = manifest.status === "completed" && qa !== null;
+        const hasArtifact = manifest.status === "completed" && artifacts.html !== null && qa !== null;
+        const htmlRoute = hasArtifact ? artifactRoute(entry.name, root, artifacts.html) : null;
         return {
           slug: entry.name,
-          title: displayTitle(manifest.paper.title),
-          authors: manifest.paper.authors?.length ? manifest.paper.authors : sourceMetadata.authors,
-          publishedAt: normalizePublishedAt(manifest.paper.publishedAt ?? null) ?? sourceMetadata.publishedAt,
-          requestedArxivId: manifest.paper.requestedArxivId ?? "",
-          resolvedArxivId: manifest.paper.resolvedArxivId ?? manifest.paper.requestedArxivId ?? "",
-          sourceUrl: manifest.paper.sourceUrl ?? "",
+          sourceType: manifest.sourceType ?? (paper.resolvedArxivId ? "arxiv" : "unknown"),
+          title: displayTitle(paper.title),
+          authors: paper.authors?.length ? paper.authors : sourceMetadata.authors,
+          publishedAt: normalizePublishedAt(paper.publishedAt ?? null) ?? sourceMetadata.publishedAt,
+          requestedArxivId: paper.requestedArxivId ?? "",
+          resolvedArxivId: paper.resolvedArxivId ?? paper.requestedArxivId ?? "",
+          sourceUrl: paper.sourceUrl ?? "",
           provider: manifest.provider ?? "unknown",
           targetLanguage: normalizeTargetLanguage(manifest.settings?.targetLanguage),
           status: normalizeStatus(manifest.status),
@@ -317,13 +427,13 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
           updatedAt: manifest.updatedAt ?? manifest.createdAt ?? new Date(0).toISOString(),
           createdAt: manifest.createdAt ?? manifest.updatedAt ?? new Date(0).toISOString(),
           finalizedAt: manifest.finalizedAt ?? null,
-          artifactUrl: hasArtifact ? `/api/artifacts/${entry.name}/index.html` : null,
-          downloadUrl: hasArtifact ? `/api/papers/${entry.name}/download` : null,
+          artifactUrl: htmlRoute,
+          downloadUrl: hasArtifact && artifacts.bundle ? `/api/papers/${entry.name}/download` : null,
           qa: {
             status: qa?.status === "passed" ? "passed" : qa ? "failed" : "missing",
             figures: qa?.output?.figures ?? 0,
             tables: qa?.output?.tables ?? 0,
-            math: qa?.output?.visibleMath ?? 0,
+            math: qa?.output?.visibleMath ?? qa?.output?.math ?? 0,
             bibliographyEntries: qa?.output?.bibliographyEntries ?? 0,
             unresolvedInternalLinks: qa?.unresolvedInternalLinks ?? 0,
             missingLocalAssets: qa?.missingLocalAssets?.length ?? 0,

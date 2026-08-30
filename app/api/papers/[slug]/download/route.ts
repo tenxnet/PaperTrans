@@ -1,7 +1,6 @@
 import { readFile } from "node:fs/promises";
-import path from "node:path";
 import { NextResponse } from "next/server";
-import { findPaper } from "@/lib/paper-library";
+import { findPaper, findPaperArtifact } from "@/lib/paper-library";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,8 +15,10 @@ export async function GET(
     return NextResponse.json({ error: "bundle not found" }, { status: 404 });
   }
   try {
+    const artifact = await findPaperArtifact(slug, "bundle");
+    if (!artifact) throw new Error("bundle not found");
     const filename = `${slug}-html.zip`;
-    const body = await readFile(path.join(process.cwd(), "output", slug, filename));
+    const body = await readFile(artifact);
     return new NextResponse(body, {
       headers: {
         "content-type": "application/zip",
@@ -29,4 +30,3 @@ export async function GET(
     return NextResponse.json({ error: "bundle not found" }, { status: 404 });
   }
 }
-

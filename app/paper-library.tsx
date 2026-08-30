@@ -46,7 +46,12 @@ type CreatedJob = {
 };
 
 function arxivIdFromInput(value: string) {
-  return value.trim().match(/(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.[1] ?? "";
+  return (
+    value
+      .trim()
+      .match(/(?:arxiv:\s*)?((?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*\/\d{7})(?:v\d+)?)/i)?.[1]
+      ?.toLowerCase() ?? ""
+  );
 }
 
 function isActive(paper: PaperSummary) {
@@ -80,6 +85,12 @@ function authorLabel(paper: PaperSummary, locale: AppLocale) {
   const text = UI_TEXT[locale];
   if (!paper.authors.length) return text.noAuthor;
   return paper.authors.length > 1 ? text.otherAuthors(paper.authors[0]) : paper.authors[0];
+}
+
+function sourceLabel(paper: PaperSummary) {
+  if (paper.resolvedArxivId) return `arXiv:${paper.resolvedArxivId}`;
+  if (paper.sourceType === "pdf") return "PDF";
+  return paper.sourceType === "unknown" ? "PDF" : paper.sourceType.toUpperCase();
 }
 
 function progressPercent(paper: PaperSummary) {
@@ -546,7 +557,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <ArrowLeft aria-hidden="true" />{text.backToLibrary}
                 </button>
                 <div className="reader-title">
-                  <small>arXiv:{selected.resolvedArxivId}</small>
+                  <small>{sourceLabel(selected)}</small>
                   <h1>{selected.title}</h1>
                 </div>
                 <div className="reader-actions">
@@ -629,7 +640,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div><dt>{text.addedAt}</dt><dd>{formatPaperDate(selected.createdAt, locale)}</dd></div>
                   <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
-                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{text.openArxivSource}<ArrowSquareOut /></a>}
+                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{text.openSource}<ArrowSquareOut /></a>}
               </section>
             </aside>
           </section>
@@ -660,7 +671,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     <span className="paper-type"><FileText weight="duotone" aria-hidden="true" /></span>
                     <span className="paper-copy">
                       <span className="paper-kicker">
-                        <span>arXiv:{paper.resolvedArxivId}</span>
+                        <span>{sourceLabel(paper)}</span>
                         <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{text.status[paper.status]}</span>
                       </span>
                       <strong>{paper.title}</strong>

@@ -56,7 +56,18 @@ export async function POST(request: Request) {
   const log = await open(path.join(outputDir, "job.log"), "a");
   const child = spawn(
     path.join(process.cwd(), ".venv", "bin", "papertrans"),
-    ["pipeline", path.join(paperDir, "source.pdf"), "--slug", slug, "--repo-root", process.cwd()],
+    [
+      "semantic-pipeline",
+      path.join(paperDir, "source.pdf"),
+      "--slug",
+      slug,
+      "--repo-root",
+      process.cwd(),
+      "--structure-mode",
+      "hybrid",
+      "--layout-parser",
+      "docling",
+    ],
     { cwd: process.cwd(), detached: true, stdio: ["ignore", log.fd, log.fd] },
   );
   child.unref();
