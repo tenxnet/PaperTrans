@@ -62,7 +62,9 @@ type Manifest = {
   chunks?: Array<{ status?: string }>;
   artifacts?: {
     html?: string;
+    markdown?: string;
     qa?: string;
+    markdownQa?: string;
     bundle?: string;
     translatedPdf?: string;
     indexPath?: string;

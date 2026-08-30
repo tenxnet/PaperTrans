@@ -145,7 +145,9 @@ def write_pdf_job_manifest(
         "finalizedAt": now if status in {"completed", "needs_review", "failed"} else None,
         "artifacts": {
             "html": "html/index.html",
+            "markdown": "html/index.md",
             "qa": "html/qa.json",
+            "markdownQa": "html/markdown-qa.json",
             "bundle": f"{slug}-html.zip",
             "sourcePdf": "html/source.pdf",
         },

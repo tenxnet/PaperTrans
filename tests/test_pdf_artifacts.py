@@ -71,6 +71,8 @@ def test_writes_source_neutral_pdf_manifest(tmp_path: Path):
     assert manifest["paper"]["authors"] == ["Ada Example"]
     assert manifest["settings"]["pdfParser"] == "docling"
     assert manifest["artifacts"]["html"] == "html/index.html"
+    assert manifest["artifacts"]["markdown"] == "html/index.md"
+    assert manifest["artifacts"]["markdownQa"] == "html/markdown-qa.json"
     assert all(chunk["status"] == "completed" for chunk in manifest["chunks"])
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["jobId"] == "paper"
 

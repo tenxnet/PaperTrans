@@ -127,8 +127,14 @@ def test_trailing_unheaded_figures_do_not_become_reference_children(
         if section["title"]["original"] == "References"
     )
     assert all(item["type"] != "visual" for item in references["content"])
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "figure-1.png").write_bytes(b"png")
     html = render_semantic_document(document, tmp_path, tmp_path / "html")
     assert ">Supplemental Material</h" not in html.read_text(encoding="utf-8")
+    markdown_qa = json.loads(
+        (tmp_path / "html" / "markdown-qa.json").read_text(encoding="utf-8")
+    )
+    assert markdown_qa["status"] == "passed"
 
 
 def test_join_source_parts_only_closes_a_verified_singleton_quote():
@@ -401,6 +407,8 @@ def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
         ' See "https://example.org/a-path?x=1&y=2" now.'
     )
     paragraph["japanese"] = paragraph["original"]
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "figure-1.png").write_bytes(b"png")
     index = render_semantic_document(document, tmp_path, tmp_path / "html")
     text = index.read_text(encoding="utf-8")
     markdown = (tmp_path / "html" / "index.md").read_text(encoding="utf-8")
@@ -420,6 +428,18 @@ def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
     assert "![Figure 1](assets/figure-1.png)" in markdown
     assert '<a id="ref-1"></a>' in markdown
     assert "Page 1" not in markdown
+    markdown_qa = json.loads(
+        (tmp_path / "html" / "markdown-qa.json").read_text(encoding="utf-8")
+    )
+    assert markdown_qa == {
+        "schemaVersion": 1,
+        "status": "passed",
+        "blocks": markdown_qa["blocks"],
+        "anchors": markdown_qa["anchors"],
+        "duplicateAnchors": [],
+        "unresolvedInternalLinks": [],
+        "missingLocalAssets": [],
+    }
 
 
 def test_semantic_translation_is_explicitly_sol_high(tmp_path: Path):
