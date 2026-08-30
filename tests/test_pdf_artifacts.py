@@ -581,6 +581,39 @@ def test_pdf_qa_rejects_title_only_semantic_output(tmp_path: Path):
     assert qa["output"]["semanticBodyUnits"] == 0
 
 
+def test_semantic_pipeline_prepare_for_mcp_is_a_distinct_cli_mode() -> None:
+    args = cli._parser().parse_args(
+        [
+            "semantic-pipeline",
+            "paper.pdf",
+            "--slug",
+            "paper",
+            "--prepare-for-mcp",
+        ]
+    )
+
+    assert args.prepare_for_mcp is True
+    assert args.skip_translation is False
+    assert cli._semantic_pipeline_status(
+        {"status": "passed"},
+        {"status": "structured"},
+        skip_translation=True,
+        prepare_for_mcp=True,
+    ) == "prepared"
+    assert cli._semantic_pipeline_status(
+        {"status": "passed"},
+        {"status": "structured"},
+        skip_translation=True,
+        prepare_for_mcp=False,
+    ) == "needs_review"
+    assert cli._semantic_pipeline_status(
+        {"status": "failed"},
+        {"status": "structured"},
+        skip_translation=True,
+        prepare_for_mcp=True,
+    ) == "failed"
+
+
 def test_semantic_pipeline_marks_manifest_failed_on_keyboard_interrupt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -595,6 +628,7 @@ def test_semantic_pipeline_marks_manifest_failed_on_keyboard_interrupt(
         layout_parser="docling",
         structure_mode="hybrid",
         skip_translation=True,
+        prepare_for_mcp=False,
     )
     monkeypatch.setattr(cli, "_parser", lambda: SimpleNamespace(parse_args=lambda: args))
     monkeypatch.setattr(

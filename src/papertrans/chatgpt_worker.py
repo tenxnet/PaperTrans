@@ -17,7 +17,12 @@ from .arxiv_html import (
     normalize_article_document,
     render_arxiv_html_document,
 )
-from .pdf_artifacts import write_pdf_job_manifest, write_semantic_pdf_qa
+from .pdf_artifacts import (
+    PDF_MCP_MAX_CHARACTERS,
+    pdf_translation_chunks,
+    write_pdf_job_manifest,
+    write_semantic_pdf_qa,
+)
 from .render import arxiv_html_artifact_version, create_bundle
 from .semantic import iter_translatable_units
 from .semantic_render import render_semantic_document
@@ -59,46 +64,11 @@ def _pdf_unit_map(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(unit["id"]): unit for unit in iter_translatable_units(document)}
 
 
-def _pdf_chunk_sections(
-    units: list[dict[str, Any]], document: dict[str, Any]
-) -> list[str]:
-    section_titles = {
-        str(section["id"]): str(section["title"].get("original", "")).strip()
-        for section in document.get("sections", [])
-    }
-    labels: list[str] = []
-    for unit in units:
-        section_id = str(unit.get("sectionId") or "")
-        label = section_titles.get(section_id) or "Front matter"
-        if label not in labels:
-            labels.append(label)
-    return labels
-
-
-def _pdf_chunks(
-    document: dict[str, Any], max_characters: int
-) -> list[list[dict[str, Any]]]:
-    chunks: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_size = 0
-    for unit in iter_translatable_units(document):
-        size = len(str(unit.get("original", "")))
-        if current and current_size + size > max_characters:
-            chunks.append(current)
-            current = []
-            current_size = 0
-        current.append(unit)
-        current_size += size
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 def _derive_pdf_mcp_manifest(
     source_manifest: dict[str, Any], document: dict[str, Any]
 ) -> dict[str, Any]:
-    max_characters = 9000
-    chunks = _pdf_chunks(document, max_characters)
+    max_characters = PDF_MCP_MAX_CHARACTERS
+    chunks = pdf_translation_chunks(document, max_characters)
     if not chunks:
         raise TranslationJobError("the PDF semantic document contains no translatable blocks")
     now = _now()
@@ -115,17 +85,7 @@ def _derive_pdf_mcp_manifest(
             "maxCharacters": max_characters,
             "targetLanguage": DEFAULT_TARGET_LANGUAGE,
         },
-        "chunks": [
-            {
-                "chunkId": f"chunk-{index:03d}",
-                "index": index,
-                "status": "pending",
-                "unitIds": [str(unit["id"]) for unit in chunk],
-                "characters": sum(len(str(unit.get("original", ""))) for unit in chunk),
-                "sections": _pdf_chunk_sections(chunk, document),
-            }
-            for index, chunk in enumerate(chunks, start=1)
-        ],
+        "chunks": chunks,
         "createdAt": source_manifest.get("createdAt", now),
         "updatedAt": now,
         "finalizedAt": None,
@@ -208,6 +168,22 @@ class MCPTranslationStore:
                 source_manifest
             ):
                 raise TranslationJobError(f"unsupported PDF job schema for {job_id}")
+            legacy_qa_path = paths["html"] / "qa.json"
+            legacy_prepared = False
+            if (
+                source_manifest.get("status") == "needs_review"
+                and source_manifest.get("provider") == "none"
+                and legacy_qa_path.is_file()
+            ):
+                try:
+                    legacy_qa = json.loads(legacy_qa_path.read_text(encoding="utf-8"))
+                    legacy_prepared = legacy_qa.get("status") == "passed"
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    legacy_prepared = False
+            if source_manifest.get("status") != "prepared" and not legacy_prepared:
+                raise TranslationJobError(
+                    f"PDF job is not ready for MCP translation: {job_id}"
+                )
             document = json.loads(
                 paths["semantic_document"].read_text(encoding="utf-8")
             )
@@ -456,6 +432,12 @@ class MCPTranslationStore:
             started_at=str(manifest.get("createdAt") or _now()),
             provider="mcp",
             source_sha256=str(manifest.get("source", {}).get("sha256", "")) or None,
+            updated_at=str(manifest.get("updatedAt") or _now()),
+            finalized_at=(
+                str(manifest["finalizedAt"])
+                if manifest.get("finalizedAt")
+                else None
+            ),
         )
 
     def list_jobs(self) -> list[dict[str, Any]]:
@@ -689,6 +671,11 @@ class MCPTranslationStore:
     def finalize(self, job_id: str) -> dict[str, Any]:
         manifest, paths = self._load_manifest(job_id)
         if self._artifacts_current(manifest, paths):
+            if _is_pdf_job(manifest):
+                document = self._load_document(manifest, paths)
+                self._sync_pdf_job_manifest(
+                    manifest, document, paths, str(manifest["status"])
+                )
             summary = self._summary(manifest, paths)
             summary.update(
                 {
@@ -744,6 +731,20 @@ class MCPTranslationStore:
             )
             if qa.get("status") != "passed":
                 raise TranslationJobError("PDF HTML artifact QA failed")
+            empty_text_pages = [
+                int(page)
+                for page in qa.get("emptyTextPages", [])
+                if isinstance(page, int)
+            ]
+            if empty_text_pages:
+                warnings.append(
+                    "empty text pages: " + ", ".join(str(page) for page in empty_text_pages)
+                )
+                document["status"] = "needs_review"
+                _atomic_write_json(document_path, document)
+                index_path = render_semantic_document(
+                    document, paths["work"], paths["html"], source_pdf
+                )
             final_status = "needs_review" if warnings else "completed"
             renderer_version = PDF_MCP_ARTIFACT_VERSION
         else:

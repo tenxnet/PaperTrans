@@ -51,6 +51,12 @@ finishes as `needs_review`; a parser or QA failure is recorded as `failed`.
 The manifest's chunk progress is refreshed after semantic construction and after
 each completed translation chunk.
 
+The Web import route uses `--prepare-for-mcp` instead. It performs the same
+Docling parse and artifact QA without local translation, then leaves the shared
+manifest in `prepared` state for the ChatGPT MCP worker. Prepared previews are
+not published by the Web artifact routes; they become visible only after MCP
+translation and finalization complete.
+
 QA fails closed when every page is text-empty or when a visible semantic source
 block is missing from the document contract. A valid blank page inside an
 otherwise readable paper is retained and makes the job `needs_review` rather

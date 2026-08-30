@@ -35,6 +35,26 @@ from .structure import analyze_layout, extract_layout_evidence, render_visual_ob
 from .translate import translate_document
 
 
+def _semantic_pipeline_status(
+    qa: dict,
+    document: dict,
+    *,
+    skip_translation: bool,
+    prepare_for_mcp: bool,
+) -> str:
+    if qa.get("status") != "passed":
+        return "failed"
+    if prepare_for_mcp:
+        return "prepared"
+    if (
+        skip_translation
+        or document.get("status") == "needs_review"
+        or bool(qa.get("emptyTextPages"))
+    ):
+        return "needs_review"
+    return "completed"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="papertrans")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -171,6 +191,11 @@ def _parser() -> argparse.ArgumentParser:
     semantic_pipeline.add_argument("--translation-workers", type=int, default=3)
     semantic_pipeline.add_argument("--max-characters", type=int, default=9000)
     semantic_pipeline.add_argument("--skip-translation", action="store_true")
+    semantic_pipeline.add_argument(
+        "--prepare-for-mcp",
+        action="store_true",
+        help="Skip local translation and publish a prepared job for the MCP worker",
+    )
 
     pdf_benchmark = subparsers.add_parser(
         "pdf-benchmark",
@@ -633,6 +658,9 @@ def main() -> None:
         return
 
     if args.command == "semantic-pipeline":
+        prepare_for_mcp = bool(getattr(args, "prepare_for_mcp", False))
+        skip_translation = bool(args.skip_translation or prepare_for_mcp)
+        manifest_provider = "mcp" if prepare_for_mcp else None
         repo_root = args.repo_root.resolve()
         output_root = args.output_root.resolve()
         paper_root = output_root / args.slug
@@ -653,11 +681,12 @@ def main() -> None:
             manifest_path,
             slug=args.slug,
             source=args.source,
-            status="translating",
+            status="preparing" if prepare_for_mcp else "translating",
             pdf_parser=args.layout_parser,
             structure_mode=manifest_structure_mode,
             started_at=pipeline_started.isoformat(),
-            skip_translation=args.skip_translation,
+            skip_translation=skip_translation,
+            provider=manifest_provider,
         )
         source_sha256 = str(active_manifest["source"]["sha256"])
         try:
@@ -730,12 +759,13 @@ def main() -> None:
                 manifest_path,
                 slug=args.slug,
                 source=args.source,
-                status="translating",
+                status="preparing" if prepare_for_mcp else "translating",
                 pdf_parser=args.layout_parser,
                 structure_mode=manifest_structure_mode,
                 document=document,
                 started_at=pipeline_started.isoformat(),
-                skip_translation=args.skip_translation,
+                skip_translation=skip_translation,
+                provider=manifest_provider,
                 source_sha256=source_sha256,
             )
             unit_count = sum(
@@ -751,7 +781,7 @@ def main() -> None:
                 utc_now(),
                 {"sections": len(document["sections"]), "units": unit_count},
             )
-            if not args.skip_translation:
+            if not skip_translation:
                 document = translate_semantic_document(
                     document,
                     semantic_path,
@@ -771,7 +801,8 @@ def main() -> None:
                         structure_mode=manifest_structure_mode,
                         document=current_document,
                         started_at=pipeline_started.isoformat(),
-                        skip_translation=args.skip_translation,
+                        skip_translation=skip_translation,
+                        provider=manifest_provider,
                         source_sha256=source_sha256,
                     ),
                 )
@@ -792,14 +823,11 @@ def main() -> None:
                 utc_now(),
                 {"html": str(index), "zip": str(bundle_path), "qa": qa["status"]},
             )
-            status = (
-                "failed"
-                if qa["status"] != "passed"
-                else "needs_review"
-                if args.skip_translation
-                or document.get("status") == "needs_review"
-                or bool(qa.get("emptyTextPages"))
-                else "completed"
+            status = _semantic_pipeline_status(
+                qa,
+                document,
+                skip_translation=skip_translation,
+                prepare_for_mcp=prepare_for_mcp,
             )
             write_pdf_job_manifest(
                 manifest_path,
@@ -810,7 +838,8 @@ def main() -> None:
                 structure_mode=manifest_structure_mode,
                 document=document,
                 started_at=pipeline_started.isoformat(),
-                skip_translation=args.skip_translation,
+                skip_translation=skip_translation,
+                provider=manifest_provider,
                 error="HTML artifact QA failed" if status == "failed" else None,
                 source_sha256=source_sha256,
             )
@@ -839,7 +868,8 @@ def main() -> None:
                 structure_mode=manifest_structure_mode,
                 document=document,
                 started_at=pipeline_started.isoformat(),
-                skip_translation=args.skip_translation,
+                skip_translation=skip_translation,
+                provider=manifest_provider,
                 error=str(error),
                 source_sha256=source_sha256,
             )

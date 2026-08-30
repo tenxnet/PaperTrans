@@ -18,6 +18,7 @@ from .structure import is_near_certain_blank_pixmap
 
 
 PDF_JOB_SCHEMA_VERSION = 1
+PDF_MCP_MAX_CHARACTERS = 9000
 
 
 def utc_now_iso() -> str:
@@ -74,39 +75,54 @@ def _authors(document: dict[str, Any] | None) -> list[str]:
     return values
 
 
-def _translation_chunks(document: dict[str, Any] | None) -> list[dict[str, Any]]:
+def pdf_translation_chunks(
+    document: dict[str, Any] | None,
+    max_characters: int = PDF_MCP_MAX_CHARACTERS,
+) -> list[dict[str, Any]]:
+    """Build the exact character-bounded chunks consumed by the PDF MCP worker."""
+
     if not document:
         return []
+    section_titles = {
+        str(section.get("id", f"section-{index}")): str(
+            section.get("title", {}).get("original", "")
+        ).strip()
+        for index, section in enumerate(document.get("sections", []), start=1)
+    }
+    grouped: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_size = 0
+    for unit in iter_translatable_units(document):
+        size = len(str(unit.get("original", "")))
+        if current and current_size + size > max_characters:
+            grouped.append(current)
+            current = []
+            current_size = 0
+        current.append(unit)
+        current_size += size
+    if current:
+        grouped.append(current)
+
     chunks: list[dict[str, Any]] = []
-    title = document.get("title")
-    if title:
+    for index, units in enumerate(grouped, start=1):
+        sections: list[str] = []
+        for unit in units:
+            section_id = str(unit.get("sectionId") or "")
+            label = section_titles.get(section_id) or "Front matter"
+            if label not in sections:
+                sections.append(label)
         chunks.append(
             {
-                "chunkId": "front-matter",
-                "status": "completed" if str(title.get("japanese", "")).strip() else "pending",
-                "unitIds": [str(title.get("id", "paper-title"))],
-            }
-        )
-    for index, section in enumerate(document.get("sections", []), start=1):
-        units = [section.get("title")]
-        units.extend(
-            item.get("value")
-            for item in section.get("content", [])
-            if item.get("type") == "unit"
-            and item.get("value", {}).get("kind") in TRANSLATABLE_ROLES
-        )
-        units = [unit for unit in units if unit]
-        if not units:
-            continue
-        chunks.append(
-            {
-                "chunkId": f"section-{index:03d}",
+                "chunkId": f"chunk-{index:03d}",
+                "index": index,
                 "status": (
                     "completed"
                     if all(str(unit.get("japanese", "")).strip() for unit in units)
                     else "pending"
                 ),
                 "unitIds": [str(unit.get("id", "")) for unit in units],
+                "characters": sum(len(str(unit.get("original", ""))) for unit in units),
+                "sections": sections,
             }
         )
     return chunks
@@ -126,13 +142,15 @@ def write_pdf_job_manifest(
     provider: str | None = None,
     error: str | None = None,
     source_sha256: str | None = None,
+    updated_at: str | None = None,
+    finalized_at: str | None = None,
 ) -> dict[str, Any]:
     """Write the source-neutral manifest consumed by the local Web library."""
 
     now = utc_now_iso()
     created_at = started_at or now
     title = _display_text(document.get("title") if document else None, source.stem)
-    chunks = _translation_chunks(document)
+    chunks = pdf_translation_chunks(document)
     manifest: dict[str, Any] = {
         "schemaVersion": PDF_JOB_SCHEMA_VERSION,
         "jobId": slug,
@@ -159,8 +177,12 @@ def write_pdf_job_manifest(
         },
         "chunks": chunks,
         "createdAt": created_at,
-        "updatedAt": now,
-        "finalizedAt": now if status in {"completed", "needs_review", "failed"} else None,
+        "updatedAt": updated_at or now,
+        "finalizedAt": (
+            finalized_at or updated_at or now
+            if status in {"completed", "needs_review", "failed"}
+            else None
+        ),
         "artifacts": {
             "html": "html/index.html",
             "markdown": "html/index.md",

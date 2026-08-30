@@ -163,7 +163,7 @@ def _prepare_pdf_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ChatGPT
         work / "papertrans-job.json",
         slug=job_id,
         source=source,
-        status="failed",
+        status="prepared",
         pdf_parser="docling",
         structure_mode="docling",
         document=document,
@@ -329,7 +329,93 @@ def test_mcp_worker_translates_prepared_docling_pdf_job(
     )
     assert finalized_common["provider"] == "mcp"
     assert finalized_common["status"] == "completed"
+    completed_updated_at = finalized_common["updatedAt"]
+    completed_finalized_at = finalized_common["finalizedAt"]
+    finalized_common["status"] = "preparing"
+    (tmp_path / "output/pdf-mcp/work/papertrans-job.json").write_text(
+        json.dumps(finalized_common), encoding="utf-8"
+    )
     assert store.finalize("pdf-mcp") == finalized
+    repaired_common = json.loads(
+        (tmp_path / "output/pdf-mcp/work/papertrans-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert repaired_common["status"] == "completed"
+    assert repaired_common["updatedAt"] == completed_updated_at
+    assert repaired_common["finalizedAt"] == completed_finalized_at
+
+
+def test_mcp_pdf_finalize_marks_empty_text_pages_for_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    chunk = store.next_chunk("pdf-mcp")
+    store.save_chunk("pdf-mcp", chunk["chunkId"], _translations(chunk))
+
+    def qa_with_blank_page(_document: dict, publication_dir: Path, **_kwargs) -> dict:
+        qa = {
+            "status": "passed",
+            "emptyTextPages": [2],
+            "output": {"figures": 0, "tables": 0, "visibleMath": 0},
+            "unresolvedInternalLinks": 0,
+            "missingLocalAssets": [],
+        }
+        (publication_dir / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+        return qa
+
+    monkeypatch.setattr(chatgpt_worker, "write_semantic_pdf_qa", qa_with_blank_page)
+
+    finalized = store.finalize("pdf-mcp")
+
+    assert finalized["status"] == "needs_review"
+    document = json.loads(
+        (tmp_path / "output/pdf-mcp/work/semantic-document.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert document["status"] == "needs_review"
+    common = json.loads(
+        (tmp_path / "output/pdf-mcp/work/papertrans-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert common["status"] == "needs_review"
+
+
+@pytest.mark.parametrize("status", ["preparing", "translating", "failed"])
+def test_mcp_worker_rejects_pdf_job_before_prepared_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    manifest_path = tmp_path / "output/pdf-mcp/work/papertrans-job.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = status
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(TranslationJobError, match="not ready for MCP translation"):
+        store.status("pdf-mcp")
+    assert store.list_jobs() == []
+    assert not (tmp_path / "output/pdf-mcp/work/mcp-job.json").exists()
+
+
+def test_mcp_worker_accepts_legacy_review_job_after_artifact_qa(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    manifest_path = tmp_path / "output/pdf-mcp/work/papertrans-job.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "needs_review"
+    manifest["provider"] = "none"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    qa_path = tmp_path / "output/pdf-mcp/html/qa.json"
+    qa_path.parent.mkdir(parents=True)
+    qa_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+
+    status = store.status("pdf-mcp")
+
+    assert status["status"] == "prepared"
+    assert status["chunks"]["remaining"] == 1
 
 
 def test_mcp_worker_rejects_pdf_source_hash_mismatch(
