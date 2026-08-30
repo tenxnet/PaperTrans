@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -17,6 +14,7 @@ from .docling_adapter import (
     DoclingResourceLimitError,
     convert_pdf_with_docling,
 )
+from .docling_worker_runtime import write_bounded_json_atomic
 
 
 def write_json_atomic(
@@ -27,35 +25,12 @@ def write_json_atomic(
 ) -> None:
     """Write a completed Docling export without exposing a partial JSON file."""
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output_path.name}.",
-        suffix=".tmp",
-        dir=output_path.parent,
+    write_bounded_json_atomic(
+        output_path,
+        value,
+        max_bytes=max_bytes,
+        limit_message=f"Docling JSON exceeds {max_bytes} bytes",
     )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            encoder = json.JSONEncoder(
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-            )
-            written = 0
-            for chunk in encoder.iterencode(value):
-                encoded_size = len(chunk.encode("utf-8"))
-                if written + encoded_size + 1 > max_bytes:
-                    raise DoclingResourceLimitError(
-                        f"Docling JSON exceeds {max_bytes} bytes"
-                    )
-                handle.write(chunk)
-                written += encoded_size
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, output_path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def _parser() -> argparse.ArgumentParser:
