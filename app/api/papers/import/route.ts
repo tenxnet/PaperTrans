@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, open, readdir, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, mkdir, open, readdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+
+const MAX_PDF_BYTES = 50 * 1024 * 1024;
+const MAX_MULTIPART_BYTES = MAX_PDF_BYTES + 1024 * 1024;
 
 function slugify(filename: string) {
   const stem = filename.replace(/\.pdf$/i, "").toLowerCase();
@@ -26,52 +30,153 @@ async function existingDigest(dataRoot: string, digest: string) {
   return null;
 }
 
+function hasErrorCode(error: unknown, code: string) {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+async function reserveImportDirectories(
+  dataRoot: string,
+  outputRoot: string,
+  baseSlug: string,
+  digest: string,
+) {
+  await Promise.all([
+    mkdir(dataRoot, { recursive: true }),
+    mkdir(outputRoot, { recursive: true }),
+  ]);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const suffix = attempt === 0
+      ? ""
+      : attempt === 1
+        ? `-${digest.slice(0, 8)}`
+        : `-${digest.slice(0, 8)}-${attempt}`;
+    const slug = `${baseSlug}${suffix}`;
+    const paperDir = path.join(dataRoot, slug);
+    const outputDir = path.join(outputRoot, slug);
+    try {
+      await mkdir(paperDir);
+    } catch (error) {
+      if (hasErrorCode(error, "EEXIST")) continue;
+      throw error;
+    }
+    try {
+      await mkdir(outputDir);
+      return { slug, paperDir, outputDir };
+    } catch (error) {
+      await rmdir(paperDir).catch(() => undefined);
+      if (hasErrorCode(error, "EEXIST")) continue;
+      throw error;
+    }
+  }
+  throw new Error("could not reserve a unique PDF job ID");
+}
+
+async function rollbackReservedImport(paperDir: string, outputDir: string) {
+  await unlink(path.join(paperDir, "source.pdf")).catch(() => undefined);
+  await unlink(path.join(outputDir, "job.log")).catch(() => undefined);
+  await rmdir(paperDir).catch(() => undefined);
+  await rmdir(outputDir).catch(() => undefined);
+}
+
 export async function POST(request: Request) {
-  const form = await request.formData();
+  const declaredLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_MULTIPART_BYTES) {
+    return NextResponse.json({ code: "pdf_too_large", error: "PDFは50MB以下にしてください" }, { status: 413 });
+  }
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    return NextResponse.json({ code: "invalid_form", error: "PDFの送信内容を確認できません" }, { status: 400 });
+  }
   const paper = form.get("paper");
   if (!(paper instanceof File) || (!paper.name.toLowerCase().endsWith(".pdf") && paper.type !== "application/pdf")) {
-    return NextResponse.json({ error: "PDFを選択してください" }, { status: 400 });
+    return NextResponse.json({ code: "invalid_pdf", error: "PDFを選択してください" }, { status: 400 });
+  }
+  if (paper.size > MAX_PDF_BYTES) {
+    return NextResponse.json({ code: "pdf_too_large", error: "PDFは50MB以下にしてください" }, { status: 413 });
   }
   const bytes = Buffer.from(await paper.arrayBuffer());
   if (bytes.length < 5 || bytes.subarray(0, 5).toString() !== "%PDF-") {
-    return NextResponse.json({ error: "PDFヘッダーを確認できません" }, { status: 400 });
+    return NextResponse.json({ code: "invalid_pdf", error: "PDFヘッダーを確認できません" }, { status: 400 });
   }
 
   const dataRoot = path.join(process.cwd(), "data", "papers");
   const digest = createHash("sha256").update(bytes).digest("hex");
   const duplicate = await existingDigest(dataRoot, digest);
-  if (duplicate) return NextResponse.json({ error: `同一PDFは取込済みです: ${duplicate}` }, { status: 409 });
+  if (duplicate) {
+    return NextResponse.json(
+      {
+        code: "duplicate_pdf",
+        error: `同一PDFは取込済みです: ${duplicate}`,
+        existingJobId: duplicate,
+        jobId: duplicate,
+        slug: duplicate,
+        status: "existing",
+        sourceType: "pdf",
+      },
+      { status: 409 },
+    );
+  }
 
-  let slug = slugify(paper.name);
+  const executable = path.join(process.cwd(), ".venv", "bin", "papertrans");
   try {
-    await readFile(path.join(dataRoot, slug, "source.pdf"));
-    slug = `${slug}-${digest.slice(0, 8)}`;
-  } catch { /* available */ }
-  const paperDir = path.join(dataRoot, slug);
-  const outputDir = path.join(process.cwd(), "output", slug);
-  await mkdir(paperDir, { recursive: true });
-  await mkdir(outputDir, { recursive: true });
-  await writeFile(path.join(paperDir, "source.pdf"), bytes, { flag: "wx" });
+    await access(executable, constants.X_OK);
+  } catch {
+    return NextResponse.json(
+      { code: "worker_unavailable", error: "PDF解析ワーカーを起動できません。ローカル環境を確認してください" },
+      { status: 503 },
+    );
+  }
 
-  const log = await open(path.join(outputDir, "job.log"), "a");
-  const child = spawn(
-    path.join(process.cwd(), ".venv", "bin", "papertrans"),
-    [
-      "semantic-pipeline",
-      path.join(paperDir, "source.pdf"),
-      "--slug",
-      slug,
-      "--repo-root",
-      process.cwd(),
-      "--structure-mode",
-      "hybrid",
-      "--layout-parser",
-      "docling",
-      "--skip-translation",
-    ],
-    { cwd: process.cwd(), detached: true, stdio: ["ignore", log.fd, log.fd] },
-  );
-  child.unref();
+  const outputRoot = path.join(process.cwd(), "output");
+  let reservation: Awaited<ReturnType<typeof reserveImportDirectories>>;
+  try {
+    reservation = await reserveImportDirectories(dataRoot, outputRoot, slugify(paper.name), digest);
+  } catch {
+    return NextResponse.json(
+      { code: "job_reservation_failed", error: "PDFジョブの保存先を確保できませんでした" },
+      { status: 500 },
+    );
+  }
+  const { slug, paperDir, outputDir } = reservation;
+  let log: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    await writeFile(path.join(paperDir, "source.pdf"), bytes, { flag: "wx" });
+    log = await open(path.join(outputDir, "job.log"), "a");
+    const child = spawn(
+      executable,
+      [
+        "semantic-pipeline",
+        path.join(paperDir, "source.pdf"),
+        "--slug",
+        slug,
+        "--repo-root",
+        process.cwd(),
+        "--structure-mode",
+        "hybrid",
+        "--layout-parser",
+        "docling",
+        "--prepare-for-mcp",
+      ],
+      { cwd: process.cwd(), detached: true, stdio: ["ignore", log.fd, log.fd] },
+    );
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    child.unref();
+  } catch {
+    await log?.close().catch(() => undefined);
+    await rollbackReservedImport(paperDir, outputDir);
+    return NextResponse.json(
+      { code: "worker_start_failed", error: "PDF解析ワーカーの起動に失敗しました" },
+      { status: 500 },
+    );
+  }
   await log.close();
-  return NextResponse.json({ slug, status: "started" }, { status: 202 });
+  return NextResponse.json(
+    { jobId: slug, slug, status: "preparing", sourceType: "pdf" },
+    { status: 202 },
+  );
 }

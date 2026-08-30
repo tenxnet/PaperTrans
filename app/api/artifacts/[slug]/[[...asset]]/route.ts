@@ -1,6 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
+import { isPaperArtifactPublished } from "@/lib/paper-library";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,6 +32,9 @@ export async function GET(
   const { slug, asset } = await context.params;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(slug)) {
     return NextResponse.json({ error: "invalid slug" }, { status: 400 });
+  }
+  if (!(await isPaperArtifactPublished(slug))) {
+    return NextResponse.json({ error: "artifact not found" }, { status: 404 });
   }
   const publicationRoot = path.resolve(process.cwd(), "output", slug, "html");
   const requested = path.resolve(publicationRoot, ...(asset?.length ? asset : ["index.html"]));
