@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -14,26 +15,79 @@ concurrency:
 
 jobs:
   python:
-    name: Python tests
-    runs-on: ubuntu-latest
+    name: Python tests and release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          version: "0.11.3"
+          python-version: "3.12"
       - run: uv sync --frozen --extra test
-      - run: uv run pytest -q
+      - run: uv run --frozen --extra test pytest -q
+      - name: Build the Python release artifacts
+        run: uv build
+      - name: Verify the pushed tag matches the release metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          PAPERTRANS_RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          uv run --frozen --extra test pytest -q
+          tests/test_release_metadata.py::test_release_tag_matches_public_metadata_when_provided
 
   web:
     name: Web typecheck and build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test:pdf-import-admission
       - run: pnpm build
+
+  babeldoc-worker:
+    name: BabelDOC worker contract tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          version: "0.11.3"
+          python-version: "3.12"
+      - run: uv sync --frozen --extra test
+      - name: Test the isolated adapter without installing its evaluation engine
+        env:
+          PYTHONPATH: workers/babeldoc/worker/src
+        run: uv run --frozen --extra test pytest -p no:cacheprovider workers/babeldoc/worker/tests -q
+      - name: Compile evaluation helper scripts
+        run: >-
+          uv run --frozen python -m py_compile
+          workers/babeldoc/scripts/generate_runtime_metadata.py
+          workers/babeldoc/scripts/generate_tree_manifest.py
+          workers/babeldoc/scripts/validate_source.py
+          workers/deterministic-gateway/gateway.py
+      - name: Validate the BabelDOC container definition
+        run: docker buildx build --check workers/babeldoc
+
+  harumi-worker:
+    name: Harumi worker tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install the worker's declared Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Validate the Harumi container definition
+        run: docker buildx build --check workers/harumi
+      - name: Test the locked evaluation worker
+        run: cargo +1.88.0 test --locked --manifest-path workers/harumi/Cargo.toml
