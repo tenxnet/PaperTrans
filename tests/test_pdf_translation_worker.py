@@ -284,6 +284,38 @@ def test_staging_rejects_extra_hash_mismatch_and_symlink(
     )
 
 
+def test_backend_report_rejects_content_or_credential_fields(tmp_path: Path):
+    source = tmp_path / "source.pdf"
+    _make_pdf(source)
+    request = _request(source)
+    staging = tmp_path / "staging"
+    _stage(staging, source, request)
+    report = staging / "artifacts" / "backend-report.json"
+    report.write_text(
+        json.dumps({"schemaVersion": 1, "apiKey": "secret-value"}),
+        encoding="utf-8",
+    )
+    result_path = staging / "worker-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["artifacts"].append(
+        {
+            "role": "backend_report",
+            "path": "artifacts/backend-report.json",
+            "mediaType": "application/json",
+            "sha256": _sha256(report),
+            "bytes": report.stat().st_size,
+        }
+    )
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    _assert_code(
+        "invalid_artifact",
+        lambda: load_and_validate_worker_result(
+            staging, request=request, source_pdf=source
+        ),
+    )
+
+
 def test_pdf_validation_rejects_geometry_changes_and_active_content(tmp_path: Path):
     source = tmp_path / "source.pdf"
     _make_pdf(source)
@@ -316,7 +348,151 @@ def test_pdf_validation_rejects_geometry_changes_and_active_content(tmp_path: Pa
     _assert_code("active_content", lambda: inspect_pdf(active))
 
 
-def test_atomic_publication_and_explicit_promotion_preserve_main_status(tmp_path: Path):
+def test_pdf_validation_rejects_missing_render_resources(tmp_path: Path):
+    malformed = tmp_path / "missing-extgstate.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((72, 72), "broken resource fixture")
+    content_xref = page.get_contents()[0]
+    document.update_stream(
+        content_xref,
+        b"/GS0 gs\n" + document.xref_stream(content_xref),
+    )
+    document.save(malformed)
+    document.close()
+
+    _assert_code("render_smoke_failed", lambda: inspect_pdf(malformed))
+
+
+def test_pdf_validation_rejects_javascript_uri_actions(tmp_path: Path):
+    active = tmp_path / "javascript-uri.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((72, 72), "blocked link")
+    page.insert_link(
+        {
+            "kind": fitz.LINK_URI,
+            "from": fitz.Rect(70, 60, 150, 85),
+            "uri": "javascript:alert(1)",
+        }
+    )
+    document.save(active)
+    document.close()
+
+    _assert_code("active_content", lambda: inspect_pdf(active))
+
+
+def test_pdf_validation_rejects_rendition_actions(tmp_path: Path):
+    active = tmp_path / "rendition.pdf"
+    _make_pdf(active, pages=1)
+    document = fitz.open(active)
+    document.xref_set_key(
+        document.pdf_catalog(), "Rendition", "<</S/Rendition>>"
+    )
+    rewritten = active.with_suffix(".new.pdf")
+    document.save(rewritten)
+    document.close()
+    rewritten.replace(active)
+
+    _assert_code("active_content", lambda: inspect_pdf(active))
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    [
+        "ResetForm",
+        "Hide",
+        "Named",
+        "SetOCGState",
+        "Trans",
+        "GoTo3DView",
+        "UnknownVendorAction",
+    ],
+)
+def test_pdf_validation_default_denies_non_allowlisted_link_actions(
+    tmp_path: Path,
+    subtype: str,
+):
+    initial = tmp_path / f"{subtype}-initial.pdf"
+    active = tmp_path / f"{subtype}.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((72, 72), "action fixture")
+    page.insert_link(
+        {
+            "kind": fitz.LINK_URI,
+            "from": fitz.Rect(70, 60, 160, 85),
+            "uri": "https://example.com/paper",
+        }
+    )
+    document.save(initial)
+    document.close()
+
+    document = fitz.open(initial)
+    action_xref = document[0].get_links()[0]["xref"]
+    document.xref_set_key(action_xref, "A", f"<</S/{subtype}>>")
+    document.save(active)
+    document.close()
+
+    _assert_code("active_content", lambda: inspect_pdf(active))
+
+
+def test_dual_pdf_may_use_two_output_pages_per_requested_source_page(
+    tmp_path: Path,
+):
+    source = tmp_path / "source.pdf"
+    _make_pdf(source, pages=1)
+    request = _request(source, run_id="pdf-harumi-dual-01")
+    request["outputs"] = ["translated_dual_pdf"]
+    request["limits"]["maxPages"] = 1
+
+    staging = tmp_path / "dual-staging"
+    artifacts = staging / "artifacts"
+    artifacts.mkdir(parents=True)
+    translated = artifacts / "translated-dual.pdf"
+    _make_pdf(translated, pages=2)
+    artifact = {
+        "role": "translated_dual_pdf",
+        "path": "artifacts/translated-dual.pdf",
+        "mediaType": "application/pdf",
+        "sha256": _sha256(translated),
+        "bytes": translated.stat().st_size,
+    }
+    (staging / "worker-result.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "runId": request["runId"],
+                "sourceSha256": request["source"]["sha256"],
+                "artifacts": [artifact],
+                "pageMaps": {
+                    "translated_dual_pdf": [
+                        {"sourcePage": 1, "outputPages": [1, 2]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    validated = load_and_validate_worker_result(
+        staging, request=request, source_pdf=source
+    )
+
+    assert validated.output_pdfs["translated_dual_pdf"].page_count == 2
+    assert validated.page_maps["translated_dual_pdf"] == [
+        {"sourcePage": 1, "outputPages": [1, 2]}
+    ]
+
+
+def test_atomic_publication_and_explicit_promotion_preserve_main_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "papertrans.pdf_translation_worker._independent_pdf_check",
+        lambda _path: {"tool": "qpdf", "status": "passed"},
+    )
     source = tmp_path / "source.pdf"
     _make_pdf(source)
     request = _request(source)
@@ -333,10 +509,18 @@ def test_atomic_publication_and_explicit_promotion_preserve_main_status(tmp_path
         health=_health(),
         events_ndjson=events,
         worker_log=f"source was {source}",
+        run_purpose="semantic_translation",
+        promotion_eligible=True,
     )
     assert run_root == output / "paper-1" / "pdf-runs" / request["runId"]
-    assert json.loads((run_root / "qa.json").read_text(encoding="utf-8"))["status"] == "passed"
+    qa = json.loads((run_root / "qa.json").read_text(encoding="utf-8"))
+    assert qa["status"] == "needs_review"
+    assert qa["automaticChecksStatus"] == "passed"
     assert "[redacted-path]" in (run_root / "worker.log").read_text(encoding="utf-8")
+    run = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+    assert run["purpose"] == "semantic_translation"
+    assert run["promotionEligible"] is True
+    assert run["state"] == "needs_review"
     index = json.loads((run_root / "artifact-index.json").read_text(encoding="utf-8"))
     assert index["artifacts"][0]["path"] == "artifacts/translated-mono.pdf"
     _assert_code(
@@ -382,3 +566,54 @@ def test_atomic_publication_and_explicit_promotion_preserve_main_status(tmp_path
     persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert persisted["status"] == "needs_review"
 
+
+@pytest.mark.parametrize(
+    ("publish_options", "expected_purpose"),
+    [
+        ({}, "unclassified"),
+        (
+            {
+                "run_purpose": "layout_evaluation",
+                "promotion_eligible": False,
+            },
+            "layout_evaluation",
+        ),
+    ],
+)
+def test_default_and_harumi_layout_candidates_cannot_be_promoted(
+    tmp_path: Path,
+    publish_options: dict,
+    expected_purpose: str,
+):
+    source = tmp_path / "source.pdf"
+    _make_pdf(source)
+    request = _request(source, run_id="pdf-harumi-layout-01")
+    staging = tmp_path / "worker-staging"
+    _, events = _stage(staging, source, request)
+    output = tmp_path / "output"
+
+    run_root = publish_candidate_run(
+        output_root=output,
+        slug="paper-layout",
+        source_pdf=source,
+        staging_dir=staging,
+        request=request,
+        health=_health(),
+        events_ndjson=events,
+        **publish_options,
+    )
+    run = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+    assert run["backendId"] == "harumi-papertrans"
+    assert run["purpose"] == expected_purpose
+    assert run["promotionEligible"] is False
+
+    _assert_code(
+        "promotion_refused",
+        lambda: promote_candidate_pdf(
+            output_root=output,
+            slug="paper-layout",
+            run_id=request["runId"],
+            approved_by="reviewer-1",
+            promoted_at="2026-08-30T00:10:00Z",
+        ),
+    )

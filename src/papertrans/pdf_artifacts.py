@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import unquote, urlsplit
 
 import pymupdf as fitz
@@ -30,6 +32,21 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+@contextmanager
+def paper_manifest_lock(path: Path) -> Iterator[None]:
+    """Serialize manifest updates across the import pipeline and PDF promotion."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _source_sha256(source: Path) -> str:
@@ -154,7 +171,28 @@ def write_pdf_job_manifest(
     }
     if error:
         manifest["error"] = {"message": error[:2000]}
-    _atomic_json(path, manifest)
+    with paper_manifest_lock(path):
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                existing = None
+            if (
+                isinstance(existing, dict)
+                and isinstance(existing.get("source"), dict)
+                and existing["source"].get("sha256") == manifest["source"]["sha256"]
+            ):
+                existing_artifacts = existing.get("artifacts")
+                translated_pdf = (
+                    existing_artifacts.get("translatedPdf")
+                    if isinstance(existing_artifacts, dict)
+                    else None
+                )
+                if isinstance(translated_pdf, str) and translated_pdf:
+                    manifest["artifacts"]["translatedPdf"] = translated_pdf
+                if isinstance(existing.get("pdfTranslation"), dict):
+                    manifest["pdfTranslation"] = existing["pdfTranslation"]
+        _atomic_json(path, manifest)
     return manifest
 
 

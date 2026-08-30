@@ -8,14 +8,19 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Collection, Iterable, Iterator, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import pymupdf as fitz
+
+from .pdf_artifacts import paper_manifest_lock
 
 
 SCHEMA_VERSION = 1
@@ -23,11 +28,13 @@ MAX_INPUT_BYTES = 100 * 1024 * 1024
 MAX_PAGES = 300
 MAX_OUTPUT_BYTES = 500 * 1024 * 1024
 MAX_DEADLINE_SECONDS = 25 * 60
+MAX_OUTPUT_PAGES = MAX_PAGES * 2
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_EVENT_LINE_BYTES = 64 * 1024
 MAX_PAGE_DIMENSION_POINTS = 14_400.0
 MAX_RENDER_PIXELS = 4_000_000
 PDF_GEOMETRY_TOLERANCE = 0.1
+_MUPDF_INSPECTION_LOCK = threading.Lock()
 
 PDF_OUTPUT_ROLES = frozenset({"translated_mono_pdf", "translated_dual_pdf"})
 ARTIFACT_ROLES = PDF_OUTPUT_ROLES | {"backend_report"}
@@ -41,6 +48,17 @@ ROLE_MEDIA_TYPES = {
     "translated_dual_pdf": "application/pdf",
     "backend_report": "application/json",
 }
+_FORBIDDEN_REPORT_KEYS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "credential",
+        "credentials",
+        "prompt",
+        "sourcetext",
+        "translatedtext",
+    }
+)
 
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _LANGUAGE_TAG = re.compile(
@@ -51,8 +69,39 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ACTIVE_NAME = re.compile(
     r"/(?:JavaScript|JS|Launch|RichMedia|RichMediaContent|EmbeddedFile|"
-    r"EmbeddedFiles|OpenAction|AA|SubmitForm|ImportData|GoToR)(?![A-Za-z0-9])"
+    r"EmbeddedFiles|OpenAction|AA|SubmitForm|ImportData|GoToR|GoToE|"
+    r"Rendition|Movie|Sound|Screen|3D|XFA|AcroForm)(?![A-Za-z0-9])"
 )
+_STANDARD_ACTION_SUBTYPES = frozenset(
+    {
+        "GoTo",
+        "GoToR",
+        "GoToE",
+        "Launch",
+        "Thread",
+        "URI",
+        "Sound",
+        "Movie",
+        "Hide",
+        "Named",
+        "SubmitForm",
+        "ResetForm",
+        "ImportData",
+        "JavaScript",
+        "SetOCGState",
+        "Rendition",
+        "Trans",
+        "GoTo3DView",
+    }
+)
+_ACTION_SUBTYPE = re.compile(r"/S\s*/([A-Za-z][A-Za-z0-9]*)")
+_ACTION_DICTIONARY = re.compile(r"/A\s*<<(.*?)(?:>>|$)", re.DOTALL)
+_ACTION_REFERENCE = re.compile(r"/A\s+(\d+)\s+\d+\s+R")
+_NEXT_ACTION_DICTIONARY = re.compile(r"/Next\s*<<(.*?)(?:>>|$)", re.DOTALL)
+_NEXT_ACTION_REFERENCE = re.compile(r"/Next\s+(\d+)\s+\d+\s+R")
+_ACTION_TYPE = re.compile(r"/Type\s*/Action(?![A-Za-z0-9])")
+_LITERAL_URI = re.compile(r"/URI\s*\(((?:\\.|[^\\)])*)\)", re.DOTALL)
+_HEX_URI = re.compile(r"/URI\s*<([0-9A-Fa-f\s]+)>")
 
 
 class PdfTranslationContractError(ValueError):
@@ -151,6 +200,54 @@ def _identifier(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
         _fail("invalid_schema", f"{field} is not a safe recorded identifier")
     return value
+
+
+def _validate_backend_report_safety(value: Any) -> None:
+    """Bound untrusted supporting evidence and reject content-bearing fields."""
+
+    retained_characters = 0
+
+    def visit(item: Any, *, depth: int) -> None:
+        nonlocal retained_characters
+        if depth > 10:
+            _fail("invalid_artifact", "backend report nesting exceeds policy")
+        if item is None or isinstance(item, bool):
+            return
+        if _is_int(item):
+            if abs(item) > 2**63 - 1:
+                _fail("invalid_artifact", "backend report integer exceeds policy")
+            return
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                _fail("invalid_artifact", "backend report contains a non-finite number")
+            return
+        if isinstance(item, str):
+            if len(item) > 1000 or "\x00" in item:
+                _fail("invalid_artifact", "backend report contains unbounded text")
+            retained_characters += len(item)
+            if retained_characters > 64 * 1024:
+                _fail("invalid_artifact", "backend report retains too much text")
+            return
+        if isinstance(item, list):
+            if len(item) > MAX_OUTPUT_PAGES:
+                _fail("invalid_artifact", "backend report array exceeds page policy")
+            for child in item:
+                visit(child, depth=depth + 1)
+            return
+        if isinstance(item, dict):
+            if len(item) > 64 or not all(isinstance(key, str) for key in item):
+                _fail("invalid_artifact", "backend report object exceeds policy")
+            for key, child in item.items():
+                if key.casefold().replace("_", "") in _FORBIDDEN_REPORT_KEYS:
+                    _fail(
+                        "invalid_artifact",
+                        "backend report contains a forbidden content or credential field",
+                    )
+                visit(child, depth=depth + 1)
+            return
+        _fail("invalid_artifact", "backend report contains an unsupported JSON value")
+
+    visit(value, depth=0)
 
 
 def _sha256(value: Any, field: str) -> str:
@@ -668,15 +765,136 @@ def _safe_pdf_link_uris(document: fitz.Document) -> frozenset[str]:
             kind = link.get("kind")
             if kind == fitz.LINK_URI:
                 uri = link.get("uri")
-                if not isinstance(uri, str) or not uri:
+                if (
+                    not isinstance(uri, str)
+                    or not uri
+                    or len(uri) > 4096
+                    or any(character in uri for character in ("\x00", "\r", "\n"))
+                ):
                     _fail("active_content", "PDF contains a malformed external URI action")
+                scheme = urlsplit(uri).scheme.lower()
+                if scheme not in {"http", "https", "mailto"}:
+                    _fail(
+                        "active_content",
+                        "PDF contains a blocked external URI action scheme",
+                    )
                 values.add(uri)
             elif kind in {fitz.LINK_LAUNCH, fitz.LINK_GOTOR}:
                 _fail("active_content", "PDF contains a launch or remote-go-to action")
     return frozenset(values)
 
 
-def _active_pdf_findings(document: fitz.Document) -> tuple[str, ...]:
+def _uri_from_action_dictionary(raw: str) -> str | None:
+    literal = _LITERAL_URI.search(raw)
+    if literal is not None:
+        value = re.sub(
+            r"\\([()\\])",
+            lambda match: match.group(1),
+            literal.group(1),
+        )
+        if "\\" in value:
+            return None
+        return value
+    hexadecimal = _HEX_URI.search(raw)
+    if hexadecimal is None:
+        return None
+    compact = re.sub(r"\s+", "", hexadecimal.group(1))
+    if len(compact) % 2:
+        compact += "0"
+    try:
+        return bytes.fromhex(compact).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _action_dictionary_findings(
+    raw: str,
+    *,
+    external_uris: frozenset[str],
+) -> set[str]:
+    findings: set[str] = set()
+    subtype_match = _ACTION_SUBTYPE.search(raw)
+    if subtype_match is None:
+        findings.add("action_missing_or_unknown_subtype")
+        return findings
+    subtype = subtype_match.group(1)
+    if subtype not in _STANDARD_ACTION_SUBTYPES:
+        findings.add("action_unknown_subtype")
+        return findings
+    if subtype not in {"GoTo", "URI"}:
+        findings.add(f"action_{subtype.lower()}")
+        return findings
+    if subtype == "GoTo":
+        if re.search(r"/D(?![A-Za-z0-9])", raw) is None:
+            findings.add("action_goto_without_destination")
+        return findings
+
+    uri = _uri_from_action_dictionary(raw)
+    if uri is None or uri not in external_uris:
+        findings.add("action_uri_not_verified")
+        return findings
+    scheme = urlsplit(uri).scheme.lower()
+    if scheme not in {"http", "https", "mailto"}:
+        findings.add("action_uri_blocked_scheme")
+    return findings
+
+
+def _action_graph_findings(
+    *,
+    raw_objects: Mapping[int, str],
+    external_uris: frozenset[str],
+) -> set[str]:
+    """Default-deny action dictionaries reachable from /A or /Next."""
+
+    findings: set[str] = set()
+    pending: list[int] = []
+    for raw in raw_objects.values():
+        for direct in _ACTION_DICTIONARY.finditer(raw):
+            findings.update(
+                _action_dictionary_findings(
+                    direct.group(1), external_uris=external_uris
+                )
+            )
+        pending.extend(int(match.group(1)) for match in _ACTION_REFERENCE.finditer(raw))
+        if _ACTION_TYPE.search(raw):
+            findings.update(
+                _action_dictionary_findings(raw, external_uris=external_uris)
+            )
+        for subtype_match in _ACTION_SUBTYPE.finditer(raw):
+            subtype = subtype_match.group(1)
+            if subtype in _STANDARD_ACTION_SUBTYPES - {"GoTo", "URI"}:
+                findings.add(f"action_{subtype.lower()}")
+
+    visited: set[int] = set()
+    while pending:
+        xref = pending.pop()
+        if xref in visited:
+            continue
+        visited.add(xref)
+        raw = raw_objects.get(xref)
+        if raw is None:
+            findings.add("action_reference_invalid")
+            continue
+        findings.update(
+            _action_dictionary_findings(raw, external_uris=external_uris)
+        )
+        pending.extend(
+            int(match.group(1)) for match in _NEXT_ACTION_REFERENCE.finditer(raw)
+        )
+        for direct in _NEXT_ACTION_DICTIONARY.finditer(raw):
+            findings.update(
+                _action_dictionary_findings(
+                    direct.group(1), external_uris=external_uris
+                )
+            )
+    return findings
+
+
+def _active_pdf_findings(
+    document: fitz.Document,
+    *,
+    external_uris: frozenset[str],
+) -> tuple[str, ...]:
     findings: set[str] = set()
     try:
         trailer = document.pdf_trailer()
@@ -690,27 +908,38 @@ def _active_pdf_findings(document: fitz.Document) -> tuple[str, ...]:
     except (RuntimeError, ValueError):
         findings.add("embedded_file_scan_failed")
 
+    raw_objects: dict[int, str] = {}
     for xref in range(1, document.xref_length()):
         try:
             raw_object = document.xref_object(xref, compressed=False)
         except (RuntimeError, ValueError):
             findings.add("xref_scan_failed")
             continue
+        raw_objects[xref] = raw_object
         for match in _ACTIVE_NAME.finditer(raw_object):
             findings.add(match.group(0)[1:].lower())
+    findings.update(
+        _action_graph_findings(
+            raw_objects=raw_objects,
+            external_uris=external_uris,
+        )
+    )
     return tuple(sorted(findings))
 
 
-def inspect_pdf(
+def _inspect_pdf_with_pymupdf(
     path: Path,
     *,
     max_pages: int = MAX_PAGES,
     reject_active_content: bool = True,
 ) -> PdfInspection:
-    """Open, bound, render-smoke, and active-content scan a PDF with PyMuPDF."""
+    """Run the PyMuPDF portion of the fail-closed PDF inspection."""
 
     path = Path(path)
-    _positive_int(max_pages, "max_pages", MAX_PAGES)
+    # A bilingual dual-layout artifact may legitimately contain two output
+    # pages for every source page. Source requests remain capped at MAX_PAGES
+    # by validate_worker_request().
+    _positive_int(max_pages, "max_pages", MAX_OUTPUT_PAGES)
     with _open_regular(path, field="PDF") as handle:
         magic = handle.read(5)
     if magic != b"%PDF-":
@@ -729,7 +958,11 @@ def inspect_pdf(
         if page_count > max_pages:
             _fail("page_limit", f"PDF has {page_count} pages, limit is {max_pages}")
 
-        active_findings = _active_pdf_findings(document)
+        external_uris = _safe_pdf_link_uris(document)
+        active_findings = _active_pdf_findings(
+            document,
+            external_uris=external_uris,
+        )
         if "encrypted" in active_findings:
             _fail("encrypted_pdf", "PDF trailer declares encryption")
         if reject_active_content and active_findings:
@@ -737,8 +970,6 @@ def inspect_pdf(
                 "active_content",
                 "PDF contains blocked active content: " + ", ".join(active_findings),
             )
-        external_uris = _safe_pdf_link_uris(document)
-
         pages: list[PdfPageGeometry] = []
         rendered_pages = 0
         for page_number in range(page_count):
@@ -788,6 +1019,67 @@ def inspect_pdf(
         )
     finally:
         document.close()
+
+
+def inspect_pdf(
+    path: Path,
+    *,
+    max_pages: int = MAX_PAGES,
+    reject_active_content: bool = True,
+) -> PdfInspection:
+    """Open, bound, render-smoke, and reject parser/render warnings."""
+
+    # MuPDF's warning buffer and display switches are process-global. Serialize
+    # the inspection so one concurrent PDF cannot hide or inherit another's
+    # diagnostics.
+    with _MUPDF_INSPECTION_LOCK:
+        previous_errors = bool(fitz.TOOLS.mupdf_display_errors())
+        previous_warnings = bool(fitz.TOOLS.mupdf_display_warnings())
+        fitz.TOOLS.mupdf_display_errors(False)
+        fitz.TOOLS.mupdf_display_warnings(False)
+        fitz.TOOLS.mupdf_warnings(reset=True)
+        diagnostics = ""
+        try:
+            inspection = _inspect_pdf_with_pymupdf(
+                path,
+                max_pages=max_pages,
+                reject_active_content=reject_active_content,
+            )
+            diagnostics = fitz.TOOLS.mupdf_warnings(reset=True)
+        finally:
+            fitz.TOOLS.mupdf_warnings(reset=True)
+            fitz.TOOLS.mupdf_display_errors(previous_errors)
+            fitz.TOOLS.mupdf_display_warnings(previous_warnings)
+    if diagnostics.strip():
+        count = len(diagnostics.splitlines())
+        _fail(
+            "render_smoke_failed",
+            f"MuPDF reported {count} parser or render warning(s)",
+        )
+    return inspection
+
+
+def _independent_pdf_check(path: Path) -> dict[str, Any]:
+    """Run qpdf as an independent structural parser when it is installed."""
+
+    executable = shutil.which("qpdf")
+    if executable is None:
+        return {"tool": "qpdf", "status": "unavailable"}
+    try:
+        result = subprocess.run(
+            [executable, "--check", str(Path(path))],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"tool": "qpdf", "status": "failed"}
+    return {
+        "tool": "qpdf",
+        "status": "passed" if result.returncode == 0 else "failed",
+    }
 
 
 def _validate_result_document(
@@ -1012,7 +1304,11 @@ def load_and_validate_worker_result(
                 report_text = report_raw.decode("utf-8")
             except UnicodeDecodeError as exc:
                 _fail("invalid_artifact", f"backend report is not UTF-8: {exc}")
-            _object(_strict_json_loads(report_text, "backend report"), "backend report")
+            report = _object(
+                _strict_json_loads(report_text, "backend report"),
+                "backend report",
+            )
+            _validate_backend_report_safety(report)
     if total_output_bytes > validated_request["limits"]["maxOutputBytes"]:
         _fail("output_limit", "aggregate worker artifacts exceed request.maxOutputBytes")
 
@@ -1021,7 +1317,11 @@ def load_and_validate_worker_result(
         max_pages=validated_request["limits"]["maxPages"],
         reject_active_content=True,
     )
+    source_independent_check = _independent_pdf_check(Path(source_pdf))
+    if source_independent_check["status"] == "failed":
+        _fail("independent_pdf_check_failed", "qpdf rejected the source PDF")
     output_inspections: dict[str, PdfInspection] = {}
+    output_independent_checks: dict[str, dict[str, Any]] = {}
     normalized_page_maps: dict[str, list[dict[str, Any]]] = {}
     for artifact in artifacts:
         if artifact.role not in PDF_OUTPUT_ROLES:
@@ -1035,11 +1335,20 @@ def load_and_validate_worker_result(
                 "output_limit",
                 f"artifact {artifact.role} exceeds five times source size or configured output limit",
             )
+        output_page_limit = validated_request["limits"]["maxPages"]
+        if artifact.role == "translated_dual_pdf":
+            output_page_limit *= 2
         output_inspection = inspect_pdf(
             staging_dir / artifact.path,
-            max_pages=validated_request["limits"]["maxPages"],
+            max_pages=output_page_limit,
             reject_active_content=True,
         )
+        independent_check = _independent_pdf_check(staging_dir / artifact.path)
+        if independent_check["status"] == "failed":
+            _fail(
+                "independent_pdf_check_failed",
+                f"qpdf rejected artifact {artifact.role}",
+            )
         unexpected_uris = output_inspection.external_uris - source_inspection.external_uris
         if unexpected_uris:
             _fail(
@@ -1053,6 +1362,7 @@ def load_and_validate_worker_result(
             output=output_inspection,
         )
         output_inspections[artifact.role] = output_inspection
+        output_independent_checks[artifact.role] = independent_check
 
     index_entries = [artifact.to_index_entry() for artifact in artifacts]
     artifact_index = {
@@ -1084,14 +1394,28 @@ def load_and_validate_worker_result(
                     "pageGeometryValid": True,
                     "renderedPages": inspection.rendered_pages,
                     "activeContentFindings": [],
+                    "actionPolicy": "default-deny-v1",
                     "unexpectedExternalActions": 0,
+                    "independentPdfCheck": output_independent_checks[artifact.role],
                 }
             )
         qa_artifacts.append(item)
     qa = {
         "schemaVersion": SCHEMA_VERSION,
         "runId": validated_request["runId"],
-        "status": "passed",
+        # Machine checks are not a semantic/layout review. A human must still
+        # approve the immutable candidate explicitly before it can enter the
+        # shared manifest.
+        "status": "needs_review",
+        "automaticChecksStatus": (
+            "passed"
+            if source_independent_check["status"] == "passed"
+            and all(
+                check["status"] == "passed"
+                for check in output_independent_checks.values()
+            )
+            else "partial"
+        ),
         "source": {
             "sha256Verified": True,
             "bytesVerified": True,
@@ -1099,6 +1423,8 @@ def load_and_validate_worker_result(
             "pageCount": source_inspection.page_count,
             "renderedPages": source_inspection.rendered_pages,
             "activeContentFindings": [],
+            "actionPolicy": "default-deny-v1",
+            "independentPdfCheck": source_independent_check,
         },
         "output": {
             "aggregateBytes": total_output_bytes,
@@ -1243,6 +1569,8 @@ def publish_candidate_run(
     events_ndjson: str | bytes | Iterable[str],
     approved_fork_revisions: Collection[str] = (),
     worker_log: str = "",
+    run_purpose: str = "unclassified",
+    promotion_eligible: bool = False,
 ) -> Path:
     """Validate and atomically publish one immutable candidate run.
 
@@ -1259,6 +1587,11 @@ def publish_candidate_run(
         approved_fork_revisions=approved_fork_revisions,
         required_outputs=validated_request["outputs"],
     )
+    purpose = _identifier(run_purpose, "run_purpose")
+    if not isinstance(promotion_eligible, bool):
+        _fail("invalid_schema", "promotion_eligible must be a boolean")
+    if promotion_eligible and purpose != "semantic_translation":
+        _fail("policy_refusal", "only semantic translation runs may be promotable")
     events = validate_ndjson_events(
         events_ndjson,
         run_id=validated_request["runId"],
@@ -1338,6 +1671,7 @@ def publish_candidate_run(
         qa_bytes = _json_bytes(validated_result.qa)
         events_text = _normalized_events_text(events)
         artifact_index_digest = hashlib.sha256(artifact_index_bytes).hexdigest()
+        qa_digest = hashlib.sha256(qa_bytes).hexdigest()
         progress_events = [event for event in events if event["type"] == "progress"]
         last_progress = (
             {
@@ -1371,7 +1705,13 @@ def publish_candidate_run(
             "profileId": validated_request["translation"]["profileId"],
             "promptRevision": validated_request["translation"]["promptRevision"],
             "glossarySha256": validated_request["translation"]["glossarySha256"],
-            "state": "succeeded",
+            "state": (
+                "succeeded"
+                if validated_result.qa["status"] == "passed"
+                else "needs_review"
+            ),
+            "purpose": purpose,
+            "promotionEligible": promotion_eligible,
             "progress": last_progress,
             "timestamps": {
                 "startedAt": events[0]["time"],
@@ -1379,6 +1719,7 @@ def publish_candidate_run(
             },
             "resourceMetrics": {},
             "artifactIndexSha256": artifact_index_digest,
+            "qaSha256": qa_digest,
         }
         files = {
             "request.json": request_bytes,
@@ -1413,6 +1754,61 @@ def publish_candidate_run(
             shutil.rmtree(host_staging)
 
 
+def _promote_into_manifest(
+    *,
+    manifest_path: Path,
+    index_source: Mapping[str, Any],
+    run: Mapping[str, Any],
+    run_id: str,
+    role: str,
+    artifact: Mapping[str, Any],
+    digest: str,
+    size: int,
+    promoted_at: str,
+    reviewer: str,
+) -> dict[str, Any]:
+    with paper_manifest_lock(manifest_path):
+        manifest = _object(
+            _strict_json_loads(
+                _read_regular_bytes(
+                    manifest_path,
+                    field="papertrans-job.json",
+                    maximum=MAX_JSON_BYTES,
+                ).decode("utf-8"),
+                "papertrans-job.json",
+            ),
+            "papertrans-job.json",
+        )
+        if manifest.get("sourceType") != "pdf":
+            _fail("invalid_manifest", "only a PDF job can receive a translated PDF")
+        manifest_source = _object(manifest.get("source"), "papertrans-job.source")
+        if manifest_source.get("sha256") != index_source["sha256"]:
+            _fail("source_digest_mismatch", "candidate source does not match the PDF job")
+        if not isinstance(manifest.get("artifacts"), dict):
+            _fail("invalid_manifest", "papertrans-job.artifacts must be an object")
+        prior_status = copy.deepcopy(manifest.get("status"))
+        relative_artifact = f"pdf-runs/{run_id}/{artifact['path']}"
+        manifest["artifacts"]["translatedPdf"] = relative_artifact
+        manifest["pdfTranslation"] = {
+            "schemaVersion": SCHEMA_VERSION,
+            "runId": run_id,
+            "backendId": run.get("backendId"),
+            "role": role,
+            "artifact": relative_artifact,
+            "sha256": digest,
+            "bytes": size,
+            "artifactIndex": f"pdf-runs/{run_id}/artifact-index.json",
+            "qa": f"pdf-runs/{run_id}/qa.json",
+            "promotedAt": promoted_at,
+            "approvedBy": reviewer,
+        }
+        # The main pipeline state belongs to the existing import/translation pipeline.
+        manifest["status"] = prior_status
+        mode = stat.S_IMODE(manifest_path.stat().st_mode)
+        _atomic_write_bytes(manifest_path, _json_bytes(manifest), mode=mode)
+        return copy.deepcopy(manifest)
+
+
 def promote_candidate_pdf(
     *,
     output_root: Path,
@@ -1438,12 +1834,13 @@ def promote_candidate_pdf(
     run_root = slug_root / "pdf-runs" / run_id_value
     if run_root.is_symlink() or not run_root.is_dir():
         _fail("missing_run", "candidate run does not exist as a real directory")
+    index_bytes = _read_regular_bytes(
+        run_root / "artifact-index.json",
+        field="artifact-index.json",
+        maximum=MAX_JSON_BYTES,
+    )
     index_raw = _strict_json_loads(
-        _read_regular_bytes(
-            run_root / "artifact-index.json",
-            field="artifact-index.json",
-            maximum=MAX_JSON_BYTES,
-        ).decode("utf-8"),
+        index_bytes.decode("utf-8"),
         "artifact-index.json",
     )
     index = _object(index_raw, "artifact-index.json")
@@ -1464,28 +1861,62 @@ def promote_candidate_pdf(
     _positive_int(index_source["bytes"], "artifact-index.source.bytes")
     if not isinstance(index["artifacts"], list):
         _fail("invalid_artifact", "artifact-index.artifacts must be an array")
+    qa_bytes = _read_regular_bytes(
+        run_root / "qa.json", field="qa.json", maximum=MAX_JSON_BYTES
+    )
     qa = _object(
-        _strict_json_loads(
-            _read_regular_bytes(
-                run_root / "qa.json", field="qa.json", maximum=MAX_JSON_BYTES
-            ).decode("utf-8"),
-            "qa.json",
-        ),
+        _strict_json_loads(qa_bytes.decode("utf-8"), "qa.json"),
         "qa.json",
     )
-    if qa.get("status") != "passed":
-        _fail("qa_not_passed", "candidate QA must pass before promotion")
+    if qa.get("schemaVersion") != SCHEMA_VERSION or qa.get("runId") != run_id_value:
+        _fail("invalid_run", "candidate QA identity is invalid")
+    if qa.get("status") not in {"passed", "needs_review"}:
+        _fail("qa_not_passed", "candidate QA is not reviewable")
+    pdf_qa_items = [
+        item
+        for item in qa.get("artifacts", [])
+        if isinstance(item, dict) and item.get("role") in PDF_OUTPUT_ROLES
+    ]
+    independent_qa_passed = qa.get("automaticChecksStatus") == "passed" and bool(
+        pdf_qa_items
+    ) and not any(
+        item.get("independentPdfCheck")
+        != {"tool": "qpdf", "status": "passed"}
+        for item in pdf_qa_items
+    )
+    run_bytes = _read_regular_bytes(
+        run_root / "run.json", field="run.json", maximum=MAX_JSON_BYTES
+    )
     run = _object(
-        _strict_json_loads(
-            _read_regular_bytes(
-                run_root / "run.json", field="run.json", maximum=MAX_JSON_BYTES
-            ).decode("utf-8"),
-            "run.json",
-        ),
+        _strict_json_loads(run_bytes.decode("utf-8"), "run.json"),
         "run.json",
     )
+    if run.get("schemaVersion") != SCHEMA_VERSION or run.get("runId") != run_id_value:
+        _fail("invalid_run", "candidate run identity is invalid")
     if run.get("state") not in {"succeeded", "needs_review"}:
         _fail("invalid_run", "candidate run is not publishable")
+    if run.get("purpose") != "semantic_translation" or run.get(
+        "promotionEligible"
+    ) is not True:
+        _fail(
+            "promotion_refused",
+            "candidate is not a host-approved semantic translation run",
+        )
+    if not independent_qa_passed:
+        _fail(
+            "qa_not_passed",
+            "candidate requires a successful independent qpdf check before promotion",
+        )
+    run_source = _object(run.get("source"), "run.source")
+    if (
+        run_source.get("sha256") != index_source["sha256"]
+        or run_source.get("bytes") != index_source["bytes"]
+    ):
+        _fail("source_digest_mismatch", "run source disagrees with artifact index")
+    if run.get("artifactIndexSha256") != hashlib.sha256(index_bytes).hexdigest():
+        _fail("artifact_changed", "artifact index changed after run publication")
+    if run.get("qaSha256") != hashlib.sha256(qa_bytes).hexdigest():
+        _fail("artifact_changed", "candidate QA changed after run publication")
 
     matching = [item for item in index["artifacts"] if item.get("role") == role]
     if len(matching) != 1:
@@ -1505,46 +1936,18 @@ def promote_candidate_pdf(
     if actual_digest != digest or actual_size != size:
         _fail("artifact_changed", "candidate artifact changed after publication")
 
-    manifest_path = slug_root / "work" / "papertrans-job.json"
-    manifest = _object(
-        _strict_json_loads(
-            _read_regular_bytes(
-                manifest_path,
-                field="papertrans-job.json",
-                maximum=MAX_JSON_BYTES,
-            ).decode("utf-8"),
-            "papertrans-job.json",
-        ),
-        "papertrans-job.json",
+    return _promote_into_manifest(
+        manifest_path=slug_root / "work" / "papertrans-job.json",
+        index_source=index_source,
+        run=run,
+        run_id=run_id_value,
+        role=role,
+        artifact=artifact,
+        digest=digest,
+        size=size,
+        promoted_at=promoted_at,
+        reviewer=reviewer,
     )
-    if manifest.get("sourceType") != "pdf":
-        _fail("invalid_manifest", "only a PDF job can receive a translated PDF")
-    manifest_source = _object(manifest.get("source"), "papertrans-job.source")
-    if manifest_source.get("sha256") != index_source["sha256"]:
-        _fail("source_digest_mismatch", "candidate source does not match the PDF job")
-    if not isinstance(manifest.get("artifacts"), dict):
-        _fail("invalid_manifest", "papertrans-job.artifacts must be an object")
-    prior_status = copy.deepcopy(manifest.get("status"))
-    relative_artifact = f"pdf-runs/{run_id_value}/{artifact['path']}"
-    manifest["artifacts"]["translatedPdf"] = relative_artifact
-    manifest["pdfTranslation"] = {
-        "schemaVersion": SCHEMA_VERSION,
-        "runId": run_id_value,
-        "backendId": run.get("backendId"),
-        "role": role,
-        "artifact": relative_artifact,
-        "sha256": digest,
-        "bytes": size,
-        "artifactIndex": f"pdf-runs/{run_id_value}/artifact-index.json",
-        "qa": f"pdf-runs/{run_id_value}/qa.json",
-        "promotedAt": promoted_at,
-        "approvedBy": reviewer,
-    }
-    # The main pipeline state belongs to the existing import/translation pipeline.
-    manifest["status"] = prior_status
-    mode = stat.S_IMODE(manifest_path.stat().st_mode)
-    _atomic_write_bytes(manifest_path, _json_bytes(manifest), mode=mode)
-    return copy.deepcopy(manifest)
 
 
 __all__ = [
@@ -1552,6 +1955,7 @@ __all__ = [
     "MAX_DEADLINE_SECONDS",
     "MAX_INPUT_BYTES",
     "MAX_OUTPUT_BYTES",
+    "MAX_OUTPUT_PAGES",
     "MAX_PAGES",
     "PDF_OUTPUT_ROLES",
     "PdfInspection",

@@ -77,6 +77,56 @@ def test_writes_source_neutral_pdf_manifest(tmp_path: Path):
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["jobId"] == "paper"
 
 
+def test_manifest_rewrite_preserves_promoted_pdf_for_the_same_source(tmp_path: Path):
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-fixture")
+    manifest_path = tmp_path / "output" / "paper" / "work" / "papertrans-job.json"
+    write_pdf_job_manifest(
+        manifest_path,
+        slug="paper",
+        source=source,
+        status="needs_review",
+        pdf_parser="docling",
+        structure_mode="docling",
+        document=sample_document(),
+        started_at="2026-08-30T00:00:00Z",
+    )
+    promoted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    promoted_path = "pdf-runs/pdf-harumi-01/artifacts/translated-mono.pdf"
+    promotion_record = {
+        "schemaVersion": 1,
+        "runId": "pdf-harumi-01",
+        "backendId": "papertrans-harumi",
+        "role": "translated_mono_pdf",
+        "artifact": promoted_path,
+        "sha256": "a" * 64,
+        "bytes": 1234,
+        "artifactIndex": "pdf-runs/pdf-harumi-01/artifact-index.json",
+        "qa": "pdf-runs/pdf-harumi-01/qa.json",
+        "promotedAt": "2026-08-30T00:10:00Z",
+        "approvedBy": "reviewer-1",
+    }
+    promoted["artifacts"]["translatedPdf"] = promoted_path
+    promoted["pdfTranslation"] = promotion_record
+    manifest_path.write_text(json.dumps(promoted), encoding="utf-8")
+
+    rewritten = write_pdf_job_manifest(
+        manifest_path,
+        slug="paper",
+        source=source,
+        status="completed",
+        pdf_parser="docling",
+        structure_mode="docling",
+        document=sample_document(),
+        started_at="2026-08-30T00:00:00Z",
+    )
+
+    assert rewritten["status"] == "completed"
+    assert rewritten["artifacts"]["translatedPdf"] == promoted_path
+    assert rewritten["pdfTranslation"] == promotion_record
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == rewritten
+
+
 def test_pdf_qa_checks_links_assets_and_semantic_counts(tmp_path: Path):
     publication = tmp_path / "html"
     (publication / "assets").mkdir(parents=True)
