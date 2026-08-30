@@ -51,7 +51,7 @@
           {% else %}
           <article class="paragraph {{ value.kind }}" id="{{ value.id }}">
             <p class="translated{% if not value.japanese %} untranslated{% endif %}">{{ (value.japanese or value.original)|academic_links }}</p>
-            {% if value.preservedTerms %}<div class="terms">{% for term in value.preservedTerms %}<span class="term">{{ term }}</span>{% endfor %}</div>{% endif %}
+            {% if value.preservedTerms %}<div class="terms">{% for term in value.preservedTerms %}<span class="term">{{ term|academic_links }}</span>{% endfor %}</div>{% endif %}
             {% if value.warnings %}<details class="warnings"><summary>確認事項 {{ value.warnings|length }}件</summary>{{ value.warnings|join(" / ") }}</details>{% endif %}
             {% if value.japanese %}<details class="original"><summary>原文を表示{% if value.pages %}（p.{{ value.pages|join(", ") }}）{% endif %}</summary><p>{{ value.original|academic_links }}</p></details>{% endif %}
           </article>

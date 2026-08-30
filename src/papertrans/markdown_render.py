@@ -229,7 +229,7 @@ def markdown_with_external_links(text: str) -> str:
         rendered.append(escape_markdown_text(source[cursor : match.start()]))
         value = match.group(0)
         trailing = ""
-        while value and value[-1] in ".,;:":
+        while value and value[-1] in ".,;:!?。、，；：！？）］】〉》」』":
             trailing = value[-1] + trailing
             value = value[:-1]
         while value.endswith(")") and value.count("(") < value.count(")"):

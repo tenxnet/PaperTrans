@@ -92,7 +92,7 @@ def _link_filter(document: dict[str, Any]):
         def external_url(match: re.Match[str]) -> str:
             value = match.group(0)
             trailing = ""
-            while value and value[-1] in ".,;:":
+            while value and value[-1] in ".,;:!?。、，；：！？）］】〉》」』":
                 trailing = value[-1] + trailing
                 value = value[:-1]
             while value.endswith(")") and value.count("(") < value.count(")"):

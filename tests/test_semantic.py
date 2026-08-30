@@ -406,7 +406,8 @@ def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
     paragraph["original"] += (
         ' See "https://example.org/a-path?x=1&y=2" now.'
     )
-    paragraph["japanese"] = paragraph["original"]
+    paragraph["japanese"] = paragraph["original"] + "（https://example.org/japanese）"
+    paragraph["preservedTerms"] = ["https://example.org/term"]
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "figure-1.png").write_bytes(b"png")
     index = render_semantic_document(document, tmp_path, tmp_path / "html")
@@ -419,6 +420,14 @@ def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
         'rel="noopener noreferrer">https://example.org/a-path?x=1&amp;y=2</a>'
     ) in text
     assert "https://example.org/a-path?x=1&amp;y=2&amp;quot" not in text
+    assert (
+        '<a class="external" href="https://example.org/japanese" '
+        'rel="noopener noreferrer">https://example.org/japanese</a>）'
+    ) in text
+    assert (
+        '<span class="term"><a class="external" href="https://example.org/term" '
+        'rel="noopener noreferrer">https://example.org/term</a></span>'
+    ) in text
     assert "<figcaption>" in text
     assert '<a class="external" href="https://example.org/caption"' in text
     assert 'class="paper-section level-1"' in text

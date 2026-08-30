@@ -28,7 +28,7 @@ JOB_SCHEMA_VERSION = "1.0"
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 DEFAULT_TARGET_LANGUAGE = "ja"
 SUPPORTED_TARGET_LANGUAGES = {DEFAULT_TARGET_LANGUAGE}
-PDF_MCP_ARTIFACT_VERSION = "semantic-pdf-mcp-v1"
+PDF_MCP_ARTIFACT_VERSION = "semantic-pdf-mcp-v2"
 
 
 class TranslationJobError(RuntimeError):

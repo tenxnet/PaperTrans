@@ -394,7 +394,8 @@ def test_semantic_markdown_links_urls_in_body_and_visual_captions():
                             "id": "body",
                             "kind": "paragraph",
                             "original": (
-                                'See "https://example.org/a?x=1&y=2" now.'
+                                'See "https://example.org/a?x=1&y=2" now. '
+                                "日本語（https://example.org/japanese）"
                             ),
                         },
                     },
@@ -421,3 +422,7 @@ def test_semantic_markdown_links_urls_in_body_and_visual_captions():
         "(https://example.org/a?x=1&y=2)"
     ) in rendered
     assert "[https://example.org/table](https://example.org/table)" in rendered
+    assert (
+        "日本語（[https://example.org/japanese]"
+        "(https://example.org/japanese)）"
+    ) in rendered
