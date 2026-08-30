@@ -19,6 +19,13 @@ from papertrans.arxiv_html import (
     normalize_article_document,
     render_arxiv_html_document,
 )
+from papertrans.arxiv_markdown import (
+    arxiv_document_to_markdown,
+    arxiv_document_to_markdown_blocks,
+    validate_arxiv_markdown,
+)
+from papertrans.dom_ir import serialize_article
+from papertrans.render import arxiv_html_artifact_version
 
 
 FIXTURE = """
@@ -41,6 +48,8 @@ FIXTURE = """
 def test_normalizes_arxiv_urls_and_versions():
     assert normalize_arxiv_id("https://arxiv.org/abs/2508.19843") == "2508.19843"
     assert normalize_arxiv_id("arXiv:2508.19843v3") == "2508.19843v3"
+    assert normalize_arxiv_id("https://arxiv.org/abs/math/0211159") == "math/0211159"
+    assert normalize_arxiv_id("arXiv:HEP-TH/9901001V2") == "hep-th/9901001v2"
 
 
 def test_reads_authors_and_publication_date_from_arxiv_html_fallbacks():
@@ -142,6 +151,467 @@ def test_tokenizer_protects_math_citations_and_cross_references():
     assert 'id="m1"' not in placeholders["[[PTX_0001]]"]
 
 
+def test_tokenizer_does_not_confuse_literal_placeholder_text_with_nodes():
+    soup = BeautifulSoup(
+        '<p data-papertrans-id="html-0001">Literal [[PTX_0001]] and <math>x</math>.</p>',
+        "html.parser",
+    )
+    paragraph = soup.p
+    assert paragraph is not None
+
+    text, placeholders = _tokenize_node(paragraph)
+
+    assert text == "Literal [[PTX_0001]] and [[PTX_0002]]."
+    assert list(placeholders) == ["[[PTX_0002]]"]
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(
+            BeautifulSoup(
+                f'<article><h1>Title</h1>{paragraph}</article>',
+                "html.parser",
+            ).article
+        ),
+        "units": [
+            {
+                "id": "html-0001",
+                "translationSource": text,
+                "japanese": text,
+                "placeholders": placeholders,
+            }
+        ],
+    }
+
+    markdown = arxiv_document_to_markdown(document)
+
+    assert r"Literal \[\[PTX\_0001\]\] and $x$" in markdown
+
+
+def test_markdown_restores_reordered_placeholders_by_token_id():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1 class="ltx_title ltx_title_document" data-papertrans-id="html-0001">Title</h1>
+          <p class="ltx_p" data-papertrans-id="html-0002">
+            Study <math><annotation encoding="application/x-tex">x</annotation></math>
+            with <cite>[<a href="#bib.b1">1</a>]</cite>.
+          </p>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [
+            {
+                "id": "html-0001",
+                "translationSource": "Title",
+                "japanese": "題名",
+            },
+            {
+                "id": "html-0002",
+                "translationSource": "Study [[PTX_0001]] with [[PTX_0002]].",
+                "japanese": "引用 [[PTX_0002]] と数式 [[PTX_0001]]。",
+            },
+        ],
+    }
+
+    markdown = arxiv_document_to_markdown(document)
+
+    assert "引用 [[PTX_" not in markdown
+    assert markdown.index("[1](#bib.b1)") < markdown.index("$x$")
+
+
+def test_markdown_preserves_subfigures_table_targets_and_list_markers():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1 class="ltx_title ltx_title_document">Title</h1>
+          <p class="ltx_p">See <a href="#T1.cell">the value</a>.</p>
+          <ul><li id="I1"><span class="ltx_tag ltx_tag_item">•</span> Item</li></ul>
+          <figure class="ltx_figure" id="F1">
+            <div>
+              <figure class="ltx_figure ltx_figure_panel" id="F1.sf1">
+                <img src="assets/a.png" alt="A"/>
+                <figcaption>(a) Alpha</figcaption>
+              </figure>
+              <figure class="ltx_figure ltx_figure_panel" id="F1.sf2">
+                <img src="assets/b.png" alt="B"/>
+                <figcaption>(b) Beta</figcaption>
+              </figure>
+            </div>
+            <figcaption>Figure 1: Combined.</figcaption>
+          </figure>
+          <figure class="ltx_table" id="T1">
+            <figcaption>Table 1</figcaption>
+            <table><tbody id="T1.body"><tr id="T1.row"><td id="T1.cell">42</td></tr></tbody></table>
+          </figure>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["source"]["figures"] == qa["output"]["figures"] == 3
+    assert qa["source"]["tables"] == qa["output"]["tables"] == 1
+    assert '<a id="F1"></a>' not in markdown
+    assert '<a id="F1.sf1"></a>' not in markdown
+    assert '<a id="F1.sf2"></a>' not in markdown
+    assert "(a) Alpha" in markdown and "(b) Beta" in markdown
+    assert "Figure 1: Combined." in markdown
+    assert '<a id="T1.cell"></a>' in markdown
+    assert '<a id="T1.body"></a>' not in markdown
+    assert '<a id="T1.row"></a>' not in markdown
+    assert '- <a id="I1"></a>Item' not in markdown
+    assert "- Item" in markdown
+    assert "- • Item" not in markdown
+
+
+def test_markdown_keeps_only_targets_referenced_by_rendered_content():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1 id="title">Title</h1>
+          <script><a href="#unused">hidden source link</a></script>
+          <p id="unused">Unused target</p>
+          <p>See <a href="#kept">the kept target</a>.</p>
+          <p id="kept">Kept target</p>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["emptyAnchors"] == qa["internalLinks"] == 1
+    assert qa["unreferencedEmptyAnchors"] == []
+    assert '<a id="kept"></a>' in markdown
+    assert '<a id="title"></a>' not in markdown
+    assert '<a id="unused"></a>' not in markdown
+
+
+def test_markdown_does_not_duplicate_an_inherited_section_anchor():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <p>See <a href="#S1">the section</a>.</p>
+          <section id="S1">
+            <h2>Main section</h2>
+            <h6>Acknowledgements.</h6>
+          </section>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert markdown.count('<a id="S1"></a>') == 1
+    assert '<a id="S1-2"></a>' not in markdown
+    assert "###### Acknowledgements." in markdown
+
+
+def test_markdown_neutralizes_arxiv_tex_that_only_looks_like_markdown():
+    soup = BeautifulSoup(
+        r"""
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <p>
+            <math><annotation encoding="application/x-tex">\sigma=&lt;(E-&lt;E&gt;)^{2}&gt;+[f](x),\alpha=1,\alpha&lt;1,\alpha&gt;1</annotation></math>,
+            <math><annotation encoding="application/x-tex">&gt;3\sigma</annotation></math>, and
+            <math><annotation encoding="application/x-tex">\lx@sectionsign
+              2</annotation></math>.
+          </p>
+          <p>Before <math display="block" alttext="x">x</math> after.</p>
+          <p>
+            <math><semantics><mrow><mi>y</mi></mrow>
+              <annotation encoding="text/plain">do not duplicate</annotation>
+            </semantics></math>
+          </p>
+          <p><span class="ltx_font_typewriter">LRG3<math alttext="+"><semantics><mo>+</mo><annotation encoding="application/x-tex">+</annotation></semantics></math>ELG1</span></p>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["source"]["inlineMath"] == qa["output"]["inlineMath"] == 5
+    assert qa["source"]["literalMath"] == 1
+    assert qa["output"]["mathFallbacks"] == 0
+    assert (
+        r"$\sigma=\lt{}(E-\lt{}E\gt{})^{2}\gt{}+[f]{}(x),"
+        r"\alpha=1,\alpha\lt{}1,\alpha\gt{}1$"
+        in markdown
+    )
+    assert r"$\gt{}3\sigma$" in markdown
+    assert r"$\S 2$" in markdown
+    assert "Before $x$ after." in markdown
+    assert "$y$" in markdown
+    assert "do not duplicate" not in markdown
+    assert "`LRG3+ELG1`" in markdown
+    assert "LRG3++ELG1" not in markdown
+    assert "```tex" not in markdown
+
+
+def test_markdown_preserves_each_equation_row_label_and_target():
+    soup = BeautifulSoup(
+        r"""
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <p>See <a href="#E2">Equation 2</a> and <a href="#R2">its row</a>.</p>
+          <table class="ltx_equationgroup ltx_eqn_table" id="EG1">
+            <tbody id="E1"><tr class="ltx_equation ltx_eqn_row">
+              <td><math display="inline"><annotation encoding="application/x-tex">
+                \text{sample $x$}
+              </annotation></math></td>
+              <td><span class="ltx_tag ltx_tag_equation">(1)</span></td>
+            </tr></tbody>
+            <tbody id="E2"><tr class="ltx_equation ltx_eqn_row" id="R2">
+              <td><math display="block"><annotation encoding="application/x-tex">
+                z=\parbox{10pt}{\begin{flushleft}y\end{flushleft}}
+              </annotation></math></td>
+              <td><span class="ltx_tag ltx_tag_equation">(2)</span></td>
+            </tr></tbody>
+          </table>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["source"]["displayRows"] == qa["output"]["displayRows"] == 2
+    assert qa["source"]["displayMath"] == qa["output"]["displayMath"] == 2
+    assert qa["source"]["equationLabels"] == qa["output"]["equationLabels"] == 2
+    assert qa["output"]["mathFallbacks"] == 0
+    assert markdown.count("$$") == 4
+    assert r"\text{sample $x$}" in markdown
+    assert r"z={y}" in markdown
+    assert "\\parbox" not in markdown
+    assert "flushleft" not in markdown
+    assert "(1)" in markdown and "(2)" in markdown
+    assert markdown.count('<a id="E2"></a>') == 1
+    assert markdown.count('<a id="R2"></a>') == 1
+    assert markdown.index("(1)") < markdown.index('<a id="E2"></a>') < markdown.index("z={y}")
+    assert markdown.index('<a id="E2"></a>') < markdown.index('<a id="R2"></a>')
+    assert "[Equation 2](#E2)" in markdown
+    assert "[its row](#R2)" in markdown
+    assert "```tex" not in markdown
+
+
+def test_arxiv_math_injection_remains_code_and_fails_math_qa():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <p><math alttext="x $$ ![track](https://evil.example/pixel) $$ y">x</math></p>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "failed"
+    assert qa["output"]["mathFallbacks"] == 1
+    assert "one or more math expressions fell back to code" in qa["failures"]
+    assert "![track](" not in markdown
+
+
+def test_markdown_preserves_svg_nested_in_a_verbatim_wrapper():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <code class="ltx_verbatim"><span>
+            <svg id="diagram" viewBox="0 0 10 10">
+              <a id="svg-internal-target"></a>
+              <use href="#svg-internal-target"></use>
+              <foreignObject><div class="ltx_listing">Diagram label</div></foreignObject>
+            </svg>
+          </span></code>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["source"]["svg"] == qa["output"]["svg"] == 1
+    assert qa["source"]["listings"] == 0
+    assert '<svg id="diagram"' in markdown
+    assert '<a id="svg-internal-target"></a>' in markdown
+    assert '<use href="#svg-internal-target"></use>' in markdown
+    assert qa["unreferencedEmptyAnchors"] == []
+    assert "<foreignobject>" in markdown
+    assert "Diagram label" in markdown
+
+
+def test_markdown_preserves_empty_anchors_inside_raw_complex_tables():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <figure class="ltx_table" id="T1">
+            <table>
+              <tr><td rowspan="2"><a id="raw-cell-target"></a>A</td><td>B</td></tr>
+              <tr><td>C</td></tr>
+            </table>
+          </figure>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert '<table>' in markdown
+    assert '<a id="raw-cell-target"></a>' in markdown
+    assert 'rowspan="2"' in markdown
+    assert qa["unreferencedEmptyAnchors"] == []
+
+
+def test_markdown_projects_latex_listing_as_a_fenced_code_block():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <div class="ltx_listing" id="alg1">
+            <div class="ltx_listingline" id="alg1.l1">
+              <span class="ltx_tag ltx_tag_listingline">1:</span> Set <math alttext="x">x</math>
+            </div>
+            <div class="ltx_listingline" id="alg1.l2">2: Return x</div>
+          </div>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["source"]["listings"] == qa["output"]["codeBlocks"] == 1
+    assert "```text\n1: Set $x$\n2: Return x\n```" in markdown
+    assert '<a id="alg1"></a>' not in markdown
+    assert '<a id="alg1.l1"></a>' not in markdown
+    assert '<a id="alg1.l2"></a>' not in markdown
+
+
 def test_normalizer_excludes_captions_and_bibliography(tmp_path: Path):
     work = tmp_path / "work"
     work.mkdir()
@@ -159,6 +629,9 @@ def test_normalizer_excludes_captions_and_bibliography(tmp_path: Path):
     assert "Original caption" not in source_text
     assert "References" not in source_text
     assert len(document["units"]) == 5
+    assert document["schema"] == "papertrans.document-ir"
+    assert document["profile"] == "official_arxiv_html"
+    assert document["content"]["root"]["tag"] == "article"
 
 
 def test_normalizer_leaves_failed_table_environment_opaque(tmp_path: Path):
@@ -221,6 +694,26 @@ def test_repairs_sections_nested_by_unclosed_latex_verbatim_code():
     assert second is not None
     assert second.find("section", id="S2.SS1", recursive=False) is not None
     assert not article.select("code section")
+
+
+def test_section_repair_never_uses_bibliography_as_a_later_section_parent():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <section id="bib" class="ltx_bibliography"><h2>References</h2></section>
+          <section id="A0.SS2" class="ltx_subsection"><h3>Appendix details</h3></section>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    _repair_section_hierarchy(article)
+
+    appendix = article.find("section", id="A0.SS2")
+    assert appendix is not None
+    assert appendix.find_parent("section") is None
 
 
 def test_repairs_list_items_nested_by_unclosed_latex_verbatim_code():
@@ -360,6 +853,7 @@ def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
     assert len([math for math in rendered.find_all("math") if not math.find_parent("details")]) == 1
     assert rendered.find("a", href="#bib.b1") is not None
     layout_css = rendered.style.get_text() if rendered.style is not None else ""
+    assert "body{display:block!important" in layout_css
     assert "grid-template-columns:minmax(0,1fr)" in layout_css
     assert ".ptx-main .ltx_table,.ptx-main .ltx_figure_panel:has(table){" in layout_css
     assert "min-width:0;max-width:100%;overflow-x:auto" in layout_css
@@ -368,4 +862,32 @@ def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
     assert ".ptx-main .ltx_equationgroup" in layout_css
     assert "@media(max-width:1200px)" in layout_css
     assert "width:max-content;min-width:100%" not in layout_css
-    assert json.loads((output / "qa.json").read_text())["status"] == "passed"
+    assert rendered.find("style", attrs={"data-papertrans-browser-compat": True}) is not None
+    artifact_meta = rendered.find("meta", attrs={"name": "papertrans-artifact-version"})
+    assert artifact_meta is not None
+    assert artifact_meta.get("content") == arxiv_html_artifact_version()
+    assert rendered.find("link", href="assets/arxiv-paper.css") is None
+    qa_document = json.loads((output / "qa.json").read_text())
+    assert qa_document["status"] == "passed"
+    assert qa_document["artifactVersion"] == arxiv_html_artifact_version()
+    markdown = (output / "index.md").read_text(encoding="utf-8")
+    assert "# Model Xの研究" in markdown
+    assert "本研究では $x$ を用いる" in markdown
+    assert '<a id="m1"></a>' not in markdown
+    assert "[Fig. 1](#S1.F1)" in markdown
+    assert '<a id="bib.b1"></a>' in markdown
+    assert "<svg>" in markdown
+    assert "原文を表示" not in markdown
+    assert "We study" not in markdown
+    assert "[[PTX_" not in markdown
+    markdown_qa = json.loads((output / "markdown-qa.json").read_text(encoding="utf-8"))
+    assert markdown_qa["status"] == "passed"
+    assert markdown_qa["source"]["figures"] == 1
+    assert markdown_qa["source"]["math"] == 1
+    assert document["schema"] == "papertrans.document-ir"
+    assert document["profile"] == "official_arxiv_html"
+
+    (work / "article-normalized.html").unlink()
+    regenerated_output = tmp_path / "regenerated"
+    render_arxiv_html_document(document, work, regenerated_output)
+    assert (regenerated_output / "index.md").read_bytes() == (output / "index.md").read_bytes()

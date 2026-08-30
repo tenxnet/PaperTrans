@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from zipfile import ZipFile
 
 import anyio
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from papertrans import chatgpt_worker
 from papertrans.chatgpt_worker import ChatGPTTranslationStore, TranslationJobError
 from papertrans.mcp_server import server
+from papertrans.render import arxiv_html_artifact_version
 
 
 ARTICLE = f"""
@@ -81,6 +83,10 @@ def _translations(chunk: dict) -> list[dict]:
     ]
 
 
+def test_default_job_id_is_safe_for_legacy_arxiv_identifiers():
+    assert chatgpt_worker._default_job_id("math/0211159") == "arxiv-math-0211159-mcp"
+
+
 def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -131,9 +137,39 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     assert finalized["usage"]["available"] is False
     assert Path(finalized["indexPath"]).exists()
     assert '<html lang="ja">' in Path(finalized["indexPath"]).read_text(encoding="utf-8")
+    assert Path(finalized["markdownPath"]).exists()
+    assert "日本語訳" in Path(finalized["markdownPath"]).read_text(encoding="utf-8")
     assert Path(finalized["bundlePath"]).exists()
     assert json.loads(Path(finalized["qaPath"]).read_text(encoding="utf-8"))["status"] == "passed"
+    assert json.loads(Path(finalized["markdownQaPath"]).read_text(encoding="utf-8"))["status"] == "passed"
+    finalized_html = Path(finalized["indexPath"]).read_bytes()
+    assert b"data-papertrans-browser-compat" in finalized_html
+    assert b"papertrans-artifact-version" in finalized_html
+    assert b"body{display:block!important" in finalized_html
+    assert b"assets/arxiv-paper.css" not in finalized_html
+    with ZipFile(finalized["bundlePath"]) as archive:
+        assert archive.read("index.html") == finalized_html
+        assert archive.read("index.md") == Path(finalized["markdownPath"]).read_bytes()
+        assert "qa.json" in archive.namelist()
+    finalized_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert finalized_manifest["artifacts"]["rendererVersion"] == arxiv_html_artifact_version()
+    assert finalized_manifest["artifacts"]["markdownPath"] == finalized["markdownPath"]
     assert restarted.finalize("paper-chatgpt") == finalized
+    assert restarted.status("paper-chatgpt")["status"] == "completed"
+
+    Path(finalized["indexPath"]).write_text("stale artifact", encoding="utf-8")
+    finalized_manifest["artifacts"]["rendererVersion"] = "1-stale"
+    manifest_path.write_text(json.dumps(finalized_manifest), encoding="utf-8")
+    assert restarted.status("paper-chatgpt")["status"] == "ready_to_finalize"
+
+    refreshed = restarted.finalize("paper-chatgpt")
+    refreshed_html = Path(refreshed["indexPath"]).read_bytes()
+    assert b"stale artifact" not in refreshed_html
+    assert b"data-papertrans-browser-compat" in refreshed_html
+    with ZipFile(refreshed["bundlePath"]) as archive:
+        assert archive.read("index.html") == refreshed_html
+    refreshed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert refreshed_manifest["artifacts"]["rendererVersion"] == arxiv_html_artifact_version()
 
 
 def test_chatgpt_worker_rejects_unsupported_target_language(tmp_path: Path):

@@ -22,13 +22,18 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
 
+from .arxiv_markdown import render_arxiv_markdown_document
+from .dom_ir import deserialize_article, serialize_article
 from .metrics import record_stage, utc_now
-from .render import create_bundle
+from .render import ARXIV_HTML_TEMPLATE, arxiv_html_artifact_version, create_bundle
 from .translate import _parse_result
 
 
 ARXIV_ORIGIN = "https://arxiv.org"
-ARXIV_ID_RE = re.compile(r"(?P<id>\d{4}\.\d{4,5})(?P<version>v\d+)?", re.IGNORECASE)
+ARXIV_ID_RE = re.compile(
+    r"(?P<id>(?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7}))(?P<version>v\d+)?",
+    re.IGNORECASE,
+)
 PLACEHOLDER_RE = re.compile(r"\[\[PTX_\d{4}\]\]")
 DISALLOWED_TAGS = {"script", "iframe", "form", "input", "button", "textarea"}
 PROTECTED_TAGS = {"math", "cite", "code", "pre", "svg", "img", "object"}
@@ -56,8 +61,11 @@ def normalize_arxiv_id(value: str) -> str:
     match = ARXIV_ID_RE.search(value.strip())
     if not match:
         raise ValueError(f"invalid arXiv identifier: {value}")
+    identifier = match.group("id")
+    if "/" in identifier:
+        identifier = identifier.lower()
     version = match.group("version") or ""
-    return f"{match.group('id')}{version.lower()}"
+    return f"{identifier}{version.lower()}"
 
 
 def _request_bytes(url: str, timeout: int = 60) -> tuple[bytes, str, str | None]:
@@ -354,7 +362,7 @@ def _find_resolved_id(soup: BeautifulSoup, requested: str) -> str:
     if watermark:
         match = ARXIV_ID_RE.search(watermark.get_text(" ", strip=True))
         if match:
-            return f"{match.group('id')}{(match.group('version') or '').lower()}"
+            return normalize_arxiv_id(match.group(0))
     return requested
 
 
@@ -453,6 +461,13 @@ def _repair_section_hierarchy(article: Tag) -> dict[str, int]:
     stack: list[tuple[int, Tag]] = [(1, article)]
     for section in sections:
         level = _section_level(section)
+        is_bibliography = "ltx_bibliography" in section.get("class", [])
+        while (
+            len(stack) > 1
+            and "ltx_bibliography" in stack[-1][1].get("class", [])
+            and not is_bibliography
+        ):
+            stack.pop()
         while stack and stack[-1][0] >= level:
             stack.pop()
         parent = stack[-1][1] if stack else article
@@ -649,13 +664,36 @@ def _sanitized_html(tag: Tag) -> str:
 def _tokenize_node(node: Tag) -> tuple[str, dict[str, str]]:
     placeholders: dict[str, str] = {}
     parts: list[str] = []
+    reserved_tokens: set[str] = set()
+
+    def collect_literals(current: Tag | NavigableString) -> None:
+        if isinstance(current, NavigableString):
+            reserved_tokens.update(PLACEHOLDER_RE.findall(str(current)))
+            return
+        if _is_protected(current):
+            return
+        for child in current.children:
+            if isinstance(child, (Tag, NavigableString)):
+                collect_literals(child)
+
+    collect_literals(node)
+    next_token = 1
+
+    def allocate_token() -> str:
+        nonlocal next_token
+        while next_token <= 9999:
+            token = f"[[PTX_{next_token:04d}]]"
+            next_token += 1
+            if token not in reserved_tokens and token not in placeholders:
+                return token
+        raise ValueError("source text exhausts the protected placeholder namespace")
 
     def walk(current: Tag | NavigableString) -> None:
         if isinstance(current, NavigableString):
             parts.append(str(current))
             return
         if _is_protected(current):
-            token = f"[[PTX_{len(placeholders) + 1:04d}]]"
+            token = allocate_token()
             placeholders[token] = _sanitized_html(current)
             parts.append(f" {token} ")
             return
@@ -777,6 +815,9 @@ def normalize_article_document(
     article_path = work_dir / "article-normalized.html"
     article_path.write_text(str(article), encoding="utf-8")
     document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
         "version": 1,
         "sourceType": "official_arxiv_html",
         "source": {
@@ -786,10 +827,13 @@ def normalize_article_document(
             "sha256": acquisition["sourceSha256"],
             "license": acquisition.get("license"),
         },
+        "metadata": acquisition.get("metadata", {}),
+        "assets": acquisition.get("assets", []),
         "status": "normalized",
         "model": {"translation": None, "reasoningEffort": None},
         "glossary": GLOSSARY,
         "validation": acquisition["validation"],
+        "content": serialize_article(article),
         "units": units,
         "warnings": [],
     }
@@ -1349,13 +1393,22 @@ def render_arxiv_html_document(
     metrics_path: Path | None = None,
 ) -> Path:
     started = utc_now()
-    source_soup = BeautifulSoup(
-        (work_dir / "article-normalized.html").read_text(encoding="utf-8"), "html.parser"
-    )
-    source_article = source_soup.find("article", class_="ltx_document")
+    legacy_document = document.get("content") is None
+    if not legacy_document:
+        source_article = deserialize_article(document["content"])
+    else:
+        source_soup = BeautifulSoup(
+            (work_dir / "article-normalized.html").read_text(encoding="utf-8"), "html.parser"
+        )
+        source_article = source_soup.find("article", class_="ltx_document")
     if source_article is None:
         raise ValueError("article-normalized.html is invalid")
     _repair_section_hierarchy(source_article)
+    if legacy_document:
+        document.setdefault("schema", "papertrans.document-ir")
+        document.setdefault("schemaVersion", "1.0")
+        document.setdefault("profile", "official_arxiv_html")
+        document["content"] = serialize_article(source_article)
     _refresh_unit_structure(document, source_article)
     article_soup = BeautifulSoup(str(source_article), "html.parser")
     article = article_soup.find("article", class_="ltx_document")
@@ -1394,12 +1447,15 @@ def render_arxiv_html_document(
         trim_blocks=True,
         lstrip_blocks=True,
     )
-    template = environment.get_template("arxiv-paper.html.j2")
+    template = environment.get_template(ARXIV_HTML_TEMPLATE)
+    artifact_version = arxiv_html_artifact_version()
     rendered = template.render(
         document=document,
         title=_translation_plain(title_unit),
         article=Markup(str(article)),
         toc=toc,
+        artifact_version=artifact_version,
+        has_paper_css=(output_assets / "arxiv-paper.css").is_file(),
     )
     index_path = output_dir / "index.html"
     index_path.write_text(rendered, encoding="utf-8")
@@ -1411,6 +1467,7 @@ def render_arxiv_html_document(
 
     output_soup = BeautifulSoup(rendered, "html.parser")
     qa = _validate_rendered_html(source_article, output_soup)
+    qa["artifactVersion"] = artifact_version
     missing_files = [
         asset for asset in qa["localAssets"] if not (output_dir / asset).exists()
     ]
@@ -1421,6 +1478,7 @@ def render_arxiv_html_document(
     (output_dir / "qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
     if qa["status"] != "passed":
         raise RuntimeError(f"rendered HTML QA failed: {qa}")
+    markdown_path = render_arxiv_markdown_document(document, output_dir)
     record_stage(
         metrics_path,
         "html_render_and_qa",
@@ -1428,6 +1486,8 @@ def render_arxiv_html_document(
         utc_now(),
         {
             "html": str(index_path),
+            "markdown": str(markdown_path),
+            "markdownQa": str(output_dir / "markdown-qa.json"),
             "qa": qa,
         },
     )
@@ -1483,6 +1543,7 @@ def run_arxiv_html_pipeline(
         publication_dir,
         metrics_path=metrics_path,
     )
+    markdown_path = publication_dir / "index.md"
     create_bundle(publication_dir, bundle_path)
     record_stage(
         metrics_path,
@@ -1491,6 +1552,7 @@ def run_arxiv_html_pipeline(
         utc_now(),
         {
             "html": str(index_path),
+            "markdown": str(markdown_path),
             "bundle": str(bundle_path),
             "route": "official_arxiv_html",
             "model": None if skip_translation else translation_model,
@@ -1502,6 +1564,7 @@ def run_arxiv_html_pipeline(
         shutil.copy2(cold_metrics, publication_dir / "cold-run-metrics.json")
     return {
         "html": str(index_path),
+        "markdown": str(markdown_path),
         "bundle": str(bundle_path),
         "metrics": str(metrics_path),
         "route": "official_arxiv_html",

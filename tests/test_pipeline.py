@@ -1,4 +1,5 @@
 from pathlib import Path
+from zipfile import ZipFile
 
 from papertrans.models import BBox, DocumentIR, DocumentItem, PageIR
 from papertrans.render import create_bundle, render_document
@@ -56,11 +57,20 @@ def test_render_and_zip(tmp_path: Path):
     index = render_document(document, work, output)
     bundle = create_bundle(output, tmp_path / "paper.zip")
     text = index.read_text(encoding="utf-8")
+    markdown = (output / "index.md").read_text(encoding="utf-8")
     assert "Transformer の結果" in text
     assert "原文を表示" in text
     assert "図表・数式の確認用" in text
     assert "page-001-original.jpg" in text
+    assert "# A Test Paper" in markdown
+    assert "A. Researcher" in markdown
+    assert "Transformer の結果を \\[12\\] に示す。" in markdown
+    assert "results are reported" not in markdown
     assert bundle.exists()
+    with ZipFile(bundle) as archive:
+        assert archive.read("index.html") == index.read_bytes()
+        assert archive.read("index.md") == (output / "index.md").read_bytes()
+        assert set(archive.namelist()) == {"document.json", "index.html", "index.md"}
 
 
 def test_codex_command_uses_read_only_sandbox(tmp_path: Path):

@@ -125,10 +125,16 @@ def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
         unit["japanese"] = unit["original"]
     index = render_semantic_document(document, tmp_path, tmp_path / "html")
     text = index.read_text(encoding="utf-8")
+    markdown = (tmp_path / "html" / "index.md").read_text(encoding="utf-8")
     assert 'href="#ref-1"' in text
     assert 'href="#visual-figure-1"' in text
     assert 'class="paper-section level-1"' in text
     assert "Page 1" not in text
+    assert "# Paper Title" in markdown
+    assert "## 1 Introduction" in markdown
+    assert "![Figure 1](assets/figure-1.png)" in markdown
+    assert '<a id="ref-1"></a>' in markdown
+    assert "Page 1" not in markdown
 
 
 def test_semantic_translation_is_explicitly_sol_high(tmp_path: Path):

@@ -15,7 +15,7 @@ from .arxiv_html import (
     normalize_article_document,
     render_arxiv_html_document,
 )
-from .render import create_bundle
+from .render import arxiv_html_artifact_version, create_bundle
 
 
 JOB_SCHEMA_VERSION = "1.0"
@@ -40,7 +40,7 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _default_job_id(arxiv_id: str) -> str:
-    normalized = normalize_arxiv_id(arxiv_id)
+    normalized = normalize_arxiv_id(arxiv_id).replace("/", "-")
     return f"arxiv-{normalized}-mcp"
 
 
@@ -71,6 +71,8 @@ class MCPTranslationStore:
             "results": root / "work" / "chatgpt-translations",
             "metrics": root / "run-metrics.json",
             "bundle": root / f"{safe_id}-html.zip",
+            "markdown": root / "html" / "index.md",
+            "markdown_qa": root / "html" / "markdown-qa.json",
         }
 
     def _load_manifest(self, job_id: str) -> tuple[dict[str, Any], dict[str, Path]]:
@@ -92,6 +94,24 @@ class MCPTranslationStore:
         if not paths["document"].exists():
             raise TranslationJobError("translation document is missing")
         return json.loads(paths["document"].read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _artifact_files_current(manifest: dict[str, Any], paths: dict[str, Path]) -> bool:
+        return (
+            manifest.get("artifacts", {}).get("rendererVersion")
+            == arxiv_html_artifact_version()
+            and (paths["html"] / "index.html").is_file()
+            and (paths["html"] / "qa.json").is_file()
+            and paths["markdown"].is_file()
+            and paths["markdown_qa"].is_file()
+            and paths["bundle"].is_file()
+        )
+
+    @classmethod
+    def _artifacts_current(cls, manifest: dict[str, Any], paths: dict[str, Path]) -> bool:
+        return manifest.get("status") == "completed" and cls._artifact_files_current(
+            manifest, paths
+        )
 
     @staticmethod
     def _refresh_status(
@@ -146,7 +166,7 @@ class MCPTranslationStore:
             document = self._load_document(paths)
             previous_status = manifest["status"]
             self._refresh_status(manifest, document, touch=False)
-            if previous_status == "completed" and (paths["html"] / "index.html").exists():
+            if previous_status == "completed" and self._artifact_files_current(manifest, paths):
                 manifest["status"] = "completed"
             return self._summary(manifest, paths)
         if paths["root"].exists() and any(paths["root"].iterdir()):
@@ -213,7 +233,7 @@ class MCPTranslationStore:
     def _summary(self, manifest: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
         total = len(manifest["chunks"])
         completed = sum(chunk["status"] == "completed" for chunk in manifest["chunks"])
-        artifacts_current = manifest["status"] == "completed"
+        artifacts_current = self._artifacts_current(manifest, paths)
         return {
             "jobId": manifest["jobId"],
             "status": manifest["status"],
@@ -232,6 +252,7 @@ class MCPTranslationStore:
                 if artifacts_current and (paths["html"] / "index.html").exists()
                 else None
             ),
+            "markdownPath": str(paths["markdown"]) if artifacts_current else None,
             "bundlePath": (
                 str(paths["bundle"])
                 if artifacts_current and paths["bundle"].exists()
@@ -260,7 +281,7 @@ class MCPTranslationStore:
                 document = self._load_document(paths)
                 previous_status = manifest["status"]
                 self._refresh_status(manifest, document, touch=False)
-                if previous_status == "completed" and (paths["html"] / "index.html").exists():
+                if previous_status == "completed" and self._artifact_files_current(manifest, paths):
                     manifest["status"] = "completed"
                 jobs.append(self._summary(manifest, paths))
             except (KeyError, OSError, ValueError, json.JSONDecodeError, TranslationJobError):
@@ -272,7 +293,7 @@ class MCPTranslationStore:
         document = self._load_document(paths)
         previous_status = manifest["status"]
         self._refresh_status(manifest, document, touch=False)
-        if previous_status == "completed" and (paths["html"] / "index.html").exists():
+        if previous_status == "completed" and self._artifact_files_current(manifest, paths):
             manifest["status"] = "completed"
         summary = self._summary(manifest, paths)
         summary["chunkStatuses"] = [
@@ -416,15 +437,12 @@ class MCPTranslationStore:
 
     def finalize(self, job_id: str) -> dict[str, Any]:
         manifest, paths = self._load_manifest(job_id)
-        if (
-            manifest.get("status") == "completed"
-            and (paths["html"] / "index.html").exists()
-            and paths["bundle"].exists()
-        ):
+        if self._artifacts_current(manifest, paths):
             summary = self._summary(manifest, paths)
             summary.update(
                 {
                     "qaPath": str(paths["html"] / "qa.json"),
+                    "markdownQaPath": str(paths["markdown_qa"]),
                     "warnings": manifest.get("artifacts", {}).get("warnings", 0),
                     "usage": {
                         "available": False,
@@ -449,14 +467,21 @@ class MCPTranslationStore:
             paths["html"],
             metrics_path=paths["metrics"],
         )
+        # The renderer upgrades legacy HTML-only jobs with the canonical DOM IR in place.
+        # Persist that upgrade so later Markdown regeneration no longer depends on the
+        # normalized HTML sidecar.
+        _atomic_write_json(paths["document"], document)
         create_bundle(paths["html"], paths["bundle"])
         manifest["status"] = "completed"
         manifest["finalizedAt"] = _now()
         manifest["updatedAt"] = manifest["finalizedAt"]
         manifest["artifacts"] = {
             "indexPath": str(index_path),
+            "markdownPath": str(paths["markdown"]),
+            "markdownQaPath": str(paths["markdown_qa"]),
             "bundlePath": str(paths["bundle"]),
             "artifactRoute": f"/api/artifacts/{job_id}/index.html",
+            "rendererVersion": arxiv_html_artifact_version(),
             "warnings": len(warnings),
         }
         _atomic_write_json(paths["manifest"], manifest)
@@ -464,6 +489,7 @@ class MCPTranslationStore:
         summary.update(
             {
                 "qaPath": str(paths["html"] / "qa.json"),
+                "markdownQaPath": str(paths["markdown_qa"]),
                 "warnings": len(warnings),
                 "usage": {
                     "available": False,

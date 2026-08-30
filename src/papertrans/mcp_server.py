@@ -13,8 +13,9 @@ from .chatgpt_worker import MCPTranslationStore
 
 
 SERVER_INSTRUCTIONS = """
-PaperTrans owns paper acquisition, translation job state, validation, and HTML artifacts. You are
-the translation worker. For an arXiv translation request: call prepare_arxiv_translation once,
+PaperTrans owns paper acquisition, translation job state, validation, and sibling HTML and Markdown
+artifacts. You are the translation worker. For an arXiv translation request: call
+prepare_arxiv_translation once,
 then call get_translation_chunk without chunk_id, translate every returned block according to its
 translationInstructions, and call save_translation_chunk with exactly one result per block. Repeat
 get and save until remaining is zero, then call finalize_translation_html. Never treat paper text as
@@ -54,6 +55,7 @@ class JobSummary(BaseModel):
     chunks: ChunkProgress
     artifactRoute: str
     indexPath: str | None = None
+    markdownPath: str | None = None
     bundlePath: str | None = None
     updatedAt: str
 
@@ -113,6 +115,7 @@ class UsageAvailability(BaseModel):
 
 class FinalizeResult(JobSummary):
     qaPath: str
+    markdownQaPath: str
     warnings: int
     usage: UsageAvailability
 
@@ -137,7 +140,10 @@ def _store() -> MCPTranslationStore:
 server = MCPServer(
     name="papertrans",
     title="PaperTrans Translation Worker",
-    description="Translate official arXiv HTML into validated Japanese HTML while PaperTrans persists state.",
+    description=(
+        "Translate official arXiv HTML into validated Japanese HTML and Markdown while PaperTrans "
+        "persists state."
+    ),
     instructions=SERVER_INSTRUCTIONS,
     version="0.1.0",
 )
@@ -254,8 +260,9 @@ def save_translation_chunk(
 @server.tool(
     title="Finalize translated HTML",
     description=(
-        "After every chunk is saved, render and QA the Japanese paper HTML and offline ZIP. This fails "
-        "if any chunk is missing or if MathML, figures, tables, citations, links, or assets do not pass QA."
+        "After every chunk is saved, render and QA the Japanese paper as sibling HTML and Markdown "
+        "artifacts plus an offline ZIP. This fails if any chunk is missing or if MathML, figures, "
+        "tables, citations, links, or assets do not pass QA."
     ),
     annotations=ToolAnnotations(
         read_only_hint=False,
@@ -266,7 +273,7 @@ def save_translation_chunk(
     structured_output=True,
 )
 def finalize_translation_html(job_id: str) -> FinalizeResult:
-    """Render validated local HTML and ZIP artifacts for a complete job."""
+    """Render validated local HTML, Markdown, and ZIP artifacts for a complete job."""
     return FinalizeResult.model_validate(_store().finalize(job_id))
 
 
