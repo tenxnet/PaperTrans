@@ -16,7 +16,8 @@ PaperTrans is a local-first academic paper translation workspace. It translates 
 - Split only translatable prose into stable semantic units.
 - Preserve equations, figures, tables, citation links, DOIs, and protected terms.
 - Use a connected MCP client as the translation worker.
-- Validate block identity and protected tokens before rendering.
+- Validate block identity and protected tokens, then persist the normalized DocumentIR as the artifact source of truth.
+- Generate sibling HTML and Markdown from that same DocumentIR and include both format-specific QA results in the ZIP.
 - Manage search, tags, unread state, and favorites in a local library.
 - Read papers inside the app with a navigable section outline.
 
@@ -52,6 +53,8 @@ pnpm dev --hostname 127.0.0.1
 Before creating the first job, connect a client with the [MCP client setup guide](docs/mcp-client-setup.md). A local MCP client can use the URL above directly; ChatGPT uses Secure MCP Tunnel.
 
 Open `http://127.0.0.1:3000` and register an arXiv ID under **New translation**. Copy the displayed **Worker request** into the connected client; PaperTrans then persists progress and artifacts. Add `--port 3100` to the web command if you need a different port.
+
+A completed job stores `html/index.html` and `html/index.md` as sibling artifacts, with format-specific checks in `html/qa.json` and `html/markdown-qa.json`. The download ZIP contains both formats and their local assets.
 
 ## Choose an MCP client
 

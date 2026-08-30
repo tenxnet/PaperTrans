@@ -12,7 +12,7 @@ If private vulnerability reporting is not available, open a public Issue contain
 
 ## System and scope
 
-PaperTrans is a local-first, single-user Web application and MCP server. The supported v1 path acquires official arXiv HTML, normalizes and sanitizes it, prepares translation chunks, accepts translations from a connected MCP client, validates structural invariants, and renders a local HTML artifact.
+PaperTrans is a local-first, single-user Web application and MCP server. The supported v1 path acquires official arXiv HTML, normalizes and sanitizes it into the persisted DocumentIR, prepares translation chunks, accepts translations from a connected MCP client, validates structural invariants, and renders sibling local HTML and Markdown artifacts.
 
 This policy covers the Web UI and API, MCP tools, arXiv acquisition and HTML normalization, local job and artifact storage, translation validation, repository Skills, and experimental PDF/Codex paths included in this repository.
 
