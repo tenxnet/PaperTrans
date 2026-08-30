@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -615,3 +616,108 @@ def test_semantic_pipeline_marks_manifest_failed_on_keyboard_interrupt(
         ).read_text(encoding="utf-8")
     )
     assert manifest["status"] == "failed"
+
+
+def test_pdf_promote_cli_accepts_the_dual_artifact_role() -> None:
+    args = cli._parser().parse_args(
+        [
+            "pdf-promote-candidate",
+            "--slug",
+            "paper-1",
+            "--run-id",
+            "pdf-babeldoc-dual-1",
+            "--approved-by",
+            "reviewer-1",
+            "--role",
+            "translated_dual_pdf",
+        ]
+    )
+
+    assert args.role == "translated_dual_pdf"
+
+
+def test_babeldoc_cli_runs_are_non_promotable_contract_evaluations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source.pdf"
+    document = fitz.open()
+    document.new_page()
+    document.save(source)
+    document.close()
+    worker_root = tmp_path / "workers" / "babeldoc"
+    (worker_root / "patches").mkdir(parents=True)
+    (worker_root / "patches" / "0001-papertrans-safe-dependencies.patch").write_text(
+        "reviewed patch\n", encoding="utf-8"
+    )
+    sbom = tmp_path / "sbom.json"
+    sbom.write_text("{}", encoding="utf-8")
+    provider = tmp_path / "provider.json"
+    provider.write_text("{}", encoding="utf-8")
+    observed: dict[str, object] = {}
+    profile = SimpleNamespace(
+        purpose="contract_evaluation", promotion_eligible=False
+    )
+
+    def fake_profile_from_files(**kwargs):
+        observed.update(kwargs)
+        return profile
+
+    def fake_run_container_candidate(**kwargs):
+        observed["runProfile"] = kwargs["profile"]
+        run_root = tmp_path / "published-run"
+        run_root.mkdir()
+        (run_root / "run.json").write_text(
+            json.dumps({"state": "needs_review"}), encoding="utf-8"
+        )
+        return run_root
+
+    monkeypatch.setattr(cli, "profile_from_files", fake_profile_from_files)
+    monkeypatch.setattr(cli, "run_container_candidate", fake_run_container_candidate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "papertrans",
+            "pdf-translate-candidate",
+            str(source),
+            "--slug",
+            "paper-1",
+            "--run-id",
+            "pdf-babeldoc-contract-1",
+            "--backend",
+            "babeldoc",
+            "--image",
+            f"papertrans-babeldoc@sha256:{'a' * 64}",
+            "--sbom",
+            str(sbom),
+            "--provider-secret",
+            str(provider),
+            "--gateway-network",
+            "papertrans-private",
+            "--gateway-container",
+            "papertrans-gateway",
+            "--gateway-image",
+            f"sha256:{'b' * 64}",
+            "--gateway-egress-network",
+            "papertrans-egress",
+            "--provider-id",
+            "provider-1",
+            "--model-id",
+            "model-1",
+            "--repo-root",
+            str(tmp_path),
+            "--output-root",
+            str(tmp_path / "output"),
+        ],
+    )
+
+    cli.main()
+
+    assert observed["purpose"] == "contract_evaluation"
+    assert observed["promotion_eligible"] is False
+    assert observed["runProfile"] is profile
+    result = json.loads(capsys.readouterr().out)
+    assert result["purpose"] == "contract_evaluation"
+    assert result["promotionEligible"] is False

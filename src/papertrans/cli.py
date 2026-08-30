@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -191,9 +192,26 @@ def _parser() -> argparse.ArgumentParser:
     pdf_translate_candidate.add_argument("source", type=Path)
     pdf_translate_candidate.add_argument("--slug", required=True)
     pdf_translate_candidate.add_argument("--run-id")
-    pdf_translate_candidate.add_argument("--backend", choices=("harumi",), default="harumi")
+    pdf_translate_candidate.add_argument(
+        "--backend", choices=("harumi", "babeldoc"), default="harumi"
+    )
     pdf_translate_candidate.add_argument("--image", required=True)
-    pdf_translate_candidate.add_argument("--font", type=Path, required=True)
+    pdf_translate_candidate.add_argument("--font", type=Path)
+    pdf_translate_candidate.add_argument("--sbom", type=Path)
+    pdf_translate_candidate.add_argument("--provider-secret", type=Path)
+    pdf_translate_candidate.add_argument("--gateway-network")
+    pdf_translate_candidate.add_argument("--gateway-container")
+    pdf_translate_candidate.add_argument("--gateway-image")
+    pdf_translate_candidate.add_argument("--gateway-egress-network")
+    pdf_translate_candidate.add_argument(
+        "--output-role",
+        choices=("translated_mono_pdf", "translated_dual_pdf"),
+        default="translated_mono_pdf",
+    )
+    pdf_translate_candidate.add_argument("--profile-id")
+    pdf_translate_candidate.add_argument("--provider-id")
+    pdf_translate_candidate.add_argument("--model-id")
+    pdf_translate_candidate.add_argument("--prompt-revision")
     pdf_translate_candidate.add_argument("--output-root", type=Path, default=Path("output"))
     pdf_translate_candidate.add_argument("--repo-root", type=Path, default=Path.cwd())
     pdf_translate_candidate.add_argument("--source-language", default="en")
@@ -207,6 +225,11 @@ def _parser() -> argparse.ArgumentParser:
     pdf_promote_candidate.add_argument("--slug", required=True)
     pdf_promote_candidate.add_argument("--run-id", required=True)
     pdf_promote_candidate.add_argument("--approved-by", required=True)
+    pdf_promote_candidate.add_argument(
+        "--role",
+        choices=("translated_mono_pdf", "translated_dual_pdf"),
+        default="translated_mono_pdf",
+    )
     pdf_promote_candidate.add_argument("--output-root", type=Path, default=Path("output"))
 
     arxiv_html_pipeline = subparsers.add_parser(
@@ -240,38 +263,101 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "pdf-translate-candidate":
         repo_root = args.repo_root.resolve()
-        run_id = args.run_id or f"pdf-harumi-{uuid.uuid4().hex[:16]}"
+        run_id = args.run_id or f"pdf-{args.backend}-{uuid.uuid4().hex[:16]}"
+        if args.backend == "harumi":
+            if args.font is None:
+                raise SystemExit("--font is required for the harumi backend")
+            profile_id = args.profile_id or "harumi-layout-eval-ja-v1"
+            provider_id = args.provider_id or "deterministic-local"
+            model_id = args.model_id or "deterministic-layout-v1"
+            prompt_revision = args.prompt_revision or "papertrans-pdf-layout-v1"
+        else:
+            required = {
+                "--sbom": args.sbom,
+                "--provider-secret": args.provider_secret,
+                "--gateway-network": args.gateway_network,
+                "--gateway-container": args.gateway_container,
+                "--gateway-image": args.gateway_image,
+                "--gateway-egress-network": args.gateway_egress_network,
+                "--provider-id": args.provider_id,
+                "--model-id": args.model_id,
+            }
+            missing = [flag for flag, value in required.items() if value is None]
+            if missing:
+                raise SystemExit(
+                    "babeldoc backend requires " + ", ".join(sorted(missing))
+                )
+            profile_id = args.profile_id or "evaluation-ja-v1"
+            provider_id = args.provider_id
+            model_id = args.model_id
+            prompt_revision = args.prompt_revision or "papertrans-pdf-ja-v1"
         request = make_candidate_request(
             args.source,
             run_id=run_id,
             source_language=args.source_language,
             target_language=args.target_language,
+            profile_id=profile_id,
+            provider_id=provider_id,
+            model_id=model_id,
+            prompt_revision=prompt_revision,
+            output_role=args.output_role,
             deadline_seconds=args.deadline_seconds,
         )
-        worker_root = repo_root / "workers" / "harumi"
-        profile = profile_from_files(
-            backend_id="papertrans-harumi",
-            image=args.image,
-            source_file=worker_root / "src" / "main.rs",
-            sbom_file=worker_root / "sbom.cargo-metadata.json",
-            lock_file=worker_root / "Cargo.lock",
-            font_file=args.font.resolve(),
-        )
+        worker_root = repo_root / "workers" / args.backend
+        approved_fork_revisions: list[str] = []
+        if args.backend == "harumi":
+            profile = profile_from_files(
+                backend_id="papertrans-harumi",
+                image=args.image,
+                source_file=worker_root / "src" / "main.rs",
+                sbom_file=worker_root / "sbom.cargo-metadata.json",
+                lock_file=worker_root / "Cargo.lock",
+                font_file=args.font.resolve(),
+            )
+        else:
+            patch_path = worker_root / "patches" / "0001-papertrans-safe-dependencies.patch"
+            approved_fork_revisions.append(
+                hashlib.sha256(patch_path.read_bytes()).hexdigest()
+            )
+            profile = profile_from_files(
+                backend_id="pdf2zh-next-babeldoc-papertrans",
+                image=args.image,
+                source_file=worker_root / "UPSTREAM.lock",
+                sbom_file=args.sbom.resolve(),
+                lock_file=worker_root / "requirements.lock",
+                network=args.gateway_network,
+                provider_secret_file=args.provider_secret.resolve(),
+                gateway_container=args.gateway_container,
+                gateway_image_digest=args.gateway_image,
+                gateway_egress_network=args.gateway_egress_network,
+                # The CLI currently accepts a gateway by runtime name and
+                # digest, but it does not carry a reviewed semantic-quality
+                # allowlist. Keep every CLI-launched BabelDOC run as a
+                # non-promotable contract evaluation until that policy exists.
+                purpose="contract_evaluation",
+                promotion_eligible=False,
+                worker_executable="/opt/venv/bin/papertrans-pdf-worker",
+            )
         run_root = run_container_candidate(
             output_root=args.output_root.resolve(),
             slug=args.slug,
             source_pdf=args.source.resolve(),
             request=request,
             profile=profile,
+            approved_fork_revisions=approved_fork_revisions,
+        )
+        published_run = json.loads(
+            (run_root / "run.json").read_text(encoding="utf-8")
         )
         print(
             json.dumps(
                 {
                     "runId": run_id,
                     "runRoot": str(run_root),
-                    "state": "succeeded",
+                    "state": published_run["state"],
                     "promoted": False,
-                    "purpose": "layout_evaluation_only",
+                    "purpose": profile.purpose,
+                    "promotionEligible": profile.promotion_eligible,
                 },
                 ensure_ascii=False,
             )
@@ -283,6 +369,7 @@ def main() -> None:
             slug=args.slug,
             run_id=args.run_id,
             approved_by=args.approved_by,
+            role=args.role,
         )
         print(
             json.dumps(
