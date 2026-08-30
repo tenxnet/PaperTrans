@@ -125,7 +125,10 @@ def test_setup_uses_frozen_scriptless_offline_install_and_build(
     def fake_run(argv, *, cwd, environment=None, timeout=None):
         calls.append(tuple(argv))
         if "install" in argv:
-            (paths.repo_root / "node_modules" / ".pnpm").mkdir(parents=True)
+            node_modules = paths.repo_root / "node_modules"
+            (node_modules / ".pnpm").mkdir(parents=True)
+            (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n")
+            (node_modules / ".pnpm" / "lock.yaml").write_text("lockfileVersion: '9.0'\n")
         if "build" in argv:
             (paths.repo_root / ".next").mkdir()
             (paths.repo_root / ".next" / "BUILD_ID").write_text("test\n", encoding="utf-8")
@@ -198,6 +201,7 @@ def test_node_dependency_readiness_rejects_a_partial_install(tmp_path: Path) -> 
     node_modules = paths.repo_root / "node_modules"
     for relative in (".pnpm", "next", "react", "typescript"):
         (node_modules / relative).mkdir(parents=True, exist_ok=True)
+    (node_modules / ".package-map.json").write_text('{"packages":{}}\n')
 
     assert not local_setup._node_dependencies_installed(paths)
 
@@ -208,10 +212,34 @@ def test_node_dependency_readiness_rejects_a_partial_install(tmp_path: Path) -> 
         executable.write_text("#!/bin/sh\n", encoding="utf-8")
         executable.chmod(0o755)
 
+    assert not local_setup._node_dependencies_installed(paths)
+
+    (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n")
+    (node_modules / ".pnpm" / "lock.yaml").write_text("lockfileVersion: '9.0'\n")
     assert local_setup._node_dependencies_installed(paths)
 
     (node_modules / "react").rmdir()
     assert not local_setup._node_dependencies_installed(paths)
+
+
+def test_node_dependency_readiness_accepts_linked_global_store(tmp_path: Path) -> None:
+    paths = _fixture_paths(tmp_path)
+    (paths.repo_root / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "1"}}), encoding="utf-8"
+    )
+    node_modules = paths.repo_root / "node_modules"
+    (node_modules / ".pnpm").mkdir(parents=True)
+    (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n")
+    (node_modules / ".pnpm" / "lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    global_next = tmp_path / "global-store" / "next"
+    global_next.mkdir(parents=True)
+    (node_modules / "next").symlink_to(global_next, target_is_directory=True)
+    (node_modules / ".bin").mkdir()
+    next_binary = node_modules / ".bin" / "next"
+    next_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    next_binary.chmod(0o755)
+
+    assert local_setup._node_dependencies_installed(paths)
 
 
 def test_setup_forces_one_relink_after_a_partial_pnpm_install(
@@ -238,6 +266,10 @@ def test_setup_forces_one_relink_after_a_partial_pnpm_install(
         if "--force" in argv:
             (node_modules / "next").mkdir()
             (node_modules / ".bin").mkdir()
+            (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n")
+            (node_modules / ".pnpm" / "lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n"
+            )
             next_binary = node_modules / ".bin" / "next"
             next_binary.write_text("#!/bin/sh\n", encoding="utf-8")
             next_binary.chmod(0o755)
@@ -254,6 +286,38 @@ def test_setup_forces_one_relink_after_a_partial_pnpm_install(
 
     assert calls[1][-1] == "--force"
     assert status_value["ready"] is True
+
+
+def test_setup_fails_if_forced_relink_remains_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _fixture_paths(tmp_path)
+    (paths.repo_root / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "1"}}), encoding="utf-8"
+    )
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(local_setup, "validate_repository", lambda _paths: None)
+    monkeypatch.setattr(local_setup, "node_version", lambda: ("/usr/bin/node", 22))
+    monkeypatch.setattr(local_setup, "pnpm_command", lambda: ("/usr/bin/pnpm",))
+    monkeypatch.setattr(
+        local_setup, "validated_pnpm_version", lambda _argv, _root: "11.19.0"
+    )
+
+    def fake_run(argv, *, cwd, environment=None, timeout=None):
+        calls.append(tuple(argv))
+        (paths.repo_root / "node_modules" / ".pnpm").mkdir(
+            parents=True, exist_ok=True
+        )
+        return local_setup.CommandResult(tuple(argv), 0)
+
+    monkeypatch.setattr(local_setup, "_run", fake_run)
+
+    with pytest.raises(local_setup.SetupError, match="supported linked dependency"):
+        local_setup.ensure_setup(paths, offline=True)
+
+    assert len(calls) == 2
+    assert calls[1][-1] == "--force"
+    assert not paths.state_path.exists()
 
 
 def test_ui_change_invalidates_build_but_not_node_install(tmp_path: Path) -> None:

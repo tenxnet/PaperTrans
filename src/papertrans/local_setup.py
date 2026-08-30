@@ -519,6 +519,12 @@ def _node_dependencies_installed(paths: LocalPaths) -> bool:
     node_modules = paths.repo_root / "node_modules"
     if not (node_modules / ".pnpm").is_dir():
         return False
+    metadata_files = (
+        node_modules / ".modules.yaml",
+        node_modules / ".pnpm" / "lock.yaml",
+    )
+    if not all(path.is_file() and not path.is_symlink() for path in metadata_files):
+        return False
     package = _load_json(paths.repo_root / "package.json")
     package_names: set[str] = set()
     for section_name in ("dependencies", "devDependencies"):
@@ -528,7 +534,7 @@ def _node_dependencies_installed(paths: LocalPaths) -> bool:
                 name for name in section if isinstance(name, str) and name
             )
     for name in package_names:
-        if not node_modules.joinpath(*name.split("/")).exists():
+        if not node_modules.joinpath(*name.split("/")).is_dir():
             return False
     required_bins = {
         "next": "next",
@@ -536,7 +542,10 @@ def _node_dependencies_installed(paths: LocalPaths) -> bool:
     }
     return all(
         package_name not in package_names
-        or (node_modules / ".bin" / executable).is_file()
+        or (
+            (node_modules / ".bin" / executable).is_file()
+            and os.access(node_modules / ".bin" / executable, os.X_OK)
+        )
         for package_name, executable in required_bins.items()
     )
 
@@ -630,7 +639,7 @@ def ensure_setup(paths: LocalPaths, *, offline: bool, dev: bool = False) -> dict
                 _run([*install_argv, "--force"], cwd=paths.repo_root)
                 if not _node_dependencies_installed(paths):
                     raise SetupError(
-                        "pnpm install completed without all direct packages and required executables"
+                        "pnpm install completed without a supported linked dependency layout"
                     )
             state["node"] = {
                 "fingerprint": dependency_fingerprint,
