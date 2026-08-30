@@ -118,6 +118,62 @@ def test_asset_download_falls_back_to_arxiv_document_directory(monkeypatch, tmp_
     assert str(article.img["src"]).startswith("assets/")
 
 
+def test_failed_asset_download_neutralizes_active_media_attributes(monkeypatch, tmp_path: Path):
+    requested: list[str] = []
+
+    def fail_request(url: str, timeout: int = 60):
+        requested.append(url)
+        raise OSError("unavailable")
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fail_request)
+    soup = BeautifulSoup(
+        """
+        <article>
+          <img src="https://media.example/missing.png" alt="Missing image">
+          <object data="//media.example/missing.pdf" aria-label="Missing object">
+            Object fallback text
+          </object>
+          <img src="data:image/png;base64,AAAA" alt="Embedded image">
+          <svg>
+            <image href="https://media.example/missing.svg"></image>
+            <image xlink:href="//media.example/missing-xlink.svg"></image>
+            <image href="#local-symbol"></image>
+          </svg>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    assert requested == [
+        "https://media.example/missing.png",
+        "https://media.example/missing.pdf",
+        "https://media.example/missing.svg",
+        "https://media.example/missing-xlink.svg",
+    ]
+    assert len(result["failures"]) == 5
+    assert article.find("img", alt="Missing image") is not None
+    assert article.find("img", alt="Missing image").get("src") is None
+    assert article.find("img", alt="Embedded image") is not None
+    assert article.find("img", alt="Embedded image").get("src") is None
+    missing_object = article.find("object")
+    assert missing_object is not None
+    assert missing_object.get("data") is None
+    assert "Object fallback text" in missing_object.get_text(" ", strip=True)
+    svg_images = article.find_all("image")
+    assert svg_images[0].get("href") is None
+    assert svg_images[1].get("xlink:href") is None
+    assert svg_images[2].get("href") == "#local-symbol"
+
+
 def test_local_image_decode_qa_rejects_corrupt_images(tmp_path: Path):
     assets = tmp_path / "assets"
     assets.mkdir()
@@ -319,6 +375,148 @@ def test_markdown_keeps_only_targets_referenced_by_rendered_content():
     assert '<a id="kept"></a>' in markdown
     assert '<a id="title"></a>' not in markdown
     assert '<a id="unused"></a>' not in markdown
+
+
+def test_arxiv_markdown_projects_only_local_media_but_keeps_text_and_external_links():
+    unsafe = [
+        ("http", "http://media.example/inline-http.png"),
+        ("https", "https://media.example/inline-https.png"),
+        ("scheme", "//media.example/inline-scheme.png"),
+        ("data", "data:image/png;base64,AAAA"),
+        ("absolute", "/private/inline-absolute.png"),
+        ("traversal", "../inline-traversal.png"),
+        ("relative", "unlocalized-inline.png"),
+    ]
+    inline_images = "".join(
+        f'<img src="{source}" alt="Inline {name}">' for name, source in unsafe
+    )
+    figure_media = [
+        '<img src="http://media.example/block-http.png" alt="Block http">',
+        '<object data="https://media.example/block-https.pdf" aria-label="Block https">Object https fallback</object>',
+        '<img src="//media.example/block-scheme.png" alt="Block scheme">',
+        '<object data="data:application/pdf;base64,AAAA" aria-label="Block data">Object data fallback</object>',
+        '<img src="/private/block-absolute.png" alt="Block absolute">',
+        '<object data="../block-traversal.pdf" aria-label="Block traversal">Object traversal fallback</object>',
+        '<img src="unlocalized-block.png" alt="Block relative">',
+    ]
+    figures = "".join(
+        f'<figure class="ltx_figure" id="F{index}">{media}'
+        f'<figcaption>Caption {index}</figcaption></figure>'
+        for index, media in enumerate(figure_media, start=1)
+    )
+    soup = BeautifulSoup(
+        f"""
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <p>{inline_images}</p>
+          <p>
+            <img src="assets/local-inline.png" alt="Local inline">
+            <a href="https://example.org/paper">External paper</a>
+          </p>
+          <svg>
+            <image href="unlocalized-svg.png"></image>
+            <image xlink:href="https://media.example/svg-tracker.png"></image>
+            <image href="#local-symbol"></image>
+          </svg>
+          {figures}
+          <figure class="ltx_figure" id="Flocal">
+            <object data="assets/local-object.svg" aria-label="Local object">Unused fallback</object>
+            <figcaption>Local caption</figcaption>
+          </figure>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+    qa = validate_arxiv_markdown(document, blocks, markdown)
+
+    assert qa["status"] == "passed"
+    assert qa["unlocalizedMedia"] == []
+    assert "![Local inline](assets/local-inline.png)" in markdown
+    assert "![Local object](assets/local-object.svg)" in markdown
+    assert "[External paper](https://example.org/paper)" in markdown
+    assert "unlocalized-svg.png" not in markdown
+    assert "https://media.example/svg-tracker.png" not in markdown
+    assert 'href="#local-symbol"' in markdown
+    for name, source in unsafe:
+        assert source not in markdown
+        assert f"Inline {name}" in markdown
+    for index, media in enumerate(figure_media, start=1):
+        source = BeautifulSoup(media, "html.parser").find(True)
+        assert source is not None
+        unsafe_destination = source.get("src") or source.get("data")
+        assert unsafe_destination not in markdown
+        assert f"Caption {index}" in markdown
+    assert "Block http" in markdown
+    assert "Block https" in markdown and "Object https fallback" in markdown
+    assert "Block scheme" in markdown
+    assert "Block data" in markdown and "Object data fallback" in markdown
+    assert "Block absolute" in markdown
+    assert "Block traversal" in markdown and "Object traversal fallback" in markdown
+    assert "Block relative" in markdown
+
+
+def test_arxiv_markdown_qa_rejects_residual_unlocalized_media_only():
+    soup = BeautifulSoup(
+        """
+        <article class="ltx_document">
+          <h1>Title</h1>
+          <p><a href="https://example.org/paper">External paper</a></p>
+          <figure class="ltx_figure">
+            <img src="assets/local.png" alt="Local">
+          </figure>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+    document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
+        "content": serialize_article(article),
+        "units": [],
+    }
+    blocks = arxiv_document_to_markdown_blocks(document)
+    markdown = arxiv_document_to_markdown(document)
+
+    clean_qa = validate_arxiv_markdown(document, blocks, markdown)
+    lazy_only = markdown + '\n<img data-src="https://media.example/lazy.png" alt="Lazy">\n'
+    injected = (
+        markdown
+        + "\n[Another external link](https://example.org/allowed)\n"
+        + "\n![Remote tracker](//media.example/tracker.png)\n"
+        + "\n![Unlocalized relative](unlocalized.png)\n"
+        + '\n<object data="data:application/pdf;base64,AAAA">Fallback</object>\n'
+        + '\n<svg><image href="unlocalized-svg.png"></image></svg>\n'
+    )
+    lazy_qa = validate_arxiv_markdown(document, blocks, lazy_only)
+    failed_qa = validate_arxiv_markdown(document, blocks, injected)
+
+    assert clean_qa["status"] == "passed"
+    assert clean_qa["unlocalizedMedia"] == []
+    assert lazy_qa["status"] == "passed"
+    assert lazy_qa["unlocalizedMedia"] == []
+    assert failed_qa["status"] == "failed"
+    assert failed_qa["unlocalizedMedia"] == [
+        "//media.example/tracker.png",
+        "data:application/pdf;base64,AAAA",
+        "unlocalized-svg.png",
+        "unlocalized.png",
+    ]
+    assert "Markdown output contains remote or unlocalized media" in failed_qa["failures"]
 
 
 def test_markdown_does_not_duplicate_an_inherited_section_anchor():

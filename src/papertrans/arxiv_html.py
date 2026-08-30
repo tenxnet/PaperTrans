@@ -295,9 +295,20 @@ def _download_assets(
     for tag, attribute in [
         *((value, "src") for value in article.find_all("img", src=True)),
         *((value, "data") for value in article.find_all("object", data=True)),
+        *((value, "href") for value in article.find_all("image", href=True)),
+        *((value, "xlink:href") for value in article.find_all("image", attrs={"xlink:href": True})),
     ]:
-        raw_url = str(tag.get(attribute, ""))
-        if not raw_url or raw_url.startswith("data:"):
+        raw_url = str(tag.get(attribute, "")).strip()
+        if not raw_url:
+            tag.attrs.pop(attribute, None)
+            continue
+        if tag.name == "image" and raw_url.startswith("#"):
+            continue
+        if raw_url.lower().startswith("data:"):
+            failures.append(
+                {"url": "data:<redacted>", "error": "embedded data media cannot be localized"}
+            )
+            tag.attrs.pop(attribute, None)
             continue
         try:
             payload, asset_url, content_type = _request_asset_bytes(base_url, raw_url)
@@ -324,6 +335,10 @@ def _download_assets(
                 tag[attribute] = f"assets/{filename}"
         except Exception as error:
             failures.append({"url": raw_url, "error": str(error)})
+            # A failed acquisition must not leave a browser- or Markdown-active
+            # remote reference in the normalized article. Accessible labels and
+            # object fallback children remain intact for textual projection.
+            tag.attrs.pop(attribute, None)
     return {"downloaded": downloaded, "failures": failures}
 
 

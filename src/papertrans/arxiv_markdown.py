@@ -5,9 +5,11 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
+
+from bs4 import BeautifulSoup
 
 from .markdown_render import (
     MarkdownBlock,
@@ -163,6 +165,9 @@ _RAW_CONTAINER_TAG_RE = re.compile(r"</?(?:svg|table)\b[^>]*>", re.IGNORECASE)
 _INTERNAL_LINK_RE = re.compile(r"(?<!!)\[(?:\\.|[^\]\\])*\]\(#([^\s)]+)\)")
 _HTML_INTERNAL_LINK_RE = re.compile(r'<a\b[^>]*\bhref="#([^"]+)"', re.IGNORECASE)
 _CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.IGNORECASE)
+_MARKDOWN_IMAGE_DESTINATION_RE = re.compile(
+    r"!\[(?:\\.|[^\]\\])*\]\(\s*(?P<destination><[^>\r\n]+>|(?:\\.|[^)\s])+)",
+)
 
 
 class ArxivMarkdownError(ValueError):
@@ -288,6 +293,44 @@ def _markdown_destination(value: str) -> str | None:
         return normalize_link_destination(raw)
     except ValueError:
         return None
+
+
+def _localized_media_destination(value: str) -> str | None:
+    """Return a safe relative media path for the official-arXiv adapter.
+
+    The shared Markdown serializer intentionally supports remote image URLs for
+    other adapters. Official arXiv media, however, must have been downloaded
+    into the artifact before projection, so only traversal-free relative paths
+    are valid here.
+    """
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+    decoded = raw
+    for _ in range(3):
+        candidate = unquote(decoded)
+        if candidate == decoded:
+            break
+        decoded = candidate
+    decoded = decoded.replace("\\", "/")
+    try:
+        parsed = urlsplit(decoded)
+    except ValueError:
+        return None
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        return None
+    path = parsed.path
+    if not path or path.startswith("/") or ".." in PurePosixPath(path).parts:
+        return None
+    try:
+        normalized = normalize_asset_path(raw)
+    except ValueError:
+        return None
+    localized_parts = PurePosixPath(unquote(normalized)).parts
+    if len(localized_parts) < 2 or localized_parts[0] != "assets":
+        return None
+    return normalized
 
 
 def _inline_code(value: str) -> str:
@@ -419,12 +462,11 @@ def _safe_raw_node(node: Mapping[str, Any], allowed_tags: set[str]) -> str:
                 if not value.strip().startswith("#"):
                     continue
             elif tag in {"img", "image"} and lowered_name in {"src", "href", "xlink:href"}:
-                try:
-                    parsed = urlsplit(value)
-                    if parsed.scheme or parsed.netloc:
-                        continue
-                    value = value if value.strip().startswith("#") else normalize_asset_path(value)
-                except ValueError:
+                if tag == "image" and value.strip().startswith("#"):
+                    value = value.strip()
+                elif localized := _localized_media_destination(value):
+                    value = localized
+                else:
                     continue
             elif tag != "a":
                 if not value.strip().startswith("#"):
@@ -493,7 +535,7 @@ def _inline_markdown(
     if tag == "br":
         return "  \n"
     if tag == "img":
-        src = _markdown_destination(_attribute(node, "src"))
+        src = _localized_media_destination(_attribute(node, "src"))
         alt = escape_markdown_text(_attribute(node, "alt") or "Figure").replace("\n", " ")
         return _inline_anchor(node, f"![{alt}]({src})" if src else alt)
     if tag == "svg":
@@ -582,6 +624,24 @@ def _caption(node: Mapping[str, Any], units: Mapping[str, Mapping[str, Any]]) ->
         return None
     value = _join_inline(_inline_markdown(child, units) for child in _children(caption))
     return _inline_anchor(caption, value) or None
+
+
+def _media_fallback_markdown(
+    node: Mapping[str, Any],
+    units: Mapping[str, Mapping[str, Any]],
+    *,
+    default: str,
+) -> str:
+    """Preserve visible/accessible text when a media reference is rejected."""
+
+    parts: list[str] = []
+    label = _attribute(node, "alt") or _attribute(node, "aria-label")
+    if label:
+        parts.append(escape_markdown_text(label).replace("\n", " "))
+    child_text = _join_inline(_inline_markdown(child, units) for child in _children(node))
+    if child_text and child_text not in parts:
+        parts.append(child_text)
+    return "\n\n".join(parts) if parts else escape_markdown_text(default)
 
 
 def _table_rows(
@@ -878,7 +938,12 @@ class _Projector:
             item
             for item in own_nodes
             if _tag(item) in {"img", "object"}
-            and _attribute(item, "src" if _tag(item) == "img" else "data")
+            and (
+                _attribute(item, "src" if _tag(item) == "img" else "data")
+                or _attribute(item, "alt")
+                or _attribute(item, "aria-label")
+                or _normalized_plain_text(item)
+            )
         ]
         listing = next(
             (item for item in own_nodes if "ltx_listing" in _classes(item)),
@@ -913,12 +978,35 @@ class _Projector:
         if own_images:
             for index, image in enumerate(own_images):
                 asset_attribute = "src" if _tag(image) == "img" else "data"
+                raw_asset = _attribute(image, asset_attribute)
+                asset = _localized_media_destination(raw_asset)
+                label = _attribute(image, "alt") or _attribute(image, "aria-label") or None
+                if asset is None:
+                    fallback_parts = [
+                        _media_fallback_markdown(
+                            image,
+                            self.units,
+                            default=visual_kind.capitalize(),
+                        )
+                    ]
+                    if index == 0 and caption and caption not in fallback_parts:
+                        fallback_parts.append(caption)
+                    self.blocks.append(
+                        MarkdownBlock(
+                            kind=visual_kind,
+                            anchor=anchor if index == 0 else None,
+                            text="\n\n".join(fallback_parts),
+                            label=label,
+                            text_is_markdown=True,
+                        )
+                    )
+                    continue
                 self.blocks.append(
                     MarkdownBlock(
                         kind=visual_kind,
                         anchor=anchor if index == 0 else None,
-                        asset=_attribute(image, asset_attribute),
-                        label=_attribute(image, "alt") or _attribute(image, "aria-label") or None,
+                        asset=asset,
+                        label=label,
                         caption=caption if index == 0 else None,
                         text_is_markdown=True,
                     )
@@ -1402,6 +1490,42 @@ def _human_readable_blocks(
     return readable
 
 
+def _unlocalized_media_destinations(
+    blocks: Sequence[MarkdownBlock],
+    markdown: str,
+) -> list[str]:
+    """Find media references that are not safe artifact-relative paths."""
+
+    candidates = [str(block.asset) for block in blocks if block.asset is not None]
+    visible = _without_fenced_code(markdown)
+    for match in _MARKDOWN_IMAGE_DESTINATION_RE.finditer(visible):
+        destination = match.group("destination").strip()
+        if destination.startswith("<") and destination.endswith(">"):
+            destination = destination[1:-1].strip()
+        candidates.append(destination)
+    raw_html = BeautifulSoup(visible, "html.parser")
+    for tag, attribute in [
+        *((value, "src") for value in raw_html.find_all("img", src=True)),
+        *((value, "data") for value in raw_html.find_all("object", data=True)),
+        *((value, "href") for value in raw_html.find_all("image", href=True)),
+        *(
+            (value, "xlink:href")
+            for value in raw_html.find_all("image", attrs={"xlink:href": True})
+        ),
+    ]:
+        destination = str(tag.get(attribute, "")).strip()
+        if tag.name == "image" and destination.startswith("#"):
+            continue
+        candidates.append(destination)
+    return sorted(
+        {
+            candidate
+            for candidate in candidates
+            if _localized_media_destination(candidate) is None
+        }
+    )
+
+
 def validate_arxiv_markdown(
     document: Mapping[str, Any],
     blocks: Sequence[MarkdownBlock],
@@ -1489,6 +1613,7 @@ def validate_arxiv_markdown(
     unreferenced_empty_anchors = sorted(set(empty_anchors) - link_targets)
     unresolved_links = sorted(link_targets - anchors)
     unresolved_tokens = sorted(set(PLACEHOLDER_RE.findall(markdown)))
+    unlocalized_media = _unlocalized_media_destinations(blocks, markdown)
     failures: list[str] = []
     if not markdown.strip():
         failures.append("Markdown output is empty")
@@ -1501,6 +1626,8 @@ def validate_arxiv_markdown(
         failures.append("source math roles could not be classified completely")
     if unresolved_tokens:
         failures.append("protected PTX placeholders remain unresolved")
+    if unlocalized_media:
+        failures.append("Markdown output contains remote or unlocalized media")
     if unresolved_links:
         failures.append("internal Markdown links have no explicit target anchor")
     if unreferenced_empty_anchors:
@@ -1537,6 +1664,7 @@ def validate_arxiv_markdown(
         "unreferencedEmptyAnchors": unreferenced_empty_anchors,
         "unresolvedInternalLinks": unresolved_links,
         "unresolvedPlaceholders": unresolved_tokens,
+        "unlocalizedMedia": unlocalized_media,
         "failures": failures,
     }
 
