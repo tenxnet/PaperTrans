@@ -3983,6 +3983,172 @@ def test_equation_reanchor_allows_small_overlap_and_keeps_narrow_existing_anchor
     assert visuals["equation-texts-345"]["insertAfterBlockId"] == "dl-texts-344"
 
 
+def test_equation_reanchor_restores_left_prefaces_and_splits_page_tail() -> None:
+    page_one_specs = [
+        ("intro", "paragraph", [0.08, 0.37, 0.89, 0.41], "para-intro", None),
+        ("eq-4", "equation", [0.39, 0.42, 0.89, 0.44], None, None),
+        ("eq-5", "equation", [0.38, 0.47, 0.89, 0.49], None, None),
+        ("eq-12", "equation", [0.32, 0.87, 0.89, 0.91], None, None),
+        (
+            "markov-preface",
+            "paragraph",
+            [0.08, 0.449, 0.318, 0.461],
+            "para-later-prose",
+            "later-prose",
+        ),
+        (
+            "mean-preface",
+            "paragraph",
+            [0.08, 0.848, 0.317, 0.859],
+            "para-mean",
+            None,
+        ),
+    ]
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {
+                        "blockId": block_id,
+                        "text": block_id,
+                        "bboxNormalized": bbox,
+                    }
+                    for block_id, _role, bbox, _paragraph, _continuation in page_one_specs
+                ],
+            },
+            {
+                "pageNumber": 2,
+                "blocks": [
+                    {
+                        "blockId": "mean-tail",
+                        "text": "In this case, the sum simplifies to",
+                        "bboxNormalized": [0.08, 0.095, 0.378, 0.106],
+                    },
+                    {
+                        "blockId": "eq-13",
+                        "text": "sum = loss (13)",
+                        "bboxNormalized": [0.11, 0.121, 0.89, 0.159],
+                    },
+                ],
+            },
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": block_id,
+                        "role": role,
+                        "readingOrder": index,
+                        "sectionId": "sec-appendix",
+                        "paragraphId": paragraph_id,
+                        "continuesFrom": continuation,
+                        "hidden": False,
+                        "warnings": [],
+                    }
+                    for index, (
+                        block_id,
+                        role,
+                        _bbox,
+                        paragraph_id,
+                        continuation,
+                    ) in enumerate(page_one_specs, 1)
+                ],
+                "visualObjects": [
+                    {
+                        "objectId": "equation-eq-4",
+                        "kind": "equation",
+                        "bboxNormalized": [0.39, 0.42, 0.89, 0.44],
+                        "insertAfterBlockId": "intro",
+                        "warnings": [],
+                    },
+                    {
+                        "objectId": "equation-eq-5",
+                        "kind": "equation",
+                        "bboxNormalized": [0.38, 0.47, 0.89, 0.49],
+                        "insertAfterBlockId": "eq-4",
+                        "warnings": [],
+                    },
+                    {
+                        "objectId": "equation-eq-12",
+                        "kind": "equation",
+                        "bboxNormalized": [0.32, 0.87, 0.89, 0.91],
+                        "insertAfterBlockId": "eq-5",
+                        "warnings": [],
+                    },
+                ],
+            },
+            {
+                "pageNumber": 2,
+                "blockAssignments": [
+                    {
+                        "blockId": "mean-tail",
+                        "role": "paragraph",
+                        "readingOrder": 1,
+                        "sectionId": "sec-appendix",
+                        "paragraphId": "para-mean",
+                        "continuesFrom": "mean-preface",
+                        "hidden": False,
+                        "warnings": [],
+                    },
+                    {
+                        "blockId": "eq-13",
+                        "role": "equation",
+                        "readingOrder": 2,
+                        "sectionId": "sec-appendix",
+                        "paragraphId": None,
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "warnings": [],
+                    },
+                ],
+                "visualObjects": [
+                    {
+                        "objectId": "equation-eq-13",
+                        "kind": "equation",
+                        "bboxNormalized": [0.11, 0.121, 0.89, 0.159],
+                        "insertAfterBlockId": "mean-tail",
+                        "warnings": [],
+                    }
+                ],
+            },
+        ]
+    }
+
+    adapter._reanchor_equations_by_geometry(evidence, structure)
+
+    assert [
+        assignment["blockId"]
+        for assignment in structure["pages"][0]["blockAssignments"]
+    ] == [
+        "intro",
+        "eq-4",
+        "markov-preface",
+        "eq-5",
+        "mean-preface",
+        "eq-12",
+    ]
+    visuals = {
+        visual["objectId"]: visual
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+    }
+    assert visuals["equation-eq-5"]["insertAfterBlockId"] == "markov-preface"
+    assert visuals["equation-eq-12"]["insertAfterBlockId"] == "mean-preface"
+    markov = structure["pages"][0]["blockAssignments"][2]
+    assert markov["paragraphId"] == "para-markov-preface"
+    assert markov["continuesFrom"] is None
+    tail = structure["pages"][1]["blockAssignments"][0]
+    assert tail["paragraphId"] == "para-mean-tail"
+    assert tail["continuesFrom"] is None
+    assert structure["doclingDiagnostics"][
+        "geometryReorderedEquationProseBlockIds"
+    ] == ["markov-preface", "mean-preface"]
+
+
 def test_absorbs_an_immediately_preceding_equation_minus_into_the_crop() -> None:
     evidence = {
         "pages": [

@@ -3628,12 +3628,125 @@ def _absorb_adjacent_equation_signs(
     return sorted(absorbed)
 
 
+def _reorder_displaced_equation_prose_by_geometry(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[str]:
+    """Move narrow left-hand equation prefaces back above their equations."""
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    moved: list[str] = []
+    for page in structure.get("pages", []):
+        page_number = int(page["pageNumber"])
+        blocks = {
+            str(block["blockId"]): block
+            for block in evidence_pages.get(page_number, {}).get("blocks", [])
+        }
+        assignments = sorted(
+            page.get("blockAssignments", []),
+            key=lambda assignment: int(assignment.get("readingOrder", 0)),
+        )
+        equation_ids = {
+            str(assignment["blockId"])
+            for assignment in assignments
+            if not assignment.get("hidden") and assignment.get("role") == "equation"
+        }
+        candidates = sorted(
+            (
+                assignment
+                for assignment in assignments
+                if not assignment.get("hidden")
+                and assignment.get("role") == "paragraph"
+                and assignment.get("sectionId")
+                and len(blocks.get(str(assignment["blockId"]), {}).get("bboxNormalized", []))
+                == 4
+            ),
+            key=lambda assignment: float(
+                blocks[str(assignment["blockId"])]["bboxNormalized"][1]
+            ),
+        )
+        for candidate in candidates:
+            candidate_id = str(candidate["blockId"])
+            candidate_bbox = [
+                float(value)
+                for value in blocks[candidate_id].get("bboxNormalized", [])
+            ]
+            if candidate_bbox[2] - candidate_bbox[0] > 0.5:
+                continue
+            positions = {
+                str(assignment["blockId"]): index
+                for index, assignment in enumerate(assignments)
+            }
+            candidate_position = positions[candidate_id]
+            targets: list[tuple[float, str]] = []
+            for equation_id in equation_ids:
+                equation_position = positions.get(equation_id)
+                equation = next(
+                    (
+                        assignment
+                        for assignment in assignments
+                        if str(assignment["blockId"]) == equation_id
+                    ),
+                    None,
+                )
+                equation_bbox = [
+                    float(value)
+                    for value in blocks.get(equation_id, {}).get("bboxNormalized", [])
+                ]
+                if (
+                    equation_position is None
+                    or equation is None
+                    or equation_position >= candidate_position
+                    or equation.get("sectionId") != candidate.get("sectionId")
+                    or len(equation_bbox) != 4
+                ):
+                    continue
+                vertical_gap = equation_bbox[1] - candidate_bbox[3]
+                horizontal_gap = equation_bbox[0] - candidate_bbox[2]
+                if (
+                    -0.002 <= vertical_gap <= 0.06
+                    and -0.02 <= horizontal_gap <= 0.1
+                ):
+                    targets.append((equation_bbox[1], equation_id))
+            if not targets:
+                continue
+            target_id = min(targets)[1]
+            assignments.remove(candidate)
+            target_position = next(
+                index
+                for index, assignment in enumerate(assignments)
+                if str(assignment["blockId"]) == target_id
+            )
+            assignments.insert(target_position, candidate)
+            if candidate.get("continuesFrom"):
+                candidate["paragraphId"] = f"para-{candidate_id}"
+                candidate["continuesFrom"] = None
+            warning = (
+                "A narrow equation preface displaced by Docling reading order "
+                "was restored from source-page geometry."
+            )
+            warnings = candidate.setdefault("warnings", [])
+            if warning not in warnings:
+                warnings.append(warning)
+            moved.append(candidate_id)
+        for reading_order, assignment in enumerate(assignments, start=1):
+            assignment["readingOrder"] = reading_order
+        page["blockAssignments"] = assignments
+    structure.setdefault("doclingDiagnostics", {})[
+        "geometryReorderedEquationProseBlockIds"
+    ] = sorted(set(moved))
+    return sorted(set(moved))
+
+
 def _reanchor_equations_by_geometry(
     evidence: dict[str, Any],
     structure: dict[str, Any],
 ) -> list[str]:
     """Anchor equations after the closest source block above them, then split prose."""
 
+    _reorder_displaced_equation_prose_by_geometry(evidence, structure)
     evidence_pages = {
         int(page["pageNumber"]): page for page in evidence.get("pages", [])
     }
@@ -3695,9 +3808,14 @@ def _reanchor_equations_by_geometry(
                 minimum_width = max(
                     1e-9, min(bbox[2] - bbox[0], visual_width)
                 )
+                left_preface = (
+                    -0.02 <= visual_bbox[0] - bbox[2] <= 0.1
+                    and -0.002 <= visual_bbox[1] - bbox[3] <= 0.06
+                )
                 if (
                     horizontal_overlap / minimum_width < 0.15
                     and block_id != existing_anchor_id
+                    and not left_preface
                 ):
                     continue
                 candidates.append(
