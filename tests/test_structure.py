@@ -1,8 +1,12 @@
 from pathlib import Path
 
 import pymupdf as fitz
+import pytest
 
+import papertrans.structure as structure_module
 from papertrans.structure import (
+    PdfRenderBudget,
+    PdfRenderLimitError,
     is_near_certain_blank_pixmap,
     render_visual_objects,
 )
@@ -80,6 +84,72 @@ def test_render_visual_objects_retains_a_sparse_black_rule(tmp_path: Path) -> No
     assert structure["pages"][0]["visualObjects"][0]["objectId"] == "figure-1"
     assert (tmp_path / rendered[0]["asset"]).is_file()
     assert "renderDiagnostics" not in structure
+
+
+def test_render_visual_objects_rejects_pixel_budget_before_allocation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large-crop.pdf"
+    _write_pdf(source, draw_sparse_line=True)
+    budget = PdfRenderBudget(
+        max_renders=1,
+        max_single_pixels=10_000,
+        max_total_pixels=10_000,
+        max_output_bytes=1024,
+    )
+
+    with pytest.raises(PdfRenderLimitError, match="per-render pixel limit"):
+        render_visual_objects(
+            source,
+            _structure(),
+            tmp_path / "assets",
+            budget=budget,
+        )
+
+    assert budget.renders == 0
+    assert list((tmp_path / "assets").glob("*.png")) == []
+
+
+def test_render_visual_objects_removes_artifact_when_output_budget_is_exceeded(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "bounded-output.pdf"
+    _write_pdf(source, draw_sparse_line=True)
+    budget = PdfRenderBudget(
+        max_renders=1,
+        max_single_pixels=100_000,
+        max_total_pixels=100_000,
+        max_output_bytes=1,
+    )
+
+    with pytest.raises(PdfRenderLimitError, match="artifact bytes"):
+        render_visual_objects(
+            source,
+            _structure(),
+            tmp_path / "assets",
+            budget=budget,
+        )
+
+    assert budget.renders == 1
+    assert budget.output_bytes == 0
+    assert list((tmp_path / "assets").glob("*.png")) == []
+
+
+def test_render_visual_objects_cleans_temporary_file_when_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "publish-failure.pdf"
+    _write_pdf(source, draw_sparse_line=True)
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(structure_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk full"):
+        render_visual_objects(source, _structure(), tmp_path / "assets")
+
+    assert list((tmp_path / "assets").iterdir()) == []
 
 
 def test_one_black_pixel_is_not_classified_as_blank() -> None:

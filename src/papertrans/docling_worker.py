@@ -11,12 +11,20 @@ from typing import Any
 
 from .docling_adapter import (
     _DOCLING_PARTIAL_EXIT_CODE,
+    _DOCLING_RESOURCE_LIMIT_EXIT_CODE,
+    DOCLING_MAX_DOCUMENT_JSON_BYTES,
     DoclingPartialConversionError,
+    DoclingResourceLimitError,
     convert_pdf_with_docling,
 )
 
 
-def write_json_atomic(value: dict[str, Any], output_path: Path) -> None:
+def write_json_atomic(
+    value: dict[str, Any],
+    output_path: Path,
+    *,
+    max_bytes: int = DOCLING_MAX_DOCUMENT_JSON_BYTES,
+) -> None:
     """Write a completed Docling export without exposing a partial JSON file."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,7 +36,20 @@ def write_json_atomic(value: dict[str, Any], output_path: Path) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
+            encoder = json.JSONEncoder(
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            written = 0
+            for chunk in encoder.iterencode(value):
+                encoded_size = len(chunk.encode("utf-8"))
+                if written + encoded_size + 1 > max_bytes:
+                    raise DoclingResourceLimitError(
+                        f"Docling JSON exceeds {max_bytes} bytes"
+                    )
+                handle.write(chunk)
+                written += encoded_size
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -51,10 +72,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         document = convert_pdf_with_docling(args.source)
+        write_json_atomic(document, args.output_json)
     except DoclingPartialConversionError as error:
         print(str(error), file=sys.stderr)
         return _DOCLING_PARTIAL_EXIT_CODE
-    write_json_atomic(document, args.output_json)
+    except DoclingResourceLimitError as error:
+        print(str(error), file=sys.stderr)
+        return _DOCLING_RESOURCE_LIMIT_EXIT_CODE
     return 0
 
 

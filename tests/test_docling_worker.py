@@ -52,18 +52,49 @@ def test_worker_returns_dedicated_code_for_partial_conversion(
 
 
 def test_atomic_writer_preserves_previous_json_when_serialization_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "docling-document.json"
+    output.write_text('{"previous": true}\n', encoding="utf-8")
+    circular: dict[str, object] = {}
+    circular["self"] = circular
+
+    with pytest.raises(ValueError, match="Circular reference"):
+        worker.write_json_atomic(circular, output)
+
+    assert json.loads(output.read_text()) == {"previous": True}
+    assert list(tmp_path.glob(".docling-document.json.*.tmp")) == []
+
+
+def test_atomic_writer_rejects_oversized_json_without_replacing_output(
+    tmp_path: Path,
 ) -> None:
     output = tmp_path / "docling-document.json"
     output.write_text('{"previous": true}\n', encoding="utf-8")
 
-    def partial_write(_value, handle, **_kwargs):
-        handle.write("{")
-        raise RuntimeError("serialization failed")
-
-    monkeypatch.setattr(worker.json, "dump", partial_write)
-    with pytest.raises(RuntimeError, match="serialization failed"):
-        worker.write_json_atomic({"new": True}, output)
+    with pytest.raises(worker.DoclingResourceLimitError, match="exceeds 32 bytes"):
+        worker.write_json_atomic({"text": "x" * 64}, output, max_bytes=32)
 
     assert json.loads(output.read_text()) == {"previous": True}
     assert list(tmp_path.glob(".docling-document.json.*.tmp")) == []
+
+
+def test_worker_returns_dedicated_code_for_resource_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "docling-document.json"
+
+    def limited(_source: Path):
+        raise worker.DoclingResourceLimitError("PDF page count exceeds 300")
+
+    monkeypatch.setattr(worker, "convert_pdf_with_docling", limited)
+
+    assert worker.main([str(tmp_path / "paper.pdf"), str(output)]) == (
+        worker._DOCLING_RESOURCE_LIMIT_EXIT_CODE
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "PDF page count exceeds 300\n"
+    assert not output.exists()

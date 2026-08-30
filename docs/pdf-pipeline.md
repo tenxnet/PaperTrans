@@ -28,6 +28,27 @@ The current adapter is for digitally generated PDFs. OCR is disabled by design;
 a scanned or otherwise unreadable PDF fails explicitly instead of silently
 producing an empty paper.
 
+## Resource envelope
+
+Docling imports fail closed before exceeding PaperTrans's per-job safety
+envelope. The hard ceilings are 50 MiB and 300 pages per source PDF, 250,000 PDF
+objects, 14,400 points on either page dimension, four parser threads, 15 minutes
+of worker time, 64 MiB of worker JSON, 50,000 extracted items, 32 MiB of extracted
+text, and 2,000 visual objects. Raster work is also shared across the whole job:
+at most 4,000 renders, 25 million pixels in one render, 150 million cumulative
+pixels, and 256 MiB of generated visual files. POSIX runtimes add CPU and
+file-size limits as defense in depth. A process-tree supervisor samples aggregate
+resident memory and terminates the worker tree above 6 GiB; finite address-space
+or data-segment limits are applied as an additional OS-level guard where
+supported.
+
+The Web route bounds the received multipart body to 51 MiB and 60 seconds before
+parsing it, admits one PDF import at a time through a process-persistent lock,
+and gives the complete detached pipeline a 20-minute outer deadline. A timed-out
+process group is terminated, including ordinary Docling descendants. Environment
+tuning may lower the worker timeout or parser thread count, but cannot raise
+these application ceilings.
+
 ## Docling semantic pipeline
 
 Docling runs in an isolated child process and writes directly to PaperTrans's

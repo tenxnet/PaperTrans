@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2209,9 +2210,18 @@ def test_converter_explicitly_disables_ocr_for_digital_pdf(
         def __init__(self, *, format_options: dict):
             observed["format_options"] = format_options
 
-        def convert(self, source: Path, *, raises_on_error: bool):
+        def convert(
+            self,
+            source: Path,
+            *,
+            raises_on_error: bool,
+            max_num_pages: int,
+            max_file_size: int,
+        ):
             observed["source"] = source
             observed["raises_on_error"] = raises_on_error
+            observed["max_num_pages"] = max_num_pages
+            observed["max_file_size"] = max_file_size
             return SimpleNamespace(
                 status=FakeConversionStatus.SUCCESS,
                 errors=[],
@@ -2276,6 +2286,8 @@ def test_converter_explicitly_disables_ocr_for_digital_pdf(
     assert observed["backend_options"].parser_threads == 3
     assert observed["source"] == Path("paper.pdf")
     assert observed["raises_on_error"] is False
+    assert observed["max_num_pages"] == adapter.DOCLING_MAX_PAGES
+    assert observed["max_file_size"] == adapter.DOCLING_MAX_SOURCE_BYTES
     format_options = observed["format_options"]
     assert isinstance(format_options, dict)
     assert list(format_options) == [FakeInputFormat.PDF]
@@ -2314,8 +2326,17 @@ def test_converter_rejects_partial_success_with_sanitized_errors(
         def __init__(self, **_kwargs):
             pass
 
-        def convert(self, _source: Path, *, raises_on_error: bool):
+        def convert(
+            self,
+            _source: Path,
+            *,
+            raises_on_error: bool,
+            max_num_pages: int,
+            max_file_size: int,
+        ):
             assert raises_on_error is False
+            assert max_num_pages == adapter.DOCLING_MAX_PAGES
+            assert max_file_size == adapter.DOCLING_MAX_SOURCE_BYTES
             return SimpleNamespace(
                 status=ConversionStatus.PARTIAL_SUCCESS,
                 errors=[SimpleNamespace(error_message="page 1\nfailed\x00to parse")],
@@ -2342,6 +2363,9 @@ def test_converter_rejects_partial_success_with_sanitized_errors(
             PdfPipelineOptions=Option,
             LayoutObjectDetectionOptions=Option,
             HeadingHierarchyOptions=Option,
+        ),
+        "docling.datamodel.backend_options": SimpleNamespace(
+            ThreadedDoclingParseBackendOptions=Option,
         ),
         "onnxruntime": SimpleNamespace(),
     }
@@ -2472,7 +2496,7 @@ def test_parent_runs_worker_without_stdout_protocol_and_reads_atomic_json(
         )
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(adapter.subprocess, "run", fake_run)
+    monkeypatch.setattr(adapter, "_run_docling_command", fake_run)
     result = adapter._run_docling_worker(source, work_dir, timeout_seconds=12.5)
 
     command = observed["command"]
@@ -2519,7 +2543,7 @@ def test_parent_retries_native_parser_crash_once_with_one_parser_thread(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
-    monkeypatch.setattr(adapter.subprocess, "run", fake_run)
+    monkeypatch.setattr(adapter, "_run_docling_command", fake_run)
     result = adapter._run_docling_worker(source, work_dir, timeout_seconds=12.5)
 
     assert len(calls) == 2
@@ -2552,7 +2576,7 @@ def test_parent_retries_partial_conversion_once_with_one_parser_thread(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
-    monkeypatch.setattr(adapter.subprocess, "run", fake_run)
+    monkeypatch.setattr(adapter, "_run_docling_command", fake_run)
     result = adapter._run_docling_worker(source, work_dir, timeout_seconds=12.5)
 
     assert len(calls) == 2
@@ -2574,7 +2598,7 @@ def test_parent_does_not_retry_persistent_partial_conversion_more_than_once(
         return SimpleNamespace(returncode=adapter._DOCLING_PARTIAL_EXIT_CODE)
 
     monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
-    monkeypatch.setattr(adapter.subprocess, "run", partial_run)
+    monkeypatch.setattr(adapter, "_run_docling_command", partial_run)
     with pytest.raises(adapter.DoclingWorkerError, match="status 75"):
         adapter._run_docling_worker(tmp_path / "paper.pdf", tmp_path / "work")
 
@@ -2587,7 +2611,7 @@ def test_parent_rejects_nonfinite_worker_timeout_without_starting_worker(
     def unexpected_run(*_args, **_kwargs):
         raise AssertionError("worker must not start")
 
-    monkeypatch.setattr(adapter.subprocess, "run", unexpected_run)
+    monkeypatch.setattr(adapter, "_run_docling_command", unexpected_run)
     with pytest.raises(DoclingAdapterError, match="positive number"):
         adapter._run_docling_worker(
             tmp_path / "paper.pdf", tmp_path / "work", timeout_seconds=float("nan")
@@ -2606,7 +2630,7 @@ def test_parent_caps_worker_stderr_and_raises_for_nonzero_exit(
         )
         return SimpleNamespace(returncode=139)
 
-    monkeypatch.setattr(adapter.subprocess, "run", failed_run)
+    monkeypatch.setattr(adapter, "_run_docling_command", failed_run)
     with pytest.raises(adapter.DoclingWorkerError, match="status 139"):
         adapter._run_docling_worker(tmp_path / "paper.pdf", work_dir)
 
@@ -2619,6 +2643,17 @@ def test_parent_caps_worker_stderr_and_raises_for_nonzero_exit(
     assert omitted == adapter._DOCLING_WORKER_LOG_LIMIT_BYTES + 200 + len(tail) - len(retained)
 
 
+def test_parent_preserves_memory_supervisor_resource_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def limited(_command: list[str], **_kwargs):
+        raise adapter.DoclingResourceLimitError("resident memory exceeds the job limit")
+
+    monkeypatch.setattr(adapter, "_run_docling_command", limited)
+    with pytest.raises(adapter.DoclingResourceLimitError, match="resident memory"):
+        adapter._run_docling_worker(tmp_path / "paper.pdf", tmp_path / "work")
+
+
 def test_parent_turns_worker_timeout_into_specific_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2628,7 +2663,7 @@ def test_parent_turns_worker_timeout_into_specific_exception(
         kwargs["stderr"].write(b"last worker line\n")
         raise adapter.subprocess.TimeoutExpired(command, kwargs["timeout"])
 
-    monkeypatch.setattr(adapter.subprocess, "run", timed_out)
+    monkeypatch.setattr(adapter, "_run_docling_command", timed_out)
     with pytest.raises(adapter.DoclingWorkerTimeoutError, match="3 seconds"):
         adapter._run_docling_worker(
             tmp_path / "paper.pdf", work_dir, timeout_seconds=3
@@ -2653,7 +2688,7 @@ def test_parent_removes_published_and_temporary_worker_output_on_timeout(
         worker_temp.write_text("partial", encoding="utf-8")
         raise adapter.subprocess.TimeoutExpired(command, kwargs["timeout"])
 
-    monkeypatch.setattr(adapter.subprocess, "run", timed_out)
+    monkeypatch.setattr(adapter, "_run_docling_command", timed_out)
     with pytest.raises(adapter.DoclingWorkerTimeoutError):
         adapter._run_docling_worker(tmp_path / "paper.pdf", work_dir, timeout_seconds=3)
 
@@ -2673,7 +2708,7 @@ def test_parent_cleans_worker_output_and_reraises_keyboard_interrupt(
         worker_output.write_text('{"partial": true}', encoding="utf-8")
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(adapter.subprocess, "run", interrupted)
+    monkeypatch.setattr(adapter, "_run_docling_command", interrupted)
     with pytest.raises(KeyboardInterrupt):
         adapter._run_docling_worker(tmp_path / "paper.pdf", work_dir)
 
@@ -2701,12 +2736,391 @@ def test_parent_cleans_worker_output_when_log_write_fails(
             raise OSError("disk full")
         return original_write_bytes(path, data)
 
-    monkeypatch.setattr(adapter.subprocess, "run", completed)
+    monkeypatch.setattr(adapter, "_run_docling_command", completed)
     monkeypatch.setattr(Path, "write_bytes", fail_log_write)
     with pytest.raises(OSError, match="disk full"):
         adapter._run_docling_worker(tmp_path / "paper.pdf", work_dir)
 
     assert not observed["output"].exists()
+
+
+def test_source_preflight_accepts_normal_pdf_and_rejects_page_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "bounded.pdf"
+    pdf = fitz.open()
+    pdf.new_page(width=612, height=792)
+    pdf.new_page(width=612, height=792)
+    pdf.save(source)
+    pdf.close()
+
+    assert adapter._validate_docling_source_pdf(source) == 2
+
+    monkeypatch.setattr(adapter, "DOCLING_MAX_PAGES", 1)
+    with pytest.raises(adapter.DoclingResourceLimitError, match="page count"):
+        adapter._validate_docling_source_pdf(source)
+
+
+def test_source_preflight_rejects_excessive_pdf_object_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "objects.pdf"
+    pdf = fitz.open()
+    pdf.new_page(width=612, height=792)
+    pdf.save(source)
+    pdf.close()
+    monkeypatch.setattr(adapter, "DOCLING_MAX_PDF_OBJECTS", 1)
+
+    with pytest.raises(adapter.DoclingResourceLimitError, match="object count"):
+        adapter._validate_docling_source_pdf(source)
+
+
+def test_parent_rejects_oversized_worker_json_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "worker.json"
+    output.write_bytes(b'{"value": true}')
+    monkeypatch.setattr(adapter, "DOCLING_MAX_DOCUMENT_JSON_BYTES", 8)
+
+    def unexpected_read(_path: Path) -> bytes:
+        raise AssertionError("oversized worker JSON must not be read")
+
+    monkeypatch.setattr(Path, "read_bytes", unexpected_read)
+    with pytest.raises(adapter.DoclingResourceLimitError, match="output limit"):
+        adapter._read_docling_worker_json(output)
+
+
+def test_docling_document_limits_reject_unbounded_page_identity_and_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid_page = {"pages": {"1": {"page_no": 3}}}
+    with pytest.raises(adapter.DoclingResourceLimitError, match="invalid page 3"):
+        adapter._validate_docling_document_limits(invalid_page, source_pages=1)
+
+    too_many = {
+        "pages": {"1": {"page_no": 1}},
+        "texts": [{"text": "one"}, {"text": "two"}],
+    }
+    monkeypatch.setattr(adapter, "DOCLING_MAX_CONTENT_ITEMS", 2)
+    with pytest.raises(adapter.DoclingResourceLimitError, match="item count"):
+        adapter._validate_docling_document_limits(too_many, source_pages=1)
+
+
+def test_retry_uses_remaining_time_from_one_shared_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[float] = []
+    moments = iter([100.0, 104.0])
+
+    def fake_monotonic() -> float:
+        return next(moments)
+
+    def fake_run(command: list[str], **kwargs):
+        timeouts.append(float(kwargs["timeout"]))
+        if len(timeouts) == 1:
+            return SimpleNamespace(returncode=-adapter.signal.SIGSEGV)
+        Path(command[-1]).write_text(
+            json.dumps(sample_docling_document()), encoding="utf-8"
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(adapter.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(adapter, "_run_docling_command", fake_run)
+    monkeypatch.delenv("PAPERTRANS_DOCLING_PARSER_THREADS", raising=False)
+
+    adapter._run_docling_worker(
+        tmp_path / "paper.pdf",
+        tmp_path / "work",
+        timeout_seconds=10,
+    )
+
+    assert timeouts == [10.0, 6.0]
+
+
+def test_worker_command_terminates_its_process_tree_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4321
+        wait_calls = 0
+
+        def wait(self, timeout: float) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise adapter.subprocess.TimeoutExpired(["worker"], timeout)
+            return -adapter.signal.SIGTERM
+
+    process = FakeProcess()
+
+    class FakePsutil:
+        class NoSuchProcess(Exception):
+            pass
+
+        class AccessDenied(Exception):
+            pass
+
+        @classmethod
+        def Process(cls, _pid: int):
+            raise cls.NoSuchProcess
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        observed.update(kwargs)
+        return process
+
+    terminated: list[object] = []
+
+    def fake_terminate(value, **_kwargs) -> None:
+        terminated.append(value)
+
+    monkeypatch.setattr(adapter.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(adapter, "_load_psutil_module", lambda: FakePsutil)
+    monkeypatch.setattr(adapter, "_terminate_docling_process_tree", fake_terminate)
+
+    with pytest.raises(adapter.subprocess.TimeoutExpired):
+        adapter._run_docling_command(["worker"], timeout=1, check=False)
+
+    assert observed["start_new_session"] is False
+    assert observed["shell"] is False
+    assert terminated == [process]
+
+
+def test_worker_command_kills_tree_when_aggregate_rss_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed = adapter.threading.Event()
+
+    class FakeProcess:
+        pid = 9876
+        returncode: int | None = None
+
+        def wait(self, timeout: float) -> int:
+            if not killed.wait(timeout):
+                raise adapter.subprocess.TimeoutExpired(["worker"], timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            killed.set()
+
+    class MonitoredProcess:
+        pid = 9876
+
+        def children(self, *, recursive: bool):
+            assert recursive is True
+            return []
+
+        def memory_info(self):
+            return SimpleNamespace(rss=adapter.DOCLING_MAX_MEMORY_BYTES + 1)
+
+        def kill(self) -> None:
+            killed.set()
+
+        def terminate(self) -> None:
+            killed.set()
+
+    class FakePsutil:
+        class NoSuchProcess(Exception):
+            pass
+
+        class AccessDenied(Exception):
+            pass
+
+        @staticmethod
+        def Process(pid: int):
+            assert pid == 9876
+            return MonitoredProcess()
+
+        @staticmethod
+        def wait_procs(processes, timeout: float):
+            return list(processes), []
+
+    process = FakeProcess()
+    monkeypatch.setattr(adapter.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(adapter, "_load_psutil_module", lambda: FakePsutil)
+    monkeypatch.setattr(adapter, "_DOCLING_MEMORY_POLL_SECONDS", 0.001)
+
+    with pytest.raises(adapter.DoclingResourceLimitError, match="resident memory"):
+        adapter._run_docling_command(["worker"], timeout=1, check=False)
+
+    assert killed.is_set()
+
+
+def test_worker_command_fails_closed_when_rss_cannot_be_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed = adapter.threading.Event()
+
+    class FakeProcess:
+        pid = 2468
+        returncode: int | None = None
+
+        def wait(self, timeout: float) -> int:
+            if not killed.wait(timeout):
+                raise adapter.subprocess.TimeoutExpired(["worker"], timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            killed.set()
+
+    class FakePsutil:
+        class NoSuchProcess(Exception):
+            pass
+
+        class AccessDenied(Exception):
+            pass
+
+        @classmethod
+        def Process(cls, _pid: int):
+            raise cls.AccessDenied
+
+        @staticmethod
+        def wait_procs(processes, timeout: float):
+            return list(processes), []
+
+    process = FakeProcess()
+    monkeypatch.setattr(adapter.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(adapter, "_load_psutil_module", lambda: FakePsutil)
+    monkeypatch.setattr(adapter, "_DOCLING_MEMORY_POLL_SECONDS", 0.001)
+
+    with pytest.raises(adapter.DoclingResourceLimitError, match="could not inspect"):
+        adapter._run_docling_command(["worker"], timeout=1, check=False)
+
+    assert killed.is_set()
+
+
+def test_temporary_resource_limits_restore_every_soft_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResource:
+        RLIM_INFINITY = -1
+        RUSAGE_SELF = 0
+        RLIMIT_AS = 1
+        RLIMIT_CPU = 2
+        RLIMIT_FSIZE = 3
+
+        def __init__(self) -> None:
+            self.limits = {
+                self.RLIMIT_AS: (10**12, 10**12),
+                self.RLIMIT_CPU: (10_000, 10_000),
+                self.RLIMIT_FSIZE: (10**12, 10**12),
+            }
+
+        def getrusage(self, _who: int):
+            return SimpleNamespace(ru_utime=2.0, ru_stime=1.0)
+
+        def getrlimit(self, name: int) -> tuple[int, int]:
+            return self.limits[name]
+
+        def setrlimit(self, name: int, limits: tuple[int, int]) -> None:
+            self.limits[name] = limits
+
+    resource = FakeResource()
+    previous = dict(resource.limits)
+    monkeypatch.setattr(adapter, "_load_resource_module", lambda: resource)
+
+    with adapter._temporary_docling_resource_limits(10):
+        assert resource.limits[resource.RLIMIT_AS][0] == (
+            adapter.DOCLING_MAX_MEMORY_BYTES
+        )
+        assert resource.limits[resource.RLIMIT_CPU][0] < 10_000
+        assert resource.limits[resource.RLIMIT_FSIZE][0] == (
+            adapter.DOCLING_MAX_OUTPUT_FILE_BYTES
+        )
+
+    assert resource.limits == previous
+
+
+def test_temporary_resource_limit_setup_failure_restores_earlier_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResource:
+        RLIM_INFINITY = -1
+        RUSAGE_SELF = 0
+        RLIMIT_AS = 1
+        RLIMIT_CPU = 2
+        RLIMIT_FSIZE = 3
+
+        def __init__(self) -> None:
+            self.limits = {
+                self.RLIMIT_AS: (10**12, 10**12),
+                self.RLIMIT_CPU: (0, 0),
+                self.RLIMIT_FSIZE: (10**12, 10**12),
+            }
+
+        def getrusage(self, _who: int):
+            return SimpleNamespace(ru_utime=0.0, ru_stime=0.0)
+
+        def getrlimit(self, name: int) -> tuple[int, int]:
+            return self.limits[name]
+
+        def setrlimit(self, name: int, limits: tuple[int, int]) -> None:
+            self.limits[name] = limits
+
+    resource = FakeResource()
+    previous = dict(resource.limits)
+    monkeypatch.setattr(adapter, "_load_resource_module", lambda: resource)
+
+    with pytest.raises(adapter.DoclingResourceLimitError, match="cannot run"):
+        with adapter._temporary_docling_resource_limits(10):
+            raise AssertionError("context body must not run")
+
+    assert resource.limits == previous
+
+
+def test_temporary_resource_limits_fall_back_when_address_space_is_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResource:
+        RLIM_INFINITY = -1
+        RUSAGE_SELF = 0
+        RLIMIT_AS = 1
+        RLIMIT_CPU = 2
+        RLIMIT_FSIZE = 3
+        RLIMIT_DATA = 4
+
+        def __init__(self) -> None:
+            self.limits = {
+                name: (10**12, 10**12)
+                for name in (
+                    self.RLIMIT_AS,
+                    self.RLIMIT_CPU,
+                    self.RLIMIT_FSIZE,
+                    self.RLIMIT_DATA,
+                )
+            }
+
+        def getrusage(self, _who: int):
+            return SimpleNamespace(ru_utime=0.0, ru_stime=0.0)
+
+        def getrlimit(self, name: int) -> tuple[int, int]:
+            return self.limits[name]
+
+        def setrlimit(self, name: int, limits: tuple[int, int]) -> None:
+            if name == self.RLIMIT_AS and limits[0] != self.limits[name][0]:
+                raise ValueError("address-space limits are unsupported")
+            self.limits[name] = limits
+
+    resource = FakeResource()
+    previous = dict(resource.limits)
+    monkeypatch.setattr(adapter, "_load_resource_module", lambda: resource)
+
+    with adapter._temporary_docling_resource_limits(10):
+        assert resource.limits[resource.RLIMIT_AS] == previous[resource.RLIMIT_AS]
+        assert resource.limits[resource.RLIMIT_DATA][0] == (
+            adapter.DOCLING_MAX_MEMORY_BYTES
+        )
+
+    assert resource.limits == previous
 
 
 def test_extract_api_persists_three_semantic_pipeline_contracts(
@@ -2728,10 +3142,23 @@ def test_extract_api_persists_three_semantic_pipeline_contracts(
         return expected_document
 
     monkeypatch.setattr(adapter, "_run_docling_worker", fake_worker)
+    monkeypatch.setattr(adapter, "_validate_docling_source_pdf", lambda _value: 2)
+    monkeypatch.setattr(
+        adapter,
+        "_temporary_docling_resource_limits",
+        lambda _timeout: nullcontext(),
+    )
 
-    def fake_render(value: Path, structure: dict, assets_dir: Path) -> list[dict]:
+    def fake_render(
+        value: Path,
+        structure: dict,
+        assets_dir: Path,
+        *,
+        budget,
+    ) -> list[dict]:
         observed["source"] = value
         observed["assets"] = assets_dir
+        observed["bounded_render"] = budget is not None
         evidence = json.loads(evidence_path.read_text()) if evidence_path.exists() else None
         # Rendering happens before persistence, so construct only the fields the
         # downstream semantic builder requires.
@@ -2760,9 +3187,10 @@ def test_extract_api_persists_three_semantic_pipeline_contracts(
     assert observed == {
         "worker_source": source.resolve(),
         "worker_dir": work_dir,
-        "worker_timeout": None,
+        "worker_timeout": adapter._DOCLING_WORKER_TIMEOUT_SECONDS,
         "source": source.resolve(),
         "assets": work_dir / "assets",
+        "bounded_render": True,
     }
     assert json.loads(evidence_path.read_text()) == evidence
     assert json.loads(structure_path.read_text()) == structure

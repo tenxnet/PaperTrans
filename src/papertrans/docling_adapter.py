@@ -7,22 +7,29 @@ import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unicodedata
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager, suppress
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 import pymupdf as fitz
 
 from .deterministic_structure import visual_caption_score
 from .pdf_caption_refinement import refine_pdf_caption_texts
-from .structure import render_visual_objects, validate_structure_batch
+from .structure import (
+    PdfRenderBudget,
+    render_visual_objects,
+    validate_structure_batch,
+)
 
 
 class DoclingAdapterError(ValueError):
@@ -45,10 +52,33 @@ class DoclingPartialConversionError(DoclingAdapterError):
     """Raised when Docling returns only a partial PDF conversion."""
 
 
+class DoclingResourceLimitError(DoclingAdapterError):
+    """Raised before a Docling job exceeds an application resource ceiling."""
+
+
 _DOCLING_WORKER_LOG_LIMIT_BYTES = 256 * 1024
 _DOCLING_PARTIAL_EXIT_CODE = 75
+_DOCLING_RESOURCE_LIMIT_EXIT_CODE = 76
 _DOCLING_DOCUMENT_TIMEOUT_SECONDS = 10 * 60.0
 _DOCLING_WORKER_TIMEOUT_SECONDS = _DOCLING_DOCUMENT_TIMEOUT_SECONDS + 30.0
+DOCLING_MAX_SOURCE_BYTES = 50 * 1024 * 1024
+DOCLING_MAX_PAGES = 300
+DOCLING_MAX_PDF_OBJECTS = 250_000
+DOCLING_MAX_PAGE_DIMENSION_POINTS = 14_400.0
+DOCLING_MAX_DOCUMENT_JSON_BYTES = 64 * 1024 * 1024
+DOCLING_MAX_CONTENT_ITEMS = 50_000
+DOCLING_MAX_TEXT_CHARACTERS = 32 * 1024 * 1024
+DOCLING_MAX_VISUAL_OBJECTS = 2_000
+DOCLING_MAX_WORKER_TIMEOUT_SECONDS = 15 * 60.0
+DOCLING_MAX_PARSER_THREADS = 4
+DOCLING_MAX_MEMORY_BYTES = 6 * 1024 * 1024 * 1024
+DOCLING_MAX_CPU_SECONDS = 15 * 60
+DOCLING_MAX_OUTPUT_FILE_BYTES = 256 * 1024 * 1024
+DOCLING_MAX_RASTER_RENDERS = 4_000
+DOCLING_MAX_SINGLE_RASTER_PIXELS = 25_000_000
+DOCLING_MAX_TOTAL_RASTER_PIXELS = 150_000_000
+DOCLING_MAX_RASTER_OUTPUT_BYTES = 256 * 1024 * 1024
+_DOCLING_MEMORY_POLL_SECONDS = 0.1
 _CONTENT_COLLECTIONS = (
     "texts",
     "pictures",
@@ -58,6 +88,190 @@ _CONTENT_COLLECTIONS = (
     "field_regions",
     "field_items",
 )
+
+
+def _resolve_docling_worker_timeout(value: float | None) -> float:
+    if value is None:
+        raw_timeout = os.environ.get("PAPERTRANS_DOCLING_WORKER_TIMEOUT")
+        try:
+            value = (
+                float(raw_timeout)
+                if raw_timeout is not None
+                else _DOCLING_WORKER_TIMEOUT_SECONDS
+            )
+        except ValueError as error:
+            raise DoclingAdapterError(
+                "PAPERTRANS_DOCLING_WORKER_TIMEOUT must be a positive number"
+            ) from error
+    if not math.isfinite(value) or value <= 0:
+        raise DoclingAdapterError(
+            "PAPERTRANS_DOCLING_WORKER_TIMEOUT must be a positive number"
+        )
+    if value > DOCLING_MAX_WORKER_TIMEOUT_SECONDS:
+        raise DoclingResourceLimitError(
+            "PAPERTRANS_DOCLING_WORKER_TIMEOUT must not exceed "
+            f"{DOCLING_MAX_WORKER_TIMEOUT_SECONDS:g} seconds"
+        )
+    return value
+
+
+def _load_resource_module() -> Any | None:
+    try:
+        import resource
+    except ImportError:
+        return None
+    return resource
+
+
+def _load_psutil_module() -> Any:
+    try:
+        return importlib.import_module("psutil")
+    except (ImportError, ModuleNotFoundError) as error:
+        raise DoclingUnavailableError(
+            "Docling process supervision requires psutil; reinstall the "
+            "PaperTrans `docling` extra."
+        ) from error
+
+
+@contextmanager
+def _temporary_docling_resource_limits(timeout_seconds: float) -> Iterator[None]:
+    """Bound the dedicated parsing process while preserving its prior soft limits."""
+
+    resource = _load_resource_module()
+    if resource is None:
+        raise DoclingResourceLimitError(
+            "Docling resource limits require the supported macOS or Linux runtime"
+        )
+    infinity = resource.RLIM_INFINITY
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_target = (
+        math.ceil(float(usage.ru_utime) + float(usage.ru_stime))
+        + min(DOCLING_MAX_CPU_SECONDS, math.ceil(timeout_seconds) + 120)
+    )
+    previous: list[tuple[int, tuple[int, int]]] = []
+
+    def apply_limit(name: str, requested_soft: int, *, required: bool) -> bool:
+        limit_name = getattr(resource, name, None)
+        if limit_name is None:
+            if required:
+                raise DoclingResourceLimitError(
+                    f"The supported runtime does not expose {name}"
+                )
+            return False
+        soft, hard = resource.getrlimit(limit_name)
+        target = int(requested_soft)
+        if soft != infinity:
+            target = min(target, int(soft))
+        if hard != infinity:
+            target = min(target, int(hard))
+        if target <= 0:
+            if required:
+                raise DoclingResourceLimitError(
+                    f"The current process {name} limit cannot run Docling safely"
+                )
+            return False
+        try:
+            resource.setrlimit(limit_name, (target, hard))
+        except (OSError, ValueError):
+            if required:
+                raise
+            return False
+        previous.append((limit_name, (soft, hard)))
+        return True
+
+    try:
+        # macOS exposes RLIMIT_AS but rejects finite values. Prefer it where it
+        # works, then fall back to the narrower data-segment limit. Structural,
+        # JSON, and raster budgets remain the primary cross-platform memory
+        # boundary when neither primitive is enforceable.
+        if not apply_limit("RLIMIT_AS", DOCLING_MAX_MEMORY_BYTES, required=False):
+            apply_limit("RLIMIT_DATA", DOCLING_MAX_MEMORY_BYTES, required=False)
+        apply_limit("RLIMIT_CPU", cpu_target, required=True)
+        apply_limit(
+            "RLIMIT_FSIZE",
+            DOCLING_MAX_OUTPUT_FILE_BYTES,
+            required=True,
+        )
+    except DoclingResourceLimitError:
+        for limit_name, limits in reversed(previous):
+            with suppress(OSError, ValueError):
+                resource.setrlimit(limit_name, limits)
+        raise
+    except (OSError, ValueError) as error:
+        for limit_name, limits in reversed(previous):
+            with suppress(OSError, ValueError):
+                resource.setrlimit(limit_name, limits)
+        raise DoclingResourceLimitError(
+            "PaperTrans could not apply the Docling process resource limits"
+        ) from error
+    try:
+        yield
+    finally:
+        for limit_name, limits in reversed(previous):
+            resource.setrlimit(limit_name, limits)
+
+
+def _validate_docling_source_pdf(source: Path) -> int:
+    """Reject oversized or structurally extreme PDFs before Docling conversion."""
+
+    source = Path(source)
+    try:
+        source_stat = source.stat()
+    except OSError as error:
+        raise DoclingAdapterError(f"PDF source is unavailable: {source}") from error
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise DoclingAdapterError("PDF source must be a regular file")
+    if source_stat.st_size > DOCLING_MAX_SOURCE_BYTES:
+        raise DoclingResourceLimitError(
+            f"PDF source exceeds {DOCLING_MAX_SOURCE_BYTES} bytes"
+        )
+    try:
+        with source.open("rb") as handle:
+            if handle.read(5) != b"%PDF-":
+                raise DoclingAdapterError("PDF source does not begin with %PDF-")
+    except OSError as error:
+        raise DoclingAdapterError(f"PDF source cannot be read: {source}") from error
+    try:
+        pdf = fitz.open(source)
+    except (RuntimeError, ValueError, OSError) as error:
+        raise DoclingAdapterError("PyMuPDF could not inspect the PDF source") from error
+    try:
+        if pdf.needs_pass or pdf.is_encrypted:
+            raise DoclingAdapterError("Encrypted PDFs are unsupported")
+        if not 1 <= pdf.page_count <= DOCLING_MAX_PAGES:
+            raise DoclingResourceLimitError(
+                f"PDF page count must be between 1 and {DOCLING_MAX_PAGES}"
+            )
+        xref_count = int(pdf.xref_length())
+        if xref_count > DOCLING_MAX_PDF_OBJECTS:
+            raise DoclingResourceLimitError(
+                "PDF object count exceeds the Docling limit "
+                f"({xref_count} > {DOCLING_MAX_PDF_OBJECTS})"
+            )
+        for page_number, page in enumerate(pdf, start=1):
+            width = float(page.rect.width)
+            height = float(page.rect.height)
+            if (
+                width <= 0
+                or height <= 0
+                or width > DOCLING_MAX_PAGE_DIMENSION_POINTS
+                or height > DOCLING_MAX_PAGE_DIMENSION_POINTS
+            ):
+                raise DoclingResourceLimitError(
+                    f"PDF page {page_number} exceeds the supported dimensions"
+                )
+        return pdf.page_count
+    finally:
+        pdf.close()
+
+
+def _new_docling_raster_budget() -> PdfRenderBudget:
+    return PdfRenderBudget(
+        max_renders=DOCLING_MAX_RASTER_RENDERS,
+        max_single_pixels=DOCLING_MAX_SINGLE_RASTER_PIXELS,
+        max_total_pixels=DOCLING_MAX_TOTAL_RASTER_PIXELS,
+        max_output_bytes=DOCLING_MAX_RASTER_OUTPUT_BYTES,
+    )
 _VISUAL_LABELS = {
     "chart": "figure",
     "diagram": "figure",
@@ -151,7 +365,12 @@ def docling_document_to_dict(document: Any) -> dict[str, Any]:
     return copy.deepcopy(dict(value))
 
 
-def _write_json_atomic(path: Path, value: Any) -> None:
+def _write_json_atomic(
+    path: Path,
+    value: Any,
+    *,
+    max_bytes: int | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -159,13 +378,20 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(
-                value,
-                handle,
+            encoder = json.JSONEncoder(
                 ensure_ascii=False,
                 indent=2,
                 allow_nan=False,
             )
+            written = 0
+            for chunk in encoder.iterencode(value):
+                encoded_size = len(chunk.encode("utf-8"))
+                if max_bytes is not None and written + encoded_size + 1 > max_bytes:
+                    raise DoclingResourceLimitError(
+                        f"JSON artifact exceeds {max_bytes} bytes: {path.name}"
+                    )
+                handle.write(chunk)
+                written += encoded_size
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -311,8 +537,13 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
         raise DoclingAdapterError(
             "PAPERTRANS_DOCLING_DOCUMENT_TIMEOUT must be a positive number"
         )
+    if document_timeout > DOCLING_MAX_WORKER_TIMEOUT_SECONDS:
+        raise DoclingResourceLimitError(
+            "PAPERTRANS_DOCLING_DOCUMENT_TIMEOUT must not exceed "
+            f"{DOCLING_MAX_WORKER_TIMEOUT_SECONDS:g} seconds"
+        )
     raw_parser_threads = os.environ.get("PAPERTRANS_DOCLING_PARSER_THREADS")
-    parser_threads: int | None = None
+    parser_threads = DOCLING_MAX_PARSER_THREADS
     if raw_parser_threads is not None:
         try:
             parser_threads = int(raw_parser_threads)
@@ -320,9 +551,10 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
             raise DoclingAdapterError(
                 "PAPERTRANS_DOCLING_PARSER_THREADS must be a positive integer"
             ) from error
-        if parser_threads <= 0:
+        if not 1 <= parser_threads <= DOCLING_MAX_PARSER_THREADS:
             raise DoclingAdapterError(
-                "PAPERTRANS_DOCLING_PARSER_THREADS must be a positive integer"
+                "PAPERTRANS_DOCLING_PARSER_THREADS must be between 1 and "
+                f"{DOCLING_MAX_PARSER_THREADS}"
             )
     pipeline_kwargs: dict[str, Any] = {
         "do_ocr": False,
@@ -343,31 +575,35 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
         pipeline_kwargs["artifacts_path"] = Path(artifacts_path)
     pdf_pipeline_options = pdf_pipeline_options_class(**pipeline_kwargs)
     format_kwargs: dict[str, Any] = {"pipeline_options": pdf_pipeline_options}
-    if parser_threads is not None:
-        try:
-            backend_options_module = importlib.import_module(
-                "docling.datamodel.backend_options"
-            )
-        except (ImportError, ModuleNotFoundError) as error:
-            raise DoclingUnavailableError(
-                "The installed Docling package does not expose parser-thread controls"
-            ) from error
-        backend_options_class = getattr(
-            backend_options_module, "ThreadedDoclingParseBackendOptions", None
+    try:
+        backend_options_module = importlib.import_module(
+            "docling.datamodel.backend_options"
         )
-        if backend_options_class is None:
-            raise DoclingUnavailableError(
-                "The installed Docling package does not expose parser-thread controls"
-            )
-        format_kwargs["backend_options"] = backend_options_class(
-            parser_threads=parser_threads
+    except (ImportError, ModuleNotFoundError) as error:
+        raise DoclingUnavailableError(
+            "The installed Docling package does not expose parser-thread controls"
+        ) from error
+    backend_options_class = getattr(
+        backend_options_module, "ThreadedDoclingParseBackendOptions", None
+    )
+    if backend_options_class is None:
+        raise DoclingUnavailableError(
+            "The installed Docling package does not expose parser-thread controls"
         )
+    format_kwargs["backend_options"] = backend_options_class(
+        parser_threads=parser_threads
+    )
     converter = converter_class(
         format_options={
             input_format.PDF: pdf_format_option_class(**format_kwargs)
         }
     )
-    result = converter.convert(Path(source), raises_on_error=False)
+    result = converter.convert(
+        Path(source),
+        raises_on_error=False,
+        max_num_pages=DOCLING_MAX_PAGES,
+        max_file_size=DOCLING_MAX_SOURCE_BYTES,
+    )
     status = getattr(result, "status", None)
     if status != conversion_status.SUCCESS:
         raw_status = getattr(status, "value", status)
@@ -438,6 +674,167 @@ def _cleanup_worker_output(output_path: Path) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _terminate_docling_process_tree(
+    process: subprocess.Popen[Any],
+    *,
+    tracked_processes: Sequence[Any] = (),
+    timeout: float = 2.0,
+) -> None:
+    """Terminate a worker and every descendant observed by the RSS monitor."""
+
+    psutil = _load_psutil_module()
+    candidates: dict[int, Any] = {}
+    for candidate in tracked_processes:
+        try:
+            candidates[int(candidate.pid)] = candidate
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if process.poll() is None:
+        try:
+            root = psutil.Process(process.pid)
+            for candidate in [*root.children(recursive=True), root]:
+                candidates[int(candidate.pid)] = candidate
+        except psutil.NoSuchProcess:
+            pass
+    ordered = list(candidates.values())
+    for candidate in reversed(ordered):
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            candidate.terminate()
+    if ordered:
+        _gone, alive = psutil.wait_procs(ordered, timeout=timeout)
+        for candidate in alive:
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                candidate.kill()
+        if alive:
+            psutil.wait_procs(alive, timeout=1)
+    if process.poll() is None:
+        with suppress(OSError):
+            process.kill()
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=1)
+
+
+def _run_docling_command(
+    command: Sequence[str],
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """Run one worker attempt with wall-clock and aggregate-RSS supervision."""
+
+    timeout = float(kwargs.pop("timeout"))
+    check = bool(kwargs.pop("check", False))
+    psutil = _load_psutil_module()
+    process = subprocess.Popen(
+        command,
+        # Inherit the semantic pipeline's process group so the Web supervisor's
+        # outer kill reaches this worker too. Direct CLI cleanup uses psutil's
+        # recursive process-tree API instead of a separate session.
+        start_new_session=False,
+        close_fds=True,
+        shell=False,
+        **kwargs,
+    )
+    monitor_stop = threading.Event()
+    tracked: dict[int, Any] = {}
+    memory_failure: list[str] = []
+
+    def monitor_memory() -> None:
+        while not monitor_stop.is_set():
+            try:
+                root = psutil.Process(process.pid)
+                candidates = [root, *root.children(recursive=True)]
+                resident_bytes = 0
+                for candidate in candidates:
+                    tracked[int(candidate.pid)] = candidate
+                    try:
+                        resident_bytes += int(candidate.memory_info().rss)
+                    except psutil.NoSuchProcess:
+                        continue
+                if resident_bytes > DOCLING_MAX_MEMORY_BYTES:
+                    memory_failure.append(
+                        "Docling worker resident memory exceeds the job limit "
+                        f"({resident_bytes} > {DOCLING_MAX_MEMORY_BYTES})"
+                    )
+                    for candidate in reversed(candidates):
+                        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                            candidate.kill()
+                    with suppress(OSError):
+                        process.kill()
+                    return
+            except psutil.NoSuchProcess:
+                return
+            except (psutil.AccessDenied, PermissionError):
+                memory_failure.append(
+                    "PaperTrans could not inspect Docling worker memory"
+                )
+                with suppress(OSError):
+                    process.kill()
+                return
+            except Exception as error:
+                memory_failure.append(
+                    "PaperTrans Docling memory supervision failed "
+                    f"({type(error).__name__})"
+                )
+                with suppress(OSError):
+                    process.kill()
+                return
+            monitor_stop.wait(_DOCLING_MEMORY_POLL_SECONDS)
+
+    monitor = threading.Thread(
+        target=monitor_memory,
+        name="papertrans-docling-memory",
+        daemon=True,
+    )
+    monitor.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except BaseException:
+        monitor_stop.set()
+        monitor.join(timeout=1)
+        _terminate_docling_process_tree(
+            process,
+            tracked_processes=list(tracked.values()),
+        )
+        raise
+    finally:
+        monitor_stop.set()
+        monitor.join(timeout=1)
+    _terminate_docling_process_tree(
+        process,
+        tracked_processes=list(tracked.values()),
+        timeout=0.5,
+    )
+    if memory_failure:
+        raise DoclingResourceLimitError(memory_failure[0])
+    if check and returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+    return subprocess.CompletedProcess(command, returncode)
+
+
+def _read_docling_worker_json(output_path: Path) -> Any:
+    try:
+        output_stat = output_path.lstat()
+        if not stat.S_ISREG(output_stat.st_mode):
+            raise DoclingWorkerError("Docling worker output is not a regular file")
+        if output_stat.st_size > DOCLING_MAX_DOCUMENT_JSON_BYTES:
+            raise DoclingResourceLimitError(
+                "Docling worker JSON exceeds the output limit "
+                f"({output_stat.st_size} > {DOCLING_MAX_DOCUMENT_JSON_BYTES})"
+            )
+        payload = output_path.read_bytes()
+    except (DoclingResourceLimitError, DoclingWorkerError):
+        raise
+    except OSError as error:
+        raise DoclingWorkerError("Docling worker output cannot be read") from error
+    if len(payload) > DOCLING_MAX_DOCUMENT_JSON_BYTES:
+        raise DoclingResourceLimitError(
+            f"Docling worker JSON exceeds {DOCLING_MAX_DOCUMENT_JSON_BYTES} bytes"
+        )
+    try:
+        return json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DoclingWorkerError("Docling worker output is not valid JSON") from error
+
+
 def _run_docling_worker(
     source: Path,
     work_dir: Path,
@@ -448,22 +845,8 @@ def _run_docling_worker(
 
     source = Path(source).resolve()
     work_dir = Path(work_dir).resolve()
-    if timeout_seconds is None:
-        raw_timeout = os.environ.get("PAPERTRANS_DOCLING_WORKER_TIMEOUT")
-        try:
-            timeout_seconds = (
-                float(raw_timeout)
-                if raw_timeout is not None
-                else _DOCLING_WORKER_TIMEOUT_SECONDS
-            )
-        except ValueError as error:
-            raise DoclingAdapterError(
-                "PAPERTRANS_DOCLING_WORKER_TIMEOUT must be a positive number"
-            ) from error
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise DoclingAdapterError(
-            "PAPERTRANS_DOCLING_WORKER_TIMEOUT must be a positive number"
-        )
+    timeout_seconds = _resolve_docling_worker_timeout(timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
     work_dir.mkdir(parents=True, exist_ok=True)
     output_path = work_dir / f".docling-document-{uuid4().hex}.json"
     canonical_output_path = work_dir / "docling-document.json"
@@ -488,6 +871,8 @@ def _run_docling_worker(
     def run_attempt(
         child_env: Mapping[str, str] | None = None,
         attempt_work_dir: Path | None = None,
+        *,
+        timeout_for_attempt: float,
     ) -> tuple[Any | None, subprocess.TimeoutExpired | None, BaseException | None]:
         read_fd, write_fd = os.pipe()
         stderr_reader = threading.Thread(
@@ -498,7 +883,7 @@ def _run_docling_worker(
         )
         stderr_reader.start()
         attempt_process: Any | None = None
-        attempt_timeout: subprocess.TimeoutExpired | None = None
+        attempt_timeout_error: subprocess.TimeoutExpired | None = None
         attempt_error: BaseException | None = None
         try:
             with os.fdopen(write_fd, "wb", buffering=0) as stderr_writer:
@@ -507,21 +892,23 @@ def _run_docling_worker(
                     "stderr": stderr_writer,
                     "cwd": attempt_work_dir or work_dir,
                     "check": False,
-                    "timeout": timeout_seconds,
+                    "timeout": timeout_for_attempt,
                 }
                 if child_env is not None:
                     run_kwargs["env"] = dict(child_env)
                 try:
-                    attempt_process = subprocess.run(command, **run_kwargs)
+                    attempt_process = _run_docling_command(command, **run_kwargs)
                 except subprocess.TimeoutExpired as error:
-                    attempt_timeout = error
+                    attempt_timeout_error = error
                 except BaseException as error:
                     attempt_error = error
         finally:
             stderr_reader.join()
-        return attempt_process, attempt_timeout, attempt_error
+        return attempt_process, attempt_timeout_error, attempt_error
 
-    process, timeout_error, run_error = run_attempt()
+    process, timeout_error, run_error = run_attempt(
+        timeout_for_attempt=timeout_seconds
+    )
     retryable_signals = {
         -value
         for value in (
@@ -552,12 +939,18 @@ def _run_docling_worker(
         )
         retry_env = os.environ.copy()
         retry_env["PAPERTRANS_DOCLING_PARSER_THREADS"] = "1"
-        with tempfile.TemporaryDirectory(
-            prefix=".docling-retry-", dir=work_dir
-        ) as retry_directory:
-            process, timeout_error, run_error = run_attempt(
-                retry_env, Path(retry_directory)
-            )
+        remaining_timeout = deadline - time.monotonic()
+        if remaining_timeout <= 0:
+            timeout_error = subprocess.TimeoutExpired(command, timeout_seconds)
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix=".docling-retry-", dir=work_dir
+            ) as retry_directory:
+                process, timeout_error, run_error = run_attempt(
+                    retry_env,
+                    Path(retry_directory),
+                    timeout_for_attempt=remaining_timeout,
+                )
     if timeout_error is not None:
         log = _capped_worker_log(
             bytes(retained_stderr),
@@ -580,6 +973,11 @@ def _run_docling_worker(
             )
         finally:
             _cleanup_worker_output(output_path)
+        if isinstance(
+            run_error,
+            (DoclingResourceLimitError, DoclingUnavailableError),
+        ):
+            raise run_error
         if isinstance(run_error, Exception):
             raise DoclingWorkerError(
                 f"Docling worker could not start; see {log_path}"
@@ -591,18 +989,28 @@ def _run_docling_worker(
         )
         if process is None:
             raise DoclingWorkerError(f"Docling worker did not start; see {log_path}")
+        if process.returncode == _DOCLING_RESOURCE_LIMIT_EXIT_CODE:
+            raise DoclingResourceLimitError(
+                f"Docling worker exceeded a resource limit; see {log_path}"
+            )
         if process.returncode != 0:
             raise DoclingWorkerError(
                 f"Docling worker exited with status {process.returncode}; see {log_path}"
             )
         try:
-            value = json.loads(output_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            value = _read_docling_worker_json(output_path)
+        except DoclingResourceLimitError:
+            raise
+        except DoclingWorkerError as error:
             raise DoclingWorkerError(
                 f"Docling worker did not produce valid JSON at {output_path}; see {log_path}"
             ) from error
         document = docling_document_to_dict(value)
-        _write_json_atomic(canonical_output_path, document)
+        _write_json_atomic(
+            canonical_output_path,
+            document,
+            max_bytes=DOCLING_MAX_DOCUMENT_JSON_BYTES,
+        )
         return document
     finally:
         _cleanup_worker_output(output_path)
@@ -628,6 +1036,60 @@ def _collection_values(value: Any) -> list[tuple[str, Mapping[str, Any]]]:
         for index, item in enumerate(_as_sequence(value))
         if isinstance(item, Mapping)
     ]
+
+
+def _validate_docling_document_limits(
+    document: Mapping[str, Any],
+    *,
+    source_pages: int,
+) -> None:
+    pages = _collection_values(document.get("pages", {}))
+    if len(pages) != source_pages:
+        raise DoclingResourceLimitError(
+            "Docling page metadata does not match the bounded source PDF "
+            f"({len(pages)} != {source_pages})"
+        )
+    page_numbers: set[int] = set()
+    for key, page in pages:
+        try:
+            page_number = int(page.get("page_no", page.get("page_number", key)))
+        except (TypeError, ValueError) as error:
+            raise DoclingResourceLimitError(
+                "Docling page metadata contains a non-numeric page number"
+            ) from error
+        if not 1 <= page_number <= source_pages or page_number in page_numbers:
+            raise DoclingResourceLimitError(
+                f"Docling page metadata contains invalid page {page_number}"
+            )
+        page_numbers.add(page_number)
+
+    total_items = len(pages)
+    text_characters = 0
+    visual_items = 0
+    for collection_name in (*_CONTENT_COLLECTIONS, "groups"):
+        items = _collection_values(document.get(collection_name, []))
+        total_items += len(items)
+        if collection_name in {"pictures", "tables"}:
+            visual_items += len(items)
+        for _key, item in items:
+            text = item.get("text", item.get("orig", ""))
+            if text is not None:
+                text_characters += len(str(text))
+    if total_items > DOCLING_MAX_CONTENT_ITEMS:
+        raise DoclingResourceLimitError(
+            "Docling document item count exceeds the job limit "
+            f"({total_items} > {DOCLING_MAX_CONTENT_ITEMS})"
+        )
+    if text_characters > DOCLING_MAX_TEXT_CHARACTERS:
+        raise DoclingResourceLimitError(
+            "Docling extracted text exceeds the job limit "
+            f"({text_characters} > {DOCLING_MAX_TEXT_CHARACTERS})"
+        )
+    if visual_items > DOCLING_MAX_VISUAL_OBJECTS:
+        raise DoclingResourceLimitError(
+            "Docling visual count exceeds the job limit "
+            f"({visual_items} > {DOCLING_MAX_VISUAL_OBJECTS})"
+        )
 
 
 def _ref_value(value: Any) -> str | None:
@@ -2635,7 +3097,10 @@ def _is_material_internal_figure_caption(
 
 
 def _rendered_ink_bbox(
-    page: fitz.Page, bbox_normalized: list[float]
+    page: fitz.Page,
+    bbox_normalized: list[float],
+    *,
+    raster_budget: PdfRenderBudget | None = None,
 ) -> list[float] | None:
     """Tighten a triggered crop to visible rendered ink, honoring PDF clips."""
 
@@ -2648,6 +3113,8 @@ def _rendered_ink_bbox(
     if rect.is_empty:
         return None
     scale = 2.5
+    if raster_budget is not None:
+        raster_budget.reserve_render(rect.width * scale, rect.height * scale)
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(scale, scale), clip=rect, alpha=False
     )
@@ -2694,7 +3161,10 @@ def _rendered_ink_bbox(
 
 
 def _rendered_bbox_has_ink(
-    page: fitz.Page, bbox_normalized: list[float]
+    page: fitz.Page,
+    bbox_normalized: list[float],
+    *,
+    raster_budget: PdfRenderBudget | None = None,
 ) -> bool:
     """Return whether an exact source rectangle contains any visible ink.
 
@@ -2711,6 +3181,8 @@ def _rendered_bbox_has_ink(
     )
     if rect.is_empty:
         return False
+    if raster_budget is not None:
+        raster_budget.reserve_render(rect.width * 2.5, rect.height * 2.5)
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(2.5, 2.5), clip=rect, alpha=False
     )
@@ -2729,6 +3201,8 @@ def _suppress_blank_docling_headings(
     source: Path,
     evidence: dict[str, Any],
     structure: dict[str, Any],
+    *,
+    raster_budget: PdfRenderBudget | None = None,
 ) -> None:
     """Hide repeated figure metadata that Docling exposed as section headings.
 
@@ -2797,7 +3271,9 @@ def _suppress_blank_docling_headings(
                 bbox = [float(value) for value in block.get("bboxNormalized", [])]
                 if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
                     continue
-                if _rendered_bbox_has_ink(pdf_page, bbox):
+                if _rendered_bbox_has_ink(
+                    pdf_page, bbox, raster_budget=raster_budget
+                ):
                     continue
                 text = re.sub(r"\s+", " ", str(block.get("text", ""))).strip()
                 anchored_visuals = [
@@ -4296,6 +4772,8 @@ def _recover_overlarge_docling_pictures(
     source: Path,
     evidence: dict[str, Any],
     structure: dict[str, Any],
+    *,
+    raster_budget: PdfRenderBudget | None = None,
 ) -> None:
     """Recover pictures whose raw Docling bbox crosses internal captions.
 
@@ -4487,7 +4965,11 @@ def _recover_overlarge_docling_pictures(
                     ):
                         recovered_bboxes = []
                         break
-                    tightened = _rendered_ink_bbox(pdf_page, candidate_bbox)
+                    tightened = _rendered_ink_bbox(
+                        pdf_page,
+                        candidate_bbox,
+                        raster_budget=raster_budget,
+                    )
                     if tightened is None:
                         recovered_bboxes = []
                         break
@@ -4608,7 +5090,9 @@ def _recover_overlarge_docling_pictures(
                         min(1.0, max(box[3] for box in boxes) + 0.003),
                     ]
                     tightened_equation = _rendered_ink_bbox(
-                        pdf_page, equation_bbox
+                        pdf_page,
+                        equation_bbox,
+                        raster_budget=raster_budget,
                     )
                     if tightened_equation is None:
                         continue
@@ -4960,6 +5444,8 @@ def _merge_split_panel_figures(
     source: Path,
     evidence: dict[str, Any],
     structure: dict[str, Any],
+    *,
+    raster_budget: PdfRenderBudget | None = None,
 ) -> None:
     """Merge a nearby unlabeled panel when one shared caption says left/right."""
 
@@ -5162,7 +5648,11 @@ def _merge_split_panel_figures(
                         max(combined_bbox[2], bbox[2]),
                         max(combined_bbox[3], bbox[3]),
                     ]
-                tightened = _rendered_ink_bbox(pdf[page_number - 1], combined_bbox)
+                tightened = _rendered_ink_bbox(
+                    pdf[page_number - 1],
+                    combined_bbox,
+                    raster_budget=raster_budget,
+                )
                 if tightened is None:
                     unresolved.update(
                         {str(captioned["objectId"]), str(unlabeled["objectId"])}
@@ -6631,7 +7121,7 @@ def docling_document_to_ir(
     return evidence, structure
 
 
-def extract_docling_semantics(
+def _extract_docling_semantics_bounded(
     source: Path,
     work_dir: Path,
     evidence_path: Path,
@@ -6640,30 +7130,48 @@ def extract_docling_semantics(
     *,
     worker_timeout_seconds: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-    """Convert a PDF and persist the three inputs used by semantic_document."""
+    """Convert one pre-bounded PDF and persist semantic_document inputs."""
 
     source = Path(source).resolve()
     work_dir = Path(work_dir)
     evidence_path = Path(evidence_path)
     structure_path = Path(structure_path)
     visuals_path = Path(visuals_path)
+    source_pages = _validate_docling_source_pdf(source)
+    raster_budget = _new_docling_raster_budget()
     raw_document = _run_docling_worker(
         source,
         work_dir,
         timeout_seconds=worker_timeout_seconds,
     )
+    _validate_docling_document_limits(raw_document, source_pages=source_pages)
     evidence, structure = docling_document_to_ir(raw_document, source_file=source.name)
     _recover_page_one_front_matter_from_pdf(source, evidence, structure)
     _restore_lexical_linebreak_hyphens_from_pdf(source, evidence, structure)
-    _suppress_blank_docling_headings(source, evidence, structure)
+    _suppress_blank_docling_headings(
+        source,
+        evidence,
+        structure,
+        raster_budget=raster_budget,
+    )
     _absorb_aligned_figure_panel_headings(source, evidence, structure)
     _demote_mislabeled_docling_headings(evidence, structure)
     _repair_lowercase_body_continuations_from_pdf(source, evidence, structure)
     _absorb_adjacent_equation_signs(evidence, structure)
     _suppress_overlapping_equation_fragments(evidence, structure)
     _reanchor_equations_by_geometry(evidence, structure)
-    _recover_overlarge_docling_pictures(source, evidence, structure)
-    _merge_split_panel_figures(source, evidence, structure)
+    _recover_overlarge_docling_pictures(
+        source,
+        evidence,
+        structure,
+        raster_budget=raster_budget,
+    )
+    _merge_split_panel_figures(
+        source,
+        evidence,
+        structure,
+        raster_budget=raster_budget,
+    )
     _split_parallel_labeled_visuals(source, evidence, structure)
     # Visibility recovery can restore prose that Docling originally buried
     # inside a picture node, so canonicalize links only after that pass.
@@ -6707,11 +7215,43 @@ def extract_docling_semantics(
             "Source-PDF caption refinement was required for an interleaved caption but did not produce an unambiguous override."
         )
     validate_structure_batch(evidence["pages"], structure)
-    visuals = render_visual_objects(source, structure, work_dir / "assets")
+    visuals = render_visual_objects(
+        source,
+        structure,
+        work_dir / "assets",
+        budget=raster_budget,
+    )
     for path, value in (
         (evidence_path, evidence),
         (structure_path, structure),
         (visuals_path, visuals),
     ):
-        _write_json_atomic(path, value)
+        _write_json_atomic(
+            path,
+            value,
+            max_bytes=DOCLING_MAX_DOCUMENT_JSON_BYTES,
+        )
     return evidence, structure, visuals
+
+
+def extract_docling_semantics(
+    source: Path,
+    work_dir: Path,
+    evidence_path: Path,
+    structure_path: Path,
+    visuals_path: Path,
+    *,
+    worker_timeout_seconds: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Convert a PDF inside the supported per-job resource envelope."""
+
+    timeout_seconds = _resolve_docling_worker_timeout(worker_timeout_seconds)
+    with _temporary_docling_resource_limits(timeout_seconds):
+        return _extract_docling_semantics_bounded(
+            source,
+            work_dir,
+            evidence_path,
+            structure_path,
+            visuals_path,
+            worker_timeout_seconds=timeout_seconds,
+        )
