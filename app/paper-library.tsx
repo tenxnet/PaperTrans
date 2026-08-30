@@ -388,7 +388,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       const frameDocument = iframe.contentDocument;
       if (!frameWindow || !frameDocument) return;
 
-      const headings = Array.from(frameDocument.querySelectorAll<HTMLElement>("article h2, article h3"));
+      const headings = Array.from(frameDocument.querySelectorAll<HTMLElement>(
+        "article h2, article h3, .paper-section > .section-heading",
+      ));
       const entries = headings.flatMap<TocEntry>((heading, index) => {
         const labelNode = heading.querySelector<HTMLElement>(".ptx-heading-ja");
         const label = (labelNode?.textContent ?? heading.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -589,6 +591,11 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                       <FileText aria-hidden="true" />{text.openTranslatedPdf}
                     </a>
                   )}
+                  {selected.markdownUrl && (
+                    <a className="secondary-button" href={selected.markdownUrl} download>
+                      <FileText aria-hidden="true" />{text.downloadMarkdown}
+                    </a>
+                  )}
                 </div>
               </div>
               {selected.artifactUrl ? (
@@ -651,6 +658,8 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
                 {selected.translatedPdfUrl && <a href={selected.translatedPdfUrl} target="_blank" rel="noreferrer">{text.openTranslatedPdf}<FileText /></a>}
+                {selected.markdownUrl && <a href={selected.markdownUrl} download>{text.downloadMarkdown}<FileText /></a>}
+                {selected.downloadUrl && <a href={selected.downloadUrl} download>{text.downloadOfflineBundle}<FileText /></a>}
                 {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{selected.sourceType === "arxiv" ? text.openArxivSource : text.openSource}<ArrowSquareOut /></a>}
               </section>
             </aside>

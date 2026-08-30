@@ -30,6 +30,7 @@ export type PaperSummary = {
   finalizedAt: string | null;
   artifactUrl: string | null;
   downloadUrl: string | null;
+  markdownUrl: string | null;
   translatedPdfUrl: string | null;
   qa: {
     status: "passed" | "failed" | "missing";
@@ -120,10 +121,11 @@ const DATA_ROOT = path.join(REPO_ROOT, "data");
 const LIBRARY_METADATA = path.join(DATA_ROOT, "library.json");
 const MANIFEST_FILENAMES = ["papertrans-job.json", "mcp-job.json", "chatgpt-job.json"] as const;
 
-type ArtifactKind = "html" | "qa" | "bundle" | "translatedPdf";
+type ArtifactKind = "html" | "markdown" | "qa" | "bundle" | "translatedPdf";
 
 const ARTIFACT_EXTENSIONS: Record<ArtifactKind, string> = {
   html: ".html",
+  markdown: ".md",
   qa: ".json",
   bundle: ".zip",
   translatedPdf: ".pdf",
@@ -151,6 +153,7 @@ async function readManifest(root: string): Promise<ValidManifest | null> {
 
 function defaultArtifact(slug: string, kind: ArtifactKind): string | null {
   if (kind === "html") return "html/index.html";
+  if (kind === "markdown") return "html/index.md";
   if (kind === "qa") return "html/qa.json";
   if (kind === "bundle") return `${slug}-html.zip`;
   return null;
@@ -196,7 +199,7 @@ export async function resolvePaperArtifact(
 
 async function artifactPaths(root: string, slug: string, manifest: Manifest) {
   const entries = await Promise.all(
-    (["html", "qa", "bundle", "translatedPdf"] as const).map(async (kind) => [
+    (["html", "markdown", "qa", "bundle", "translatedPdf"] as const).map(async (kind) => [
       kind,
       await resolvePaperArtifact(
         root,
@@ -220,7 +223,7 @@ function artifactRoute(slug: string, root: string, htmlArtifact: string | null):
 
 export async function findPaperArtifact(
   slug: string,
-  kind: "bundle" | "translatedPdf",
+  kind: "bundle" | "markdown" | "translatedPdf",
 ): Promise<string | null> {
   if (!JOB_ID.test(slug)) return null;
   const root = path.join(OUTPUT_ROOT, slug);
@@ -462,6 +465,9 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
           finalizedAt: manifest.finalizedAt ?? null,
           artifactUrl: htmlRoute,
           downloadUrl: hasDownload ? `/api/papers/${entry.name}/download` : null,
+          markdownUrl: artifactStatus && artifacts.markdown
+            ? `/api/papers/${entry.name}/markdown`
+            : null,
           translatedPdfUrl: artifactStatus && artifacts.translatedPdf
             ? `/api/papers/${entry.name}/translated-pdf`
             : null,

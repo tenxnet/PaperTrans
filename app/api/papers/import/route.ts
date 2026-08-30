@@ -67,6 +67,7 @@ export async function POST(request: Request) {
       "hybrid",
       "--layout-parser",
       "docling",
+      "--skip-translation",
     ],
     { cwd: process.cwd(), detached: true, stdio: ["ignore", log.fd, log.fd] },
   );
