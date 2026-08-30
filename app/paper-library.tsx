@@ -579,6 +579,16 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   >
                     <BookOpenText aria-hidden="true" />{selected.isRead ? text.markUnread : text.markRead}
                   </button>
+                  {selected.translatedPdfUrl && (
+                    <a
+                      className="secondary-button"
+                      href={selected.translatedPdfUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <FileText aria-hidden="true" />{text.openTranslatedPdf}
+                    </a>
+                  )}
                 </div>
               </div>
               {selected.artifactUrl ? (
@@ -640,6 +650,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div><dt>{text.addedAt}</dt><dd>{formatPaperDate(selected.createdAt, locale)}</dd></div>
                   <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
+                {selected.translatedPdfUrl && <a href={selected.translatedPdfUrl} target="_blank" rel="noreferrer">{text.openTranslatedPdf}<FileText /></a>}
                 {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{selected.sourceType === "arxiv" ? text.openArxivSource : text.openSource}<ArrowSquareOut /></a>}
               </section>
             </aside>

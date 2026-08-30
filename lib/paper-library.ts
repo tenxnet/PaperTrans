@@ -30,6 +30,7 @@ export type PaperSummary = {
   finalizedAt: string | null;
   artifactUrl: string | null;
   downloadUrl: string | null;
+  translatedPdfUrl: string | null;
   qa: {
     status: "passed" | "failed" | "missing";
     figures: number;
@@ -461,6 +462,9 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
           finalizedAt: manifest.finalizedAt ?? null,
           artifactUrl: htmlRoute,
           downloadUrl: hasDownload ? `/api/papers/${entry.name}/download` : null,
+          translatedPdfUrl: artifactStatus && artifacts.translatedPdf
+            ? `/api/papers/${entry.name}/translated-pdf`
+            : null,
           qa: {
             status: qa?.status === "passed" ? "passed" : qa ? "failed" : "missing",
             figures: qa?.output?.figures ?? 0,
