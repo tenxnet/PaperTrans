@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 from pathlib import Path
 
 from .arxiv_html import run_arxiv_html_pipeline
@@ -14,6 +15,12 @@ from .io import load_document
 from .metrics import record_stage, utc_now
 from .pdf_artifacts import write_pdf_job_manifest, write_semantic_pdf_qa
 from .pdf_benchmark import run_pdf_parser_benchmark
+from .pdf_translation_supervisor import (
+    make_candidate_request,
+    profile_from_files,
+    run_container_candidate,
+)
+from .pdf_translation_worker import promote_candidate_pdf
 from .render import create_bundle, render_document
 from .semantic import (
     build_semantic_document,
@@ -177,6 +184,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     pdf_benchmark.add_argument("--limit", type=int, default=10)
 
+    pdf_translate_candidate = subparsers.add_parser(
+        "pdf-translate-candidate",
+        help="Run a layout-preserving translated-PDF candidate in an isolated container",
+    )
+    pdf_translate_candidate.add_argument("source", type=Path)
+    pdf_translate_candidate.add_argument("--slug", required=True)
+    pdf_translate_candidate.add_argument("--run-id")
+    pdf_translate_candidate.add_argument("--backend", choices=("harumi",), default="harumi")
+    pdf_translate_candidate.add_argument("--image", required=True)
+    pdf_translate_candidate.add_argument("--font", type=Path, required=True)
+    pdf_translate_candidate.add_argument("--output-root", type=Path, default=Path("output"))
+    pdf_translate_candidate.add_argument("--repo-root", type=Path, default=Path.cwd())
+    pdf_translate_candidate.add_argument("--source-language", default="en")
+    pdf_translate_candidate.add_argument("--target-language", choices=("ja",), default="ja")
+    pdf_translate_candidate.add_argument("--deadline-seconds", type=int, default=1500)
+
+    pdf_promote_candidate = subparsers.add_parser(
+        "pdf-promote-candidate",
+        help="Explicitly promote a validated translated-PDF candidate",
+    )
+    pdf_promote_candidate.add_argument("--slug", required=True)
+    pdf_promote_candidate.add_argument("--run-id", required=True)
+    pdf_promote_candidate.add_argument("--approved-by", required=True)
+    pdf_promote_candidate.add_argument("--output-root", type=Path, default=Path("output"))
+
     arxiv_html_pipeline = subparsers.add_parser(
         "arxiv-html-pipeline",
         help="Acquire official arXiv HTML, translate semantic sections, and preserve MathML/links",
@@ -206,6 +238,64 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
+    if args.command == "pdf-translate-candidate":
+        repo_root = args.repo_root.resolve()
+        run_id = args.run_id or f"pdf-harumi-{uuid.uuid4().hex[:16]}"
+        request = make_candidate_request(
+            args.source,
+            run_id=run_id,
+            source_language=args.source_language,
+            target_language=args.target_language,
+            deadline_seconds=args.deadline_seconds,
+        )
+        worker_root = repo_root / "workers" / "harumi"
+        profile = profile_from_files(
+            backend_id="papertrans-harumi",
+            image=args.image,
+            source_file=worker_root / "src" / "main.rs",
+            sbom_file=worker_root / "sbom.cargo-metadata.json",
+            lock_file=worker_root / "Cargo.lock",
+            font_file=args.font.resolve(),
+        )
+        run_root = run_container_candidate(
+            output_root=args.output_root.resolve(),
+            slug=args.slug,
+            source_pdf=args.source.resolve(),
+            request=request,
+            profile=profile,
+        )
+        print(
+            json.dumps(
+                {
+                    "runId": run_id,
+                    "runRoot": str(run_root),
+                    "state": "succeeded",
+                    "promoted": False,
+                    "purpose": "layout_evaluation_only",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+    if args.command == "pdf-promote-candidate":
+        manifest = promote_candidate_pdf(
+            output_root=args.output_root.resolve(),
+            slug=args.slug,
+            run_id=args.run_id,
+            approved_by=args.approved_by,
+        )
+        print(
+            json.dumps(
+                {
+                    "runId": args.run_id,
+                    "slug": args.slug,
+                    "translatedPdf": manifest["artifacts"]["translatedPdf"],
+                    "status": manifest["status"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
     if args.command == "pdf-benchmark":
         report = run_pdf_parser_benchmark(
             args.corpus_dir,
