@@ -1,7 +1,8 @@
-import { readFile, stat } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { isPaperArtifactPublished } from "@/lib/paper-library";
+import { getPaperTransRuntimeConfig } from "@/lib/runtime-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,13 +37,24 @@ export async function GET(
   if (!(await isPaperArtifactPublished(slug))) {
     return NextResponse.json({ error: "artifact not found" }, { status: 404 });
   }
-  const publicationRoot = path.resolve(process.cwd(), "output", slug, "html");
+  const publicationRoot = path.join(getPaperTransRuntimeConfig().outputRoot, slug, "html");
   const requested = path.resolve(publicationRoot, ...(asset?.length ? asset : ["index.html"]));
   if (requested !== publicationRoot && !requested.startsWith(`${publicationRoot}${path.sep}`)) {
     return NextResponse.json({ error: "invalid path" }, { status: 400 });
   }
   try {
-    if (!(await stat(requested)).isFile()) throw new Error("not a file");
+    const [rootInfo, requestedInfo, canonicalRoot, canonicalRequested] = await Promise.all([
+      lstat(publicationRoot),
+      lstat(requested),
+      realpath(publicationRoot),
+      realpath(requested),
+    ]);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("invalid root");
+    if (!requestedInfo.isFile() || requestedInfo.isSymbolicLink()) throw new Error("not a file");
+    if (
+      canonicalRequested === canonicalRoot
+      || !canonicalRequested.startsWith(`${canonicalRoot}${path.sep}`)
+    ) throw new Error("artifact escaped publication root");
     const body = await readFile(requested);
     const isHtml = path.extname(requested).toLowerCase() === ".html";
     const isEmbeddedHtml = isHtml && new URL(request.url).searchParams.get("embed") === "1";

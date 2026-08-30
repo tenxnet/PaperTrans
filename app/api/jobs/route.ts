@@ -1,7 +1,11 @@
 import { execFile } from "node:child_process";
-import path from "node:path";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
+import {
+  getPaperTransRuntimeConfig,
+  inspectPaperTransRuntime,
+  paperTransChildEnvironment,
+} from "@/lib/runtime-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,11 +21,6 @@ function normalizeArxivId(value: unknown) {
       .match(/(?:arxiv:\s*)?((?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*\/\d{7})(?:v\d+)?)/i)?.[1]
       ?.toLowerCase() ?? null
   );
-}
-
-function resolvedRoot(configured: string | undefined, fallback: string) {
-  if (!configured?.trim()) return fallback;
-  return path.resolve(process.cwd(), configured.trim());
 }
 
 export async function POST(request: Request) {
@@ -45,27 +44,34 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "この論文のジョブを準備中です", jobId }, { status: 409 });
   }
 
-  const repoRoot = resolvedRoot(process.env.PAPERTRANS_REPO_ROOT, process.cwd());
-  const outputRoot = resolvedRoot(
-    process.env.PAPERTRANS_OUTPUT_ROOT,
-    path.join(repoRoot, "output"),
-  );
-  const papertrans = path.join(repoRoot, ".venv", "bin", "papertrans");
+  const config = getPaperTransRuntimeConfig();
+  const readiness = await inspectPaperTransRuntime(config);
+  if (!config.configurationReady || !readiness.cliReady) {
+    return NextResponse.json(
+      { error: "PaperTransの実行環境が準備できていません" },
+      { status: 503 },
+    );
+  }
   activeJobs.add(jobId);
   try {
     const { stdout } = await execFileAsync(
-      papertrans,
+      config.cliPath,
       [
         "prepare-mcp-job",
         arxivId,
         "--job-id",
         jobId,
         "--repo-root",
-        repoRoot,
+        config.repoRoot,
         "--output-root",
-        outputRoot,
+        config.outputRoot,
       ],
-      { cwd: repoRoot, timeout: 180_000, maxBuffer: 1024 * 1024 },
+      {
+        cwd: config.repoRoot,
+        env: paperTransChildEnvironment(config),
+        timeout: 180_000,
+        maxBuffer: 1024 * 1024,
+      },
     );
     return NextResponse.json(JSON.parse(stdout.trim()), { status: 201 });
   } catch (error) {

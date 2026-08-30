@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { getPaperTransRuntimeConfig } from "@/lib/runtime-config";
 
 export type PaperStatus =
   | "preparing"
@@ -123,11 +124,16 @@ export type PaperLibraryPatch = {
 };
 
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
-const REPO_ROOT = process.cwd();
-const OUTPUT_ROOT = path.join(REPO_ROOT, "output");
-const DATA_ROOT = path.join(REPO_ROOT, "data");
-const LIBRARY_METADATA = path.join(DATA_ROOT, "library.json");
 const MANIFEST_FILENAMES = ["papertrans-job.json", "mcp-job.json", "chatgpt-job.json"] as const;
+
+function libraryRoots() {
+  const config = getPaperTransRuntimeConfig();
+  return {
+    dataRoot: config.dataRoot,
+    outputRoot: config.outputRoot,
+    metadataPath: path.join(config.dataRoot, "library.json"),
+  };
+}
 
 type ArtifactKind = "html" | "markdown" | "qa" | "bundle" | "translatedPdf";
 
@@ -234,7 +240,7 @@ export async function findPaperArtifact(
   kind: "bundle" | "markdown" | "translatedPdf",
 ): Promise<string | null> {
   if (!JOB_ID.test(slug)) return null;
-  const root = path.join(OUTPUT_ROOT, slug);
+  const root = path.join(libraryRoots().outputRoot, slug);
   const manifest = await readManifest(root);
   if (!manifest || !manifestArtifactsPublished(manifest)) return null;
   return resolvePaperArtifact(
@@ -245,8 +251,8 @@ export async function findPaperArtifact(
   );
 }
 
-async function loadMetadata(): Promise<LibraryMetadata> {
-  const value = await readJson<LibraryMetadata>(LIBRARY_METADATA);
+async function loadMetadata(metadataPath: string): Promise<LibraryMetadata> {
+  const value = await readJson<LibraryMetadata>(metadataPath);
   if (!value || value.version !== 1 || typeof value.papers !== "object") {
     return { version: 1, papers: {} };
   }
@@ -286,7 +292,8 @@ export async function savePaperLibraryState(
   patch: PaperLibraryPatch,
 ): Promise<PaperLibraryState> {
   if (!JOB_ID.test(slug)) throw new Error("invalid paper slug");
-  const metadata = await loadMetadata();
+  const { dataRoot, metadataPath } = libraryRoots();
+  const metadata = await loadMetadata(metadataPath);
   const current = currentPaperState(metadata, slug);
   if (patch.tags !== undefined) current.tags = normalizeTags(patch.tags);
   if (patch.isRead !== undefined) {
@@ -298,10 +305,10 @@ export async function savePaperLibraryState(
     current.favorite = patch.favorite;
   }
   metadata.papers[slug] = current;
-  const temporary = path.join(DATA_ROOT, `.library-${process.pid}-${Date.now()}.tmp`);
-  await mkdir(DATA_ROOT, { recursive: true });
+  const temporary = path.join(dataRoot, `.library-${process.pid}-${Date.now()}.tmp`);
+  await mkdir(dataRoot, { recursive: true });
   await writeFile(temporary, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await rename(temporary, LIBRARY_METADATA);
+  await rename(temporary, metadataPath);
   return current;
 }
 
@@ -348,7 +355,7 @@ function manifestArtifactsPublished(manifest: ValidManifest): boolean {
 
 export async function isPaperArtifactPublished(slug: string): Promise<boolean> {
   if (!JOB_ID.test(slug)) return false;
-  const manifest = await readManifest(path.join(OUTPUT_ROOT, slug));
+  const manifest = await readManifest(path.join(libraryRoots().outputRoot, slug));
   return manifest !== null && manifestArtifactsPublished(manifest);
 }
 
@@ -486,10 +493,11 @@ async function readPdfMcpProgress(
 }
 
 export async function scanPaperLibrary(): Promise<PaperSummary[]> {
-  const metadata = await loadMetadata();
+  const { metadataPath, outputRoot } = libraryRoots();
+  const metadata = await loadMetadata(metadataPath);
   let entries;
   try {
-    entries = await readdir(OUTPUT_ROOT, { withFileTypes: true });
+    entries = await readdir(outputRoot, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -498,7 +506,7 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
     entries
       .filter((entry) => entry.isDirectory() && JOB_ID.test(entry.name))
       .map(async (entry): Promise<PaperSummary | null> => {
-        const root = path.join(OUTPUT_ROOT, entry.name);
+        const root = path.join(outputRoot, entry.name);
         const manifest = await readManifest(root);
         if (!manifest) return null;
         const artifacts = await artifactPaths(root, entry.name, manifest);

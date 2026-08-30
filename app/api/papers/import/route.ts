@@ -4,6 +4,11 @@ import { constants } from "node:fs";
 import { access, mkdir, open, readdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
+import {
+  getPaperTransRuntimeConfig,
+  inspectPaperTransRuntime,
+  paperTransChildEnvironment,
+} from "@/lib/runtime-config";
 
 export const runtime = "nodejs";
 
@@ -79,6 +84,18 @@ async function rollbackReservedImport(paperDir: string, outputDir: string) {
 }
 
 export async function POST(request: Request) {
+  const config = getPaperTransRuntimeConfig();
+  const runtimeReadiness = await inspectPaperTransRuntime(config);
+  if (!runtimeReadiness.pdfImportReady) {
+    return NextResponse.json(
+      {
+        code: "worker_unavailable",
+        error: "PDF解析環境の準備が完了していません。PaperTransを再起動してください",
+      },
+      { status: 503 },
+    );
+  }
+
   const declaredLength = Number(request.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > MAX_MULTIPART_BYTES) {
     return NextResponse.json({ code: "pdf_too_large", error: "PDFは50MB以下にしてください" }, { status: 413 });
@@ -101,7 +118,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ code: "invalid_pdf", error: "PDFヘッダーを確認できません" }, { status: 400 });
   }
 
-  const dataRoot = path.join(process.cwd(), "data", "papers");
+  const dataRoot = path.join(config.dataRoot, "papers");
   const digest = createHash("sha256").update(bytes).digest("hex");
   const duplicate = await existingDigest(dataRoot, digest);
   if (duplicate) {
@@ -119,7 +136,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const executable = path.join(process.cwd(), ".venv", "bin", "papertrans");
+  const executable = config.cliPath;
   try {
     await access(executable, constants.X_OK);
   } catch {
@@ -129,7 +146,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const outputRoot = path.join(process.cwd(), "output");
+  const outputRoot = config.outputRoot;
   let reservation: Awaited<ReturnType<typeof reserveImportDirectories>>;
   try {
     reservation = await reserveImportDirectories(dataRoot, outputRoot, slugify(paper.name), digest);
@@ -152,14 +169,21 @@ export async function POST(request: Request) {
         "--slug",
         slug,
         "--repo-root",
-        process.cwd(),
+        config.repoRoot,
+        "--output-root",
+        config.outputRoot,
         "--structure-mode",
         "hybrid",
         "--layout-parser",
         "docling",
         "--prepare-for-mcp",
       ],
-      { cwd: process.cwd(), detached: true, stdio: ["ignore", log.fd, log.fd] },
+      {
+        cwd: config.repoRoot,
+        detached: true,
+        env: paperTransChildEnvironment(config),
+        stdio: ["ignore", log.fd, log.fd],
+      },
     );
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
