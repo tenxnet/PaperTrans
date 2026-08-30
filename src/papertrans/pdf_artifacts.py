@@ -123,6 +123,7 @@ def write_pdf_job_manifest(
     document: dict[str, Any] | None = None,
     started_at: str | None = None,
     skip_translation: bool = False,
+    provider: str | None = None,
     error: str | None = None,
     source_sha256: str | None = None,
 ) -> dict[str, Any]:
@@ -137,7 +138,7 @@ def write_pdf_job_manifest(
         "jobId": slug,
         "sourceType": "pdf",
         "status": status,
-        "provider": "none" if skip_translation else "codex-cli",
+        "provider": provider or ("none" if skip_translation else "codex-cli"),
         "paper": {
             "requestedArxivId": "",
             "resolvedArxivId": "",
