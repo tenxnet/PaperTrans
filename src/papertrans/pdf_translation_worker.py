@@ -1246,6 +1246,16 @@ def _validate_page_map(
         ]
         if output.page_count != source.page_count or normalized != expected:
             _fail("invalid_page_map", "monolingual PDF must preserve one-to-one page identity")
+    elif role == "translated_dual_pdf":
+        expected = [
+            {"sourcePage": page, "outputPages": [page * 2 - 1, page * 2]}
+            for page in range(1, source.page_count + 1)
+        ]
+        if output.page_count != source.page_count * 2 or normalized != expected:
+            _fail(
+                "invalid_page_map",
+                "dual PDF must preserve adjacent original/translated page pairs",
+            )
     return normalized
 
 

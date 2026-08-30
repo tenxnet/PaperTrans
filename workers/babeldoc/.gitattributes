@@ -1,0 +1,2 @@
+# Preserve the exact reviewed upstream patch bytes, including context whitespace.
+patches/*.patch -whitespace

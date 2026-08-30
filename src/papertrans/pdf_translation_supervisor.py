@@ -940,6 +940,91 @@ def _reject_retained_provider_secrets(
             )
 
 
+def _numeric_non_root_user(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"[1-9][0-9]*(?::[1-9][0-9]*)?", value
+    ) is not None
+
+
+def _gateway_runtime_config_is_reviewed(
+    gateway: Mapping[str, Any],
+    *,
+    image_config: Mapping[str, Any],
+    profile: ContainerWorkerProfile,
+) -> bool:
+    """Reject runtime overrides that can retain or redirect paper credentials."""
+
+    runtime_config = gateway.get("Config")
+    host_config = gateway.get("HostConfig")
+    network_settings = gateway.get("NetworkSettings")
+    if (
+        not isinstance(runtime_config, dict)
+        or not isinstance(host_config, dict)
+        or not isinstance(network_settings, dict)
+    ):
+        return False
+    if not _numeric_non_root_user(image_config.get("User")):
+        return False
+    reviewed_fields = (
+        "User",
+        "Entrypoint",
+        "Cmd",
+        "Env",
+        "WorkingDir",
+        "ExposedPorts",
+        "Volumes",
+    )
+    if any(
+        runtime_config.get(field) != image_config.get(field)
+        for field in reviewed_fields
+    ):
+        return False
+    runtime_ports = network_settings.get("Ports")
+    exposed_ports = image_config.get("ExposedPorts")
+    expected_port_names = set(exposed_ports) if isinstance(exposed_ports, dict) else set()
+    ports_are_unpublished = bool(
+        isinstance(runtime_ports, dict)
+        and (
+            not runtime_ports
+            or (
+                set(runtime_ports) == expected_port_names
+                and all(binding is None for binding in runtime_ports.values())
+            )
+        )
+    )
+    if (
+        gateway.get("Mounts") not in (None, [])
+        or bool(host_config.get("Binds"))
+        or bool(host_config.get("VolumesFrom"))
+        or bool(host_config.get("Devices"))
+        or bool(host_config.get("DeviceRequests"))
+        or bool(host_config.get("DeviceCgroupRules"))
+        or bool(host_config.get("ExtraHosts"))
+        or bool(host_config.get("Links"))
+        or bool(host_config.get("PortBindings"))
+        or host_config.get("PublishAllPorts") is not False
+        or host_config.get("PidMode") not in (None, "")
+        or host_config.get("IpcMode") not in (None, "", "private")
+        or host_config.get("UTSMode") not in (None, "")
+        or host_config.get("UsernsMode") not in (None, "")
+        or host_config.get("CgroupnsMode") not in (None, "", "private")
+        or host_config.get("NetworkMode")
+        not in (None, "", profile.network, profile.gateway_egress_network)
+        or bool(host_config.get("Dns"))
+        or bool(host_config.get("DnsOptions"))
+        or bool(host_config.get("DnsSearch"))
+        or not ports_are_unpublished
+    ):
+        return False
+    state = gateway.get("State")
+    return bool(
+        isinstance(state, dict)
+        and state.get("Running") is True
+        and state.get("Paused") in (None, False)
+        and state.get("Restarting") in (None, False)
+    )
+
+
 def _require_gateway_network(
     docker: str,
     profile: ContainerWorkerProfile,
@@ -1030,7 +1115,6 @@ def _require_gateway_network(
     gateway = inspected_containers[0]
     host_config = gateway.get("HostConfig")
     gateway_networks = gateway.get("NetworkSettings", {}).get("Networks")
-    state = gateway.get("State")
     security_options = set(host_config.get("SecurityOpt") or []) if isinstance(
         host_config, dict
     ) else set()
@@ -1039,11 +1123,38 @@ def _require_gateway_network(
         "no-new-privileges:true",
         "no-new-privileges=true",
     }
+    image_result = _bounded_process(
+        [docker, "image", "inspect", profile.gateway_image_digest or ""],
+        timeout=20,
+        stdout_limit=256 * 1024,
+        stderr_limit=64 * 1024,
+        label="translation gateway image inspection",
+    )
+    if image_result.returncode != 0:
+        raise PdfTranslationSupervisorError(
+            "gateway_network_unavailable",
+            "reviewed translation gateway image is unavailable",
+        )
+    try:
+        inspected_images = json.loads(image_result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PdfTranslationSupervisorError(
+            "gateway_network_unavailable",
+            "translation gateway image metadata is invalid",
+        ) from error
+    if (
+        not isinstance(inspected_images, list)
+        or len(inspected_images) != 1
+        or not isinstance(inspected_images[0], dict)
+        or inspected_images[0].get("Id") != profile.gateway_image_digest
+        or not isinstance(inspected_images[0].get("Config"), dict)
+    ):
+        raise PdfTranslationSupervisorError(
+            "unsafe_network", "translation gateway image identity is ambiguous"
+        )
     if (
         str(gateway.get("Name", "")).lstrip("/") != profile.gateway_container
         or gateway.get("Image") != profile.gateway_image_digest
-        or not isinstance(state, dict)
-        or state.get("Running") is not True
         or not isinstance(host_config, dict)
         or host_config.get("ReadonlyRootfs") is not True
         or host_config.get("Privileged") is not False
@@ -1054,6 +1165,11 @@ def _require_gateway_network(
         or not isinstance(gateway_networks, dict)
         or set(gateway_networks)
         != {profile.network, profile.gateway_egress_network}
+        or not _gateway_runtime_config_is_reviewed(
+            gateway,
+            image_config=inspected_images[0]["Config"],
+            profile=profile,
+        )
     ):
         raise PdfTranslationSupervisorError(
             "unsafe_network", "translation gateway runtime differs from reviewed isolation"

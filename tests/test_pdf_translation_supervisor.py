@@ -114,7 +114,7 @@ def _provider_translation() -> dict:
     }
 
 
-def _gateway_inspection(profile: ContainerWorkerProfile) -> tuple[list, list]:
+def _gateway_inspection(profile: ContainerWorkerProfile) -> tuple[list, list, list]:
     network = [
         {
             "Name": profile.network,
@@ -126,19 +126,34 @@ def _gateway_inspection(profile: ContainerWorkerProfile) -> tuple[list, list]:
             },
         }
     ]
+    image_config = {
+        "User": "65532:65532",
+        "Entrypoint": ["/usr/local/bin/python", "/opt/papertrans/gateway.py"],
+        "Cmd": None,
+        "Env": ["PATH=/usr/local/bin", "PYTHONUNBUFFERED=1"],
+        "WorkingDir": "/tmp",
+        "ExposedPorts": {"8080/tcp": {}},
+        "Volumes": None,
+    }
     container = [
         {
             "Name": f"/{profile.gateway_container}",
             "Image": profile.gateway_image_digest,
-            "State": {"Running": True},
+            "State": {"Running": True, "Paused": False, "Restarting": False},
             "HostConfig": {
                 "ReadonlyRootfs": True,
                 "Privileged": False,
                 "CapDrop": ["ALL"],
                 "CapAdd": [],
                 "SecurityOpt": ["no-new-privileges"],
+                "NetworkMode": profile.gateway_egress_network,
+                "PortBindings": {},
+                "PublishAllPorts": False,
             },
+            "Mounts": [],
+            "Config": json.loads(json.dumps(image_config)),
             "NetworkSettings": {
+                "Ports": {},
                 "Networks": {
                     profile.network: {},
                     profile.gateway_egress_network: {},
@@ -146,19 +161,23 @@ def _gateway_inspection(profile: ContainerWorkerProfile) -> tuple[list, list]:
             },
         }
     ]
-    return network, container
+    image = [{"Id": profile.gateway_image_digest, "Config": image_config}]
+    return network, container, image
 
 
 def _mock_gateway_inspection(
     monkeypatch: pytest.MonkeyPatch,
     network: list,
     container: list,
+    image: list,
 ) -> None:
     def fake_bounded_process(argv, **_kwargs):
         if argv[1:3] == ["network", "inspect"]:
             payload = network
         elif argv[1:3] == ["container", "inspect"]:
             payload = container
+        elif argv[1:3] == ["image", "inspect"]:
+            payload = image
         else:  # pragma: no cover - an unexpected subprocess is a test failure
             raise AssertionError(f"unexpected command: {argv}")
         return supervisor._CapturedProcess(
@@ -617,8 +636,8 @@ def test_reviewed_gateway_runtime_is_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     profile = _babel_profile(tmp_path)
-    network, container = _gateway_inspection(profile)
-    _mock_gateway_inspection(monkeypatch, network, container)
+    network, container, image = _gateway_inspection(profile)
+    _mock_gateway_inspection(monkeypatch, network, container, image)
 
     supervisor._require_gateway_network(
         "docker", profile, _provider_translation()
@@ -639,6 +658,16 @@ def test_reviewed_gateway_runtime_is_accepted(
         "false-no-new-privileges",
         "extra-security-option",
         "network-bindings",
+        "root-user",
+        "entrypoint-override",
+        "command-override",
+        "environment-override",
+        "host-mount",
+        "device-access",
+        "host-pid",
+        "custom-dns",
+        "host-port",
+        "network-port-binding",
     ],
 )
 def test_gateway_runtime_must_match_every_reviewed_isolation_property(
@@ -647,7 +676,7 @@ def test_gateway_runtime_must_match_every_reviewed_isolation_property(
     mutation: str,
 ):
     profile = _babel_profile(tmp_path)
-    network, container = _gateway_inspection(profile)
+    network, container, image = _gateway_inspection(profile)
     if mutation == "non-internal":
         network[0]["Internal"] = False
     elif mutation == "extra-peer":
@@ -671,9 +700,34 @@ def test_gateway_runtime_must_match_every_reviewed_isolation_property(
             "no-new-privileges:true",
             "seccomp=unconfined",
         ]
-    else:
+    elif mutation == "network-bindings":
         container[0]["NetworkSettings"]["Networks"]["unexpected-network"] = {}
-    _mock_gateway_inspection(monkeypatch, network, container)
+    elif mutation == "root-user":
+        image[0]["Config"]["User"] = "0:0"
+        container[0]["Config"]["User"] = "0:0"
+    elif mutation == "entrypoint-override":
+        container[0]["Config"]["Entrypoint"] = ["/bin/sh"]
+    elif mutation == "command-override":
+        container[0]["Config"]["Cmd"] = ["-c", "capture-input"]
+    elif mutation == "environment-override":
+        container[0]["Config"]["Env"].append("CAPTURE_REQUESTS=1")
+    elif mutation == "host-mount":
+        container[0]["Mounts"] = [{"Type": "bind", "Source": "/tmp"}]
+    elif mutation == "device-access":
+        container[0]["HostConfig"]["Devices"] = [{"PathOnHost": "/dev/null"}]
+    elif mutation == "host-pid":
+        container[0]["HostConfig"]["PidMode"] = "host"
+    elif mutation == "custom-dns":
+        container[0]["HostConfig"]["Dns"] = ["203.0.113.1"]
+    elif mutation == "host-port":
+        container[0]["HostConfig"]["PortBindings"] = {
+            "8080/tcp": [{"HostPort": "8080"}]
+        }
+    else:
+        container[0]["NetworkSettings"]["Ports"] = {
+            "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}]
+        }
+    _mock_gateway_inspection(monkeypatch, network, container, image)
 
     with pytest.raises(PdfTranslationSupervisorError) as error:
         supervisor._require_gateway_network(
@@ -692,9 +746,20 @@ def test_gateway_accepts_docker_canonical_true_no_new_privileges(
     value: str,
 ):
     profile = _babel_profile(tmp_path)
-    network, container = _gateway_inspection(profile)
+    network, container, image = _gateway_inspection(profile)
     container[0]["HostConfig"]["SecurityOpt"] = [value]
-    _mock_gateway_inspection(monkeypatch, network, container)
+    _mock_gateway_inspection(monkeypatch, network, container, image)
+
+    supervisor._require_gateway_network("docker", profile, _provider_translation())
+
+
+def test_gateway_accepts_exposed_but_unpublished_image_ports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    profile = _babel_profile(tmp_path)
+    network, container, image = _gateway_inspection(profile)
+    container[0]["NetworkSettings"]["Ports"] = {"8080/tcp": None}
+    _mock_gateway_inspection(monkeypatch, network, container, image)
 
     supervisor._require_gateway_network("docker", profile, _provider_translation())
 

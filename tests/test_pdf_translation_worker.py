@@ -485,6 +485,68 @@ def test_dual_pdf_may_use_two_output_pages_per_requested_source_page(
     ]
 
 
+@pytest.mark.parametrize(
+    ("output_pages", "page_map"),
+    [
+        (
+            4,
+            [
+                {"sourcePage": 1, "outputPages": [1, 3]},
+                {"sourcePage": 2, "outputPages": [2, 4]},
+            ],
+        ),
+        (
+            2,
+            [
+                {"sourcePage": 1, "outputPages": [1]},
+                {"sourcePage": 2, "outputPages": [2]},
+            ],
+        ),
+    ],
+)
+def test_dual_pdf_rejects_non_adjacent_or_single_page_mappings(
+    tmp_path: Path,
+    output_pages: int,
+    page_map: list[dict[str, object]],
+):
+    source = tmp_path / "source.pdf"
+    _make_pdf(source, pages=2)
+    request = _request(source, run_id="pdf-babeldoc-dual-invalid-01")
+    request["outputs"] = ["translated_dual_pdf"]
+    request["limits"]["maxPages"] = 2
+    staging = tmp_path / "dual-staging"
+    artifacts = staging / "artifacts"
+    artifacts.mkdir(parents=True)
+    translated = artifacts / "translated-dual.pdf"
+    _make_pdf(translated, pages=output_pages)
+    artifact = {
+        "role": "translated_dual_pdf",
+        "path": "artifacts/translated-dual.pdf",
+        "mediaType": "application/pdf",
+        "sha256": _sha256(translated),
+        "bytes": translated.stat().st_size,
+    }
+    (staging / "worker-result.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "runId": request["runId"],
+                "sourceSha256": request["source"]["sha256"],
+                "artifacts": [artifact],
+                "pageMaps": {"translated_dual_pdf": page_map},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _assert_code(
+        "invalid_page_map",
+        lambda: load_and_validate_worker_result(
+            staging, request=request, source_pdf=source
+        ),
+    )
+
+
 def test_atomic_publication_and_explicit_promotion_preserve_main_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
