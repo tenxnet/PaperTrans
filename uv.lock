@@ -2152,7 +2152,7 @@ wheels = [
 
 [[package]]
 name = "papertrans"
-version = "0.1.0"
+version = "0.2.0rc1"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -2167,6 +2167,7 @@ chatgpt = [
 ]
 docling = [
     { name = "docling" },
+    { name = "huggingface-hub" },
     { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "onnxruntime", version = "1.29.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -2184,6 +2185,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.13.0" },
     { name = "docling", marker = "extra == 'docling'", specifier = ">=2.123.0,<3" },
     { name = "html5lib", specifier = ">=1.1" },
+    { name = "huggingface-hub", marker = "extra == 'docling'", specifier = ">=1.0.0,<2" },
     { name = "jinja2", specifier = ">=3.1.0" },
     { name = "mcp", marker = "extra == 'chatgpt'", specifier = ">=2.1.1,<3" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.1.1,<3" },

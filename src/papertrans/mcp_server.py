@@ -9,6 +9,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from . import __release__
 from .chatgpt_worker import MCPTranslationStore
 
 
@@ -145,7 +146,7 @@ server = MCPServer(
         "and Markdown while PaperTrans persists state."
     ),
     instructions=SERVER_INSTRUCTIONS,
-    version="0.1.0",
+    version=__release__,
 )
 
 
