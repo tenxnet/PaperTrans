@@ -1,6 +1,9 @@
 # PDF translation backends: isolation and evaluation contract
 
-Status: design proposal, not an implemented or supported PaperTrans path.
+Status: experimental implementation. The common candidate contract, hardened
+container supervisor, Harumi layout-evaluation adapter, and patched BabelDOC
+adapter are implemented. No translated-PDF backend is selected or supported,
+and no candidate may enter the shared manifest without explicit promotion.
 
 This document defines how to evaluate a layout-preserving PDF translation backend without making it part of PaperTrans's trusted process. The supported v1 path remains official arXiv HTML. PDF input, backend output, and backend logs are all untrusted.
 
@@ -8,7 +11,10 @@ This document defines how to evaluate a layout-preserving PDF translation backen
 
 - Do not install or run the published `pdf2zh-next==2.9.0` dependency set. It resolves to a BabelDOC version affected by a high-severity arbitrary-code-execution advisory.
 - If the BabelDOC family is evaluated, build an auditable PaperTrans fork of the pdf2zh-next adapter around a patched BabelDOC release, run one job per locked container, and expose only the narrow contract below.
-- Evaluate `harumi` through the same contract. It is the preferred permissive candidate, but it is not accepted merely because its license is permissive.
+- `harumi` was evaluated through the same contract. The representative
+  14-page run exposed broken font/ExtGState resource references and 893 native
+  layout issues, so it is retained only as negative comparison evidence and
+  is never promotion-eligible.
 - Never write a candidate result into `output/<slug>/html/` or replace an existing MCP/arXiv artifact. Candidate runs remain under `output/<slug>/pdf-runs/` until a separate promotion decision.
 - Isolation is a security control, not a way to avoid AGPL obligations.
 
@@ -23,7 +29,52 @@ PaperTrans is a local-first, single-user application. A PDF imported by the curr
 - The current PDF library summary remains `work/papertrans-job.json` with `sourceType: "pdf"`. Candidate runs do not rewrite it. A later promotion may atomically map one validated `translated_mono_pdf` role to its `artifacts.translatedPdf` field.
 - The browser and the Next.js request handler do not connect to a backend directly. A persistent local supervisor enqueues work and returns `202 Accepted`; it does not keep correctness-critical state only in an in-memory `Set`.
 
-The first implementation should use the process contract. The HTTP contract is for a later private service or a non-local worker and must produce the same events and artifacts.
+The implemented path uses the process contract. The HTTP contract remains a
+future private-service design and must produce the same events and artifacts.
+
+## Implemented checkpoint (2026-08-30)
+
+- The supervisor runs a detached, capability-dropped keeper as UID/GID 65532,
+  executes a fixed absolute worker binary without a shell, and copies output
+  before stopping the keeper.
+- `/output` is a named local-driver tmpfs volume with an aggregate quota and
+  `noexec,nosuid,nodev`; the supervisor verifies the live `/proc/self/mountinfo`
+  entry before starting a worker. `/tmp`, config, and separate BabelDOC and
+  pdf2zh-next caches are bounded tmpfs mounts. Baked BabelDOC assets remain in
+  an immutable image path and are linked into the empty runtime cache only
+  after provenance and sandbox checks pass.
+- Provider JSON is copied over stdin into an ephemeral Docker volume. It is
+  absent from argv, environment variables, host binds, events, and persisted
+  logs. The host rejects literal credential retention in any event or staged
+  artifact before publication. Before exposing that secret, the supervisor
+  compares the live gateway user, entrypoint, command, environment, and image
+  config against the immutable image and rejects host mounts, devices, host
+  namespaces, custom DNS, or published ports.
+- The host validates exact health/events/result contracts, immutable build
+  provenance, artifact hashes and sizes, page maps, geometry, external-action
+  provenance, standardized PDF actions with a default-deny policy, and MuPDF
+  parser/render warnings. A separate `qpdf --check` pass is mandatory for
+  promotion; when qpdf is unavailable the candidate remains `needs_review`.
+- Promotion is host-owned and role-aware for mono or dual PDF. Layout-only
+  Harumi runs carry `promotionEligible: false` and cannot be promoted.
+- The BabelDOC worker pins the safe dependency fork and suppresses fd 1/2 even
+  during third-party imports/native initialization, preserving exact health
+  JSON and NDJSON under noisy imports.
+- The public CLI deliberately labels every gateway-backed BabelDOC launch as
+  `contract_evaluation` with `promotionEligible: false`. A future reviewed
+  semantic-gateway allowlist must be implemented before the CLI can create a
+  promotable run.
+- The built image
+  `papertrans-babeldoc@sha256:4f2761829b3f3f191f9e5e4eef1b407d622e9804aeab8a13e6f0d171f15b6905`
+  passed exact offline health with embedded SBOM SHA-256
+  `8c0f18d500210d5cc26ceb86ac385cd01bdc0bcaf3dc7d8d0b8111721264539f`.
+  Adapter `0.1.1` then completed a one-page dual E2E through the
+  network-offline deterministic gateway, mapped the source to adjacent output
+  pages `[1, 2]`, and published a renderable common candidate bundle. This
+  verifies wiring and isolation, not translation semantics.
+
+The concrete comparison result and remaining hard stops are recorded in
+[`pdf-backend-comparison-2026-08-30.md`](pdf-backend-comparison-2026-08-30.md).
 
 ## Candidate versions and hard stops
 
@@ -32,7 +83,7 @@ The baseline below was checked on 2026-08-30. Every production build must use an
 | Candidate | Evaluation baseline | License | Current decision |
 | --- | --- | --- | --- |
 | pdf2zh-next / BabelDOC | PaperTrans fork from pdf2zh-next `v2.9.0`; `BabelDOC==0.6.4`; an exact tested PyMuPDF `>=1.26.7`; Python `>=3.10,<3.14` | pdf2zh-next and BabelDOC: AGPL-3.0; PyMuPDF: AGPL-3.0 or commercial | Blocked until the fork passes dependency, security, regression, and legal gates |
-| harumi | `harumi==1.19.0`, `harumi-ai==0.9.0`, Rust `1.88`, committed `Cargo.lock`, exact font hash | MIT OR Apache-2.0; font and optional tools separately licensed | Eligible for the parallel digital-PDF evaluation |
+| harumi | `harumi==1.19.0`, `harumi-ai==0.9.0`, Rust `1.88`, committed `Cargo.lock`, exact font hash | MIT OR Apache-2.0; font and optional tools separately licensed | Evaluated; retained only as non-promotable negative evidence |
 | Docling plus a writer | Repository lock `docling==2.123.0` and exact model revisions, with harumi as the PDF writer | Docling code: MIT; model licenses vary | Parser/OCR experiment only; Docling does not produce a translated PDF itself |
 
 ### Why the upstream pdf2zh-next release is blocked
@@ -196,7 +247,7 @@ queued -> running -> validating -> succeeded | needs_review | failed
                    \-> cancelled
 ```
 
-It records `schemaVersion`, `runId`, `slug`, `sourceType: "pdf"`, source SHA-256 and byte count, target language, backend ID, adapter/engine/dependency versions, source revision, image/build digest, model/profile/prompt/glossary hashes, font/model digests, state, progress, timestamps, sanitized error code, resource metrics, and the hash of `artifact-index.json`. It never stores credentials or absolute local paths. `succeeded` means the candidate is valid for evaluation; it does not mean selected or supported.
+It records `schemaVersion`, `runId`, `slug`, `sourceType: "pdf"`, source SHA-256 and byte count, target language, backend ID, adapter/engine/dependency versions, source revision, image/build digest, model/profile/prompt/glossary hashes, font/model digests, state, progress, timestamps, sanitized error code, resource metrics, and hashes of `artifact-index.json` and `qa.json`. It never stores credentials or absolute local paths. A newly validated artifact normally remains `needs_review`; `succeeded` requires all configured gates and never means selected or supported.
 
 The worker writes `worker-result.json` in staging. PaperTrans treats it as untrusted, verifies it, then creates `artifact-index.json`. Every indexed artifact has exactly:
 
@@ -287,13 +338,21 @@ Before any image, service, or binary is distributed or made available over a net
 
 No backend is silently selected based on availability. The approved backend ID and license mode are explicit configuration, recorded in every run, and fail closed when the build does not match the approved manifest.
 
-## Implementation order
+## Remaining implementation order
 
-1. Implement schemas, persistent run state, staging validation, and fake-worker tests without either real backend.
-2. Implement the Harumi adapter and deterministic digital-PDF pass first; it has the smaller license boundary and a provider-agnostic translation trait.
-3. Build the patched pdf2zh-next/BabelDOC candidate only after source, dependency, container, security, and AGPL decisions are recorded.
-4. Run the two-pass corpus evaluation and publish `pdf-backend-comparison.json` with hashes and blinded review results.
-5. Add UI selection or promotion only after a backend passes all gates. Keep source acquisition, backend execution, artifact validation, and publication as separate states.
+1. Move source and output PDF parsing/render smoke out of the trusted host
+   process and into a locked, no-network validation sandbox. The current host
+   still invokes native PyMuPDF on untrusted input and worker output, so this
+   experimental path is not approved for adversarial PDFs.
+2. Freeze and review the real gateway's DNS/IP/TLS/redirect/body/concurrency,
+   retry, and credential-forwarding policy before any real-key run.
+3. Install or provide sandboxed qpdf and complete semantic, layout, glyph,
+   protected-token, and manual QA for a promotion-eligible BabelDOC result.
+4. Run the same two-pass ten-paper corpus for every candidate and publish a
+   hash-bound comparison record.
+5. Select or promote a backend only after security, quality, licensing, and
+   corresponding-source gates pass. Keep acquisition, execution, validation,
+   review, and promotion separate.
 
 ## Primary sources
 
