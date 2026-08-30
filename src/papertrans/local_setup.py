@@ -515,6 +515,32 @@ def _state_is_current(state: dict[str, Any], key: str, fingerprint: str) -> bool
     )
 
 
+def _node_dependencies_installed(paths: LocalPaths) -> bool:
+    node_modules = paths.repo_root / "node_modules"
+    if not (node_modules / ".pnpm").is_dir():
+        return False
+    package = _load_json(paths.repo_root / "package.json")
+    package_names: set[str] = set()
+    for section_name in ("dependencies", "devDependencies"):
+        section = package.get(section_name)
+        if isinstance(section, dict):
+            package_names.update(
+                name for name in section if isinstance(name, str) and name
+            )
+    for name in package_names:
+        if not node_modules.joinpath(*name.split("/")).exists():
+            return False
+    required_bins = {
+        "next": "next",
+        "typescript": "tsc",
+    }
+    return all(
+        package_name not in package_names
+        or (node_modules / ".bin" / executable).is_file()
+        for package_name, executable in required_bins.items()
+    )
+
+
 def _python_package_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -546,7 +572,7 @@ def setup_status(paths: LocalPaths, *, dev: bool = False) -> dict[str, Any]:
     build_fingerprint = _build_fingerprint(paths, dependency_fingerprint)
     dependencies_ok = (
         pnpm_ok
-        and (paths.repo_root / "node_modules" / ".pnpm").is_dir()
+        and _node_dependencies_installed(paths)
         and _state_is_current(state, "node", dependency_fingerprint)
     )
     build_ok = dev or (
@@ -589,7 +615,7 @@ def ensure_setup(paths: LocalPaths, *, offline: bool, dev: bool = False) -> dict
         state = _load_json(paths.state_path)
 
         node_modules_ready = (
-            (paths.repo_root / "node_modules" / ".pnpm").is_dir()
+            _node_dependencies_installed(paths)
             and _state_is_current(state, "node", dependency_fingerprint)
         )
         if not node_modules_ready:
@@ -597,6 +623,15 @@ def ensure_setup(paths: LocalPaths, *, offline: bool, dev: bool = False) -> dict
             if offline:
                 install_argv.append("--offline")
             _run(install_argv, cwd=paths.repo_root)
+            if not _node_dependencies_installed(paths):
+                # pnpm can regard an interrupted linker state as current even
+                # when root package links or .bin entries are missing. Force a
+                # relink once, preserving the same frozen/offline policy.
+                _run([*install_argv, "--force"], cwd=paths.repo_root)
+                if not _node_dependencies_installed(paths):
+                    raise SetupError(
+                        "pnpm install completed without all direct packages and required executables"
+                    )
             state["node"] = {
                 "fingerprint": dependency_fingerprint,
                 "ok": True,

@@ -184,6 +184,78 @@ def test_pnpm_major_is_enforced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         local_setup.validated_pnpm_version(("/usr/bin/pnpm",), tmp_path)
 
 
+def test_node_dependency_readiness_rejects_a_partial_install(tmp_path: Path) -> None:
+    paths = _fixture_paths(tmp_path)
+    (paths.repo_root / "package.json").write_text(
+        json.dumps(
+            {
+                "dependencies": {"next": "1", "react": "1"},
+                "devDependencies": {"typescript": "1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    node_modules = paths.repo_root / "node_modules"
+    for relative in (".pnpm", "next", "react", "typescript"):
+        (node_modules / relative).mkdir(parents=True, exist_ok=True)
+
+    assert not local_setup._node_dependencies_installed(paths)
+
+    binaries = node_modules / ".bin"
+    binaries.mkdir()
+    for name in ("next", "tsc"):
+        executable = binaries / name
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+
+    assert local_setup._node_dependencies_installed(paths)
+
+    (node_modules / "react").rmdir()
+    assert not local_setup._node_dependencies_installed(paths)
+
+
+def test_setup_forces_one_relink_after_a_partial_pnpm_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _fixture_paths(tmp_path)
+    (paths.repo_root / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "1"}}), encoding="utf-8"
+    )
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(local_setup, "validate_repository", lambda _paths: None)
+    monkeypatch.setattr(local_setup, "node_version", lambda: ("/usr/bin/node", 22))
+    monkeypatch.setattr(local_setup, "pnpm_command", lambda: ("/usr/bin/pnpm",))
+    monkeypatch.setattr(
+        local_setup, "validated_pnpm_version", lambda _argv, _root: "11.19.0"
+    )
+    monkeypatch.setattr(local_setup, "ensure_models", lambda _paths, offline: None)
+    monkeypatch.setattr(local_setup, "_python_package_version", lambda _name: "1.0")
+
+    def fake_run(argv, *, cwd, environment=None, timeout=None):
+        calls.append(tuple(argv))
+        node_modules = paths.repo_root / "node_modules"
+        (node_modules / ".pnpm").mkdir(parents=True, exist_ok=True)
+        if "--force" in argv:
+            (node_modules / "next").mkdir()
+            (node_modules / ".bin").mkdir()
+            next_binary = node_modules / ".bin" / "next"
+            next_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            next_binary.chmod(0o755)
+        if "build" in argv:
+            (paths.repo_root / ".next").mkdir()
+            (paths.repo_root / ".next" / "BUILD_ID").write_text(
+                "test\n", encoding="utf-8"
+            )
+        return local_setup.CommandResult(tuple(argv), 0)
+
+    monkeypatch.setattr(local_setup, "_run", fake_run)
+
+    status_value = local_setup.ensure_setup(paths, offline=True)
+
+    assert calls[1][-1] == "--force"
+    assert status_value["ready"] is True
+
+
 def test_ui_change_invalidates_build_but_not_node_install(tmp_path: Path) -> None:
     paths = _fixture_paths(tmp_path)
     app = paths.repo_root / "app"
