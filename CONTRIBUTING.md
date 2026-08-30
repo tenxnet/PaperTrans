@@ -1,6 +1,6 @@
 # Contributing to PaperTrans
 
-Thank you for helping improve PaperTrans. The project is currently a v0.1 preview focused on official arXiv HTML to Japanese HTML conversion.
+Thank you for helping improve PaperTrans. The project is currently a v0.2.0-rc.1 release candidate. Official arXiv HTML is the stable input path; Docling PDF import is experimental.
 
 ## Before opening an issue
 
@@ -20,6 +20,13 @@ Start the local web app with an explicit loopback binding:
 
 ```bash
 pnpm dev --hostname 127.0.0.1
+```
+
+To exercise the complete release-candidate runtime, including the Docling models, use the root launcher instead:
+
+```bash
+./papertrans setup
+./papertrans start --dev
 ```
 
 ## Validation
