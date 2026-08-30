@@ -7,7 +7,14 @@ from types import SimpleNamespace
 import papertrans.semantic_translate as semantic_translation
 from papertrans.deterministic_structure import analyze_layout_deterministic, evaluate_structure
 from papertrans.hybrid_structure import _merge_reviewed_pages, _stable_cache_payload, select_review_pages
-from papertrans.semantic import build_semantic_document, iter_translatable_units
+from papertrans.semantic import (
+    _is_descendant_section,
+    _join_source_parts,
+    _select_visual_reference_anchor,
+    _should_preserve_paired_figure_parent,
+    build_semantic_document,
+    iter_translatable_units,
+)
 from papertrans.semantic_render import render_semantic_document
 from papertrans.semantic_translate import _command, _validate_result
 from papertrans.structure import validate_structure_batch
@@ -102,6 +109,212 @@ def test_builds_real_sections_and_semantic_paragraphs():
     assert content[1]["value"]["caption"] == "Figure 1: Original caption."
 
 
+def test_trailing_unheaded_figures_do_not_become_reference_children(
+    tmp_path: Path,
+):
+    evidence, structure, visuals = sample_semantic_inputs()
+    visuals[0]["label"] = "Figure 99"
+    visuals[0]["insertAfterBlockId"] = "p1-b8"
+
+    document = build_semantic_document(evidence, structure, visuals)
+
+    supplemental = document["sections"][-1]
+    assert supplemental["syntheticUnheaded"] is True
+    assert supplemental["content"][0]["value"]["label"] == "Figure 99"
+    references = next(
+        section
+        for section in document["sections"]
+        if section["title"]["original"] == "References"
+    )
+    assert all(item["type"] != "visual" for item in references["content"])
+    html = render_semantic_document(document, tmp_path, tmp_path / "html")
+    assert ">Supplemental Material</h" not in html.read_text(encoding="utf-8")
+
+
+def test_join_source_parts_only_closes_a_verified_singleton_quote():
+    assert _join_source_parts(["RESPONSE: ' {}", "'"]) == "RESPONSE: ' {}'"
+    assert _join_source_parts(["He said", '"hello"']) == 'He said "hello"'
+    assert _join_source_parts(["This is", "'quoted'"]) == "This is 'quoted'"
+    assert _join_source_parts(["Don't say", "'", "hello", "'"]) == (
+        "Don't say 'hello'"
+    )
+    assert _join_source_parts(["the models'", "outputs differ"]) == (
+        "the models' outputs differ"
+    )
+
+
+def test_verbatim_unit_preserves_internal_newlines_and_indentation():
+    evidence = {
+        "sourceFile": "code.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {"blockId": "code", "text": "if x:\n    y = 1\n    return y"}
+                ],
+            }
+        ],
+    }
+    structure = {
+        "warnings": [],
+        "sections": [],
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": "code",
+                        "role": "verbatim",
+                        "readingOrder": 1,
+                        "sectionId": None,
+                        "paragraphId": "verbatim-code",
+                        "hidden": False,
+                        "confidence": 1,
+                        "warnings": [],
+                    }
+                ],
+                "visualObjects": [],
+            }
+        ],
+    }
+
+    document = build_semantic_document(evidence, structure, [])
+
+    assert document["sections"][0]["content"][0]["value"]["original"] == (
+        "if x:\n    y = 1\n    return y"
+    )
+
+
+def test_visuals_use_latest_preceding_exact_reference_as_semantic_anchor():
+    block_specs = [
+        ("title", "Paper", "title", None, None),
+        ("heading-j", "J. Results", "heading", "sec-j", None),
+        ("intro-j", "Table 7 shows detailed results.", "paragraph", "sec-j", "p-j"),
+        ("heading-m", "M. Evaluation", "heading", "sec-m", None),
+        ("intro-m", "We compare both methods in Table 8.", "paragraph", "sec-m", "p-m"),
+        ("heading-o", "O. Prompts", "heading", "sec-o", None),
+        ("long-a", "A paragraph starts here", "paragraph", "sec-o", "p-o"),
+        ("footnote", "Table note", "footnote", "sec-o", "p-note"),
+        ("long-b", "and continues later.", "paragraph", "sec-o", "p-o"),
+    ]
+    evidence = {
+        "sourceFile": "floats.pdf",
+        "pageCount": 1,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {"blockId": block_id, "text": text}
+                    for block_id, text, _role, _section, _paragraph in block_specs
+                ],
+            }
+        ],
+    }
+    structure = {
+        "warnings": [],
+        "sections": [
+            {
+                "sectionId": section_id,
+                "number": None,
+                "titleBlockId": heading_id,
+                "level": 1,
+                "parentSectionId": None,
+                "pageStart": 1,
+            }
+            for section_id, heading_id in (
+                ("sec-j", "heading-j"),
+                ("sec-m", "heading-m"),
+                ("sec-o", "heading-o"),
+            )
+        ],
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": block_id,
+                        "role": role,
+                        "readingOrder": index,
+                        "sectionId": section_id,
+                        "paragraphId": paragraph_id,
+                        "hidden": False,
+                        "citations": [],
+                        "objectReferences": (
+                            ["Table 7"]
+                            if block_id == "intro-j"
+                            else ["Table 8"]
+                            if block_id == "intro-m"
+                            else []
+                        ),
+                        "referenceLabel": None,
+                        "confidence": 1,
+                        "warnings": [],
+                    }
+                    for index, (
+                        block_id,
+                        _text,
+                        role,
+                        section_id,
+                        paragraph_id,
+                    ) in enumerate(block_specs, 1)
+                ],
+                "visualObjects": [],
+            }
+        ],
+    }
+    visuals = [
+        {
+            "objectId": "table-7",
+            "kind": "table",
+            "label": "Table 7",
+            "captionBlockIds": [],
+            "insertAfterBlockId": "long-a",
+            "pageNumber": 1,
+            "asset": "assets/table-7.png",
+            "bboxNormalized": [0.1, 0.1, 0.9, 0.4],
+            "bboxPdf": [10, 10, 90, 40],
+            "confidence": 1,
+            "warnings": [],
+        },
+        {
+            "objectId": "table-8",
+            "kind": "table",
+            "label": "Table 8",
+            "captionBlockIds": [],
+            "insertAfterBlockId": "footnote",
+            "pageNumber": 1,
+            "asset": "assets/table-8.png",
+            "bboxNormalized": [0.1, 0.6, 0.9, 0.7],
+            "bboxPdf": [10, 60, 90, 70],
+            "confidence": 1,
+            "warnings": [],
+        },
+    ]
+
+    document = build_semantic_document(evidence, structure, visuals)
+
+    content_by_section = {
+        section["id"]: section["content"] for section in document["sections"]
+    }
+    assert [
+        item["value"]["objectId"]
+        for item in content_by_section["sec-j"]
+        if item["type"] == "visual"
+    ] == ["table-7"]
+    assert [
+        item["value"]["objectId"]
+        for item in content_by_section["sec-m"]
+        if item["type"] == "visual"
+    ] == ["table-8"]
+    assert not any(
+        item["type"] == "visual" for item in content_by_section["sec-o"]
+    )
+    rendered = {visual["objectId"]: visual for visual in document["visualObjects"]}
+    assert rendered["table-7"]["insertAfterBlockId"] == "intro-j"
+    assert rendered["table-8"]["insertAfterBlockId"] == "intro-m"
+
+
 def test_synthesizes_section_for_document_without_headings():
     evidence = {
         "sourceFile": "unheaded.pdf",
@@ -177,13 +390,28 @@ def test_splits_author_from_known_affiliation():
 
 def test_semantic_renderer_links_citations_and_objects(tmp_path: Path):
     document = build_semantic_document(*sample_semantic_inputs())
+    document["sections"][0]["content"][1]["value"]["caption"] += (
+        " https://example.org/caption."
+    )
     units = list(iter_translatable_units(document))
     for unit in units:
         unit["japanese"] = unit["original"]
+    paragraph = next(unit for unit in units if unit["kind"] == "paragraph")
+    paragraph["original"] += (
+        ' See "https://example.org/a-path?x=1&y=2" now.'
+    )
+    paragraph["japanese"] = paragraph["original"]
     index = render_semantic_document(document, tmp_path, tmp_path / "html")
     text = index.read_text(encoding="utf-8")
     assert 'href="#ref-1"' in text
     assert 'href="#visual-figure-1"' in text
+    assert (
+        '<a class="external" href="https://example.org/a-path?x=1&amp;y=2" '
+        'rel="noopener noreferrer">https://example.org/a-path?x=1&amp;y=2</a>'
+    ) in text
+    assert "https://example.org/a-path?x=1&amp;y=2&amp;quot" not in text
+    assert "<figcaption>" in text
+    assert '<a class="external" href="https://example.org/caption"' in text
     assert 'class="paper-section level-1"' in text
     assert "Page 1" not in text
 
@@ -681,3 +909,303 @@ def test_hybrid_merge_orders_sections_by_page_reading_order():
         "sec-earlier",
         "sec-later",
     ]
+
+
+def _xref_unit(
+    unit_id: str,
+    position: float,
+    section_id: str,
+    page: int,
+    references: list[str],
+    original: str = "",
+) -> dict:
+    return {
+        "id": unit_id,
+        "kind": "paragraph",
+        "endPosition": position,
+        "sectionId": section_id,
+        "pages": [page],
+        "objectReferences": references,
+        "original": original,
+    }
+
+
+def test_visual_xref_anchor_prefers_exact_reference_on_the_visual_page() -> None:
+    units = [
+        _xref_unit("early", 155, "sec-results", 6, ["Fig. 4"]),
+        _xref_unit("discussion-a", 247, "sec-discussion", 7, ["Figure 4"]),
+        _xref_unit("discussion-b", 248, "sec-discussion", 7, ["Figure 4"]),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Figure 4",
+        160.1,
+        {"sec-results", "sec-discussion"},
+        visual_page=7,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "discussion-b"
+
+
+def test_visual_xref_anchor_does_not_drift_to_a_later_page_remention() -> None:
+    units = [
+        _xref_unit("primary", 236, "sec-primary", 5, ["Table 1"]),
+        _xref_unit("later", 244, "sec-later", 6, ["Table 1"]),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 1",
+        227.1,
+        {"sec-primary", "sec-later"},
+        visual_page=5,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "primary"
+
+
+def test_visual_xref_anchor_finishes_a_tight_future_reference_cluster() -> None:
+    units = [
+        _xref_unit("top", 95, "sec-top", 6, ["Table 2"]),
+        _xref_unit("bottom", 97, "sec-bottom", 6, ["Table 2"]),
+        _xref_unit("later-reminder", 110, "sec-later", 6, ["Table 2"]),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 2",
+        84.1,
+        {"sec-top", "sec-bottom", "sec-later"},
+        visual_page=6,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "bottom"
+
+
+def test_visual_xref_anchor_ignores_a_remote_retrospective_mention() -> None:
+    units = [
+        _xref_unit("remote", 137, "sec-retrospective", 10, ["Table 1"]),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 1",
+        24.1,
+        {"sec-source", "sec-retrospective"},
+        visual_page=2,
+    )
+
+    assert anchor is None
+
+
+def test_visual_xref_anchor_allows_a_two_page_forward_appendix_float() -> None:
+    units = [
+        _xref_unit("forward", 180, "sec-appendix-d2", 18, ["Table 10"]),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 10",
+        200.1,
+        {"sec-appendix-d2", "sec-local"},
+        visual_page=20,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "forward"
+
+
+def test_visual_xref_anchor_rejects_a_two_page_later_comparison() -> None:
+    units = [
+        _xref_unit("later-comparison", 220, "sec-comparison", 10, ["Table 5"]),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 5",
+        180.1,
+        {"sec-source", "sec-comparison"},
+        visual_page=8,
+    )
+
+    assert anchor is None
+
+
+def test_visual_xref_anchor_prefers_a_defining_reference_over_a_remention() -> None:
+    units = [
+        _xref_unit(
+            "configuration-intro",
+            28,
+            "sec-configurations",
+            2,
+            ["Table 1"],
+            "The ConvNet configurations are outlined in Table 1, one per column.",
+        ),
+        _xref_unit(
+            "discussion-remention",
+            37,
+            "sec-discussion",
+            3,
+            ["Table 1"],
+            "We use a 1 x 1 layer (configuration C, Table 1).",
+        ),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 1",
+        30.1,
+        {"sec-configurations", "sec-discussion"},
+        visual_page=3,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "configuration-intro"
+
+
+def test_visual_xref_anchor_allows_a_three_page_defining_appendix_reference() -> None:
+    units = [
+        _xref_unit(
+            "appendix-intro",
+            615,
+            "sec-appendix-j",
+            17,
+            ["Table 7"],
+            "Table 7 shows the results evaluated on OR-Bench-80K.",
+        ),
+        _xref_unit(
+            "earlier-reminder",
+            317,
+            "sec-results",
+            7,
+            ["Table 7"],
+            "The results in Table 7 are a better indicator.",
+        ),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 7",
+        880.1,
+        {"sec-appendix-j", "sec-results", "sec-appendix-o"},
+        visual_page=20,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "appendix-intro"
+
+
+def test_table_result_discussion_does_not_replace_its_preceding_intro() -> None:
+    units = [
+        _xref_unit(
+            "comparison-intro",
+            287,
+            "sec-results",
+            6,
+            ["Table 3"],
+            "In Table 3 we compare three shortcut options.",
+        ),
+        _xref_unit(
+            "result-discussion",
+            301,
+            "sec-results",
+            6,
+            ["Table 3"],
+            "Table 3 shows that all three options beat the plain counterpart.",
+        ),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 3",
+        290.1,
+        {"sec-results"},
+        visual_page=6,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "comparison-intro"
+
+
+def test_remote_result_sentence_does_not_erase_a_local_table_owner() -> None:
+    units = [
+        _xref_unit(
+            "local-owner",
+            416,
+            "sec-object-detection",
+            8,
+            ["Table 7"],
+            "Our method has good generalization; Table 7 and 8 show detection results.",
+        ),
+        _xref_unit(
+            "later-result",
+            454,
+            "sec-pascal",
+            10,
+            ["Table 7"],
+            "Table 7 shows the PASCAL results.",
+        ),
+    ]
+
+    anchor = _select_visual_reference_anchor(
+        units,
+        "Table 7",
+        412.1,
+        {"sec-object-detection", "sec-pascal"},
+        visual_page=8,
+    )
+
+    assert anchor is not None
+    assert anchor["id"] == "local-owner"
+
+
+def test_section_descendant_check_is_strict_and_transitive() -> None:
+    sections = {
+        "attention": {"parentSectionId": "architecture"},
+        "scaled": {"parentSectionId": "attention"},
+        "architecture": {"parentSectionId": None},
+    }
+
+    assert _is_descendant_section("scaled", "attention", sections)
+    assert _is_descendant_section("scaled", "architecture", sections)
+    assert not _is_descendant_section("attention", "attention", sections)
+    assert not _is_descendant_section("architecture", "scaled", sections)
+
+
+def test_only_paired_figures_preserve_a_physical_parent_section() -> None:
+    sections = {
+        "attention": {"parentSectionId": "architecture"},
+        "scaled": {"parentSectionId": "attention"},
+        "architecture": {"parentSectionId": None},
+    }
+    child_anchor = {"sectionId": "scaled", "endPosition": 67}
+    composite = {"kind": "figure"}
+
+    assert _should_preserve_paired_figure_parent(
+        composite,
+        "Figure 2: (left) Scaled attention. (right) Multi-head attention.",
+        child_anchor,
+        65.1,
+        "attention",
+        sections,
+    )
+    assert not _should_preserve_paired_figure_parent(
+        {"kind": "table"},
+        "Table 2: left and right results.",
+        child_anchor,
+        65.1,
+        "attention",
+        sections,
+    )
+    assert not _should_preserve_paired_figure_parent(
+        composite,
+        "Figure 5: Classification results.",
+        child_anchor,
+        65.1,
+        "attention",
+        sections,
+    )

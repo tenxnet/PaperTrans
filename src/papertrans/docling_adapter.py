@@ -11,7 +11,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Mapping, Sequence
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -101,9 +103,15 @@ _AUTHOR_YEAR_CITATION = re.compile(
     r"(?:\s*;\s*)?)+\)"
 )
 _OBJECT_REFERENCE = re.compile(
-    r"\b(?:Figure|Fig\.?|Table|Algorithm|Equation|Eq\.?)\s*"
-    r"\(?((?:[A-Z]\.)?\d+(?:[.\-][A-Za-z0-9]+)*)\)?",
+    r"\b(?P<kind>Figures?|Figs?\.?|Tables?|Algorithms?|Equations?|Eqs?\.?)\s*"
+    r"(?P<values>"
+    r"\(?(?:[A-Z]\.)?\d+(?:[.\-][A-Za-z0-9]+)*\)?"
+    r"(?:\s*(?:,|and|&)\s*\(?(?:[A-Z]\.)?\d+(?:[.\-][A-Za-z0-9]+)*\)?)*"
+    r")",
     re.IGNORECASE,
+)
+_OBJECT_REFERENCE_VALUE = re.compile(
+    r"(?:[A-Z]\.)?\d+(?:[.\-][A-Za-z0-9]+)*", re.IGNORECASE
 )
 _OBJECT_LABEL = re.compile(
     r"^\s*(Figure|Fig\.?|Table|Algorithm|Equation|Eq\.?)\s*"
@@ -647,8 +655,70 @@ def _raw_text(item: Mapping[str, Any]) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _normalize_displaced_pdf_diacritics(text: str) -> str:
+    """Move a detached diaeresis from the prior consonant onto its vowel."""
+
+    return re.sub(
+        r"([^\W\d_])\u00a8\s*([AEIOUYaeiouy])",
+        lambda match: match.group(1)
+        + unicodedata.normalize("NFC", match.group(2) + "\u0308"),
+        text,
+    )
+
+
+def _normalize_spaced_urls(text: str) -> str:
+    """Normalize only the URL scheme; path repair needs PDF annotations."""
+
+    return re.sub(
+        r"\b(https?)\s*:\s*/\s*/\s*",
+        lambda match: f"{match.group(1).lower()}://",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+_UNANNOTATED_HOST = re.compile(
+    r"\bhttps?://\s*(?:[A-Za-z0-9-]+\s*\.\s*)+"
+    r"(?:com|org|net|edu|gov|io|ai|co|dev|app|info|me|us|uk|de|fr|jp|cn|ch|ly|tv|xyz)\b",
+    re.IGNORECASE,
+)
+_URL_SAFE_PREFIX = r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+;=%-]+"
+
+
+def _normalize_unannotated_printed_urls(text: str) -> str:
+    """Apply only structurally unambiguous URL spacing repairs.
+
+    Unlike annotation-backed recovery, this never guesses a missing path
+    token.  It only removes PDF-inserted spaces inside a DNS host, around a
+    path slash, or before a familiar file extension.
+    """
+
+    value = _normalize_spaced_urls(text)
+    value = _UNANNOTATED_HOST.sub(
+        lambda match: re.sub(r"\s+", "", match.group(0)), value
+    )
+    slash_spacing = re.compile(
+        rf"({_URL_SAFE_PREFIX})\s*/\s*(?=[A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    extension_spacing = re.compile(
+        rf"({_URL_SAFE_PREFIX})\s*\.\s*(?=(?:html?|pdf)\b)",
+        re.IGNORECASE,
+    )
+    while True:
+        repaired = slash_spacing.sub(r"\1/", value)
+        repaired = extension_spacing.sub(r"\1.", repaired)
+        if repaired == value:
+            return value
+        value = repaired
+
+
+def _normalize_extracted_text(text: str) -> str:
+    return _normalize_displaced_pdf_diacritics(text)
+
+
 def _text(item: Mapping[str, Any]) -> str:
-    return _raw_text(item).strip()
+    return _normalize_extracted_text(_raw_text(item).strip())
 
 
 def _label(item: Mapping[str, Any]) -> str:
@@ -770,9 +840,73 @@ def _char_span(provenance: Mapping[str, Any], text_length: int) -> tuple[int, in
         start, end = int(raw[0]), int(raw[1])
     except (TypeError, ValueError):
         return None
-    if 0 <= start < end <= text_length:
-        return start, end
+    # Docling occasionally reports the final span one or two code points past
+    # its exported text after ligature normalization.  A tiny terminal clamp
+    # preserves otherwise exact multi-page provenance without guessing an
+    # interior boundary.
+    if 0 <= start < min(end, text_length) and end <= text_length + 2:
+        return start, min(end, text_length)
     return None
+
+
+def _partition_provenance_char_spans(
+    provenance_values: list[Mapping[str, Any]], raw_text: str
+) -> list[tuple[int, int]] | None:
+    """Return ordered spans, absorbing only tiny Docling boundary drift."""
+
+    terminal_overrun = False
+    for provenance in provenance_values:
+        raw_span = provenance.get("charspan", provenance.get("char_span"))
+        if (
+            isinstance(raw_span, Sequence)
+            and not isinstance(raw_span, (str, bytes, bytearray))
+            and len(raw_span) == 2
+        ):
+            try:
+                terminal_overrun = terminal_overrun or (
+                    len(raw_text) < int(raw_span[1]) <= len(raw_text) + 2
+                )
+            except (TypeError, ValueError):
+                pass
+    raw_spans = [_char_span(value, len(raw_text)) for value in provenance_values]
+    if not all(span is not None for span in raw_spans):
+        return None
+    spans = [span for span in raw_spans if span is not None]
+    for index in range(len(spans)):
+        start, end = spans[index]
+        previous_end = spans[index - 1][1] if index else 0
+        if start < previous_end:
+            return None
+        gap = raw_text[previous_end:start]
+        if gap.strip():
+            if len(gap) > 2 or not terminal_overrun or index == 0:
+                return None
+            word_char = lambda value: value.isalnum() or value in "-_"
+            word_start = previous_end
+            while word_start > 0 and word_char(raw_text[word_start - 1]):
+                word_start -= 1
+            word_end = start
+            while word_end < len(raw_text) and word_char(raw_text[word_end]):
+                word_end += 1
+            backward_distance = previous_end - word_start
+            forward_distance = word_end - start
+            boundary = (
+                word_end
+                if forward_distance <= backward_distance
+                else word_start
+            )
+            previous_start, _ = spans[index - 1]
+            if previous_start >= boundary or boundary >= end:
+                return None
+            spans[index - 1] = (previous_start, boundary)
+            spans[index] = (boundary, end)
+    trailing = raw_text[spans[-1][1] :]
+    if trailing.strip():
+        if len(trailing) > 2:
+            return None
+        start, _ = spans[-1]
+        spans[-1] = (start, len(raw_text))
+    return spans
 
 
 def _citations(text: str) -> list[str]:
@@ -782,7 +916,23 @@ def _citations(text: str) -> list[str]:
 
 
 def _object_references(text: str) -> list[str]:
-    return list(dict.fromkeys(match.group(0) for match in _OBJECT_REFERENCE.finditer(text)))
+    references: list[str] = []
+    for match in _OBJECT_REFERENCE.finditer(text):
+        raw_kind = match.group("kind").casefold().rstrip(".")
+        if raw_kind.startswith("fig"):
+            kind = "Figure"
+        elif raw_kind.startswith("table"):
+            kind = "Table"
+        elif raw_kind.startswith("algorithm"):
+            kind = "Algorithm"
+        else:
+            kind = "Equation"
+        values = _OBJECT_REFERENCE_VALUE.findall(match.group("values"))
+        for value in values:
+            reference = f"{kind} {value}"
+            if reference not in references:
+                references.append(reference)
+    return references
 
 
 def _reference_label(text: str) -> str | None:
@@ -1386,6 +1536,933 @@ def _pdf_text_regions(page: fitz.Page) -> list[dict[str, Any]]:
     return regions
 
 
+_FRONT_AFFILIATION = re.compile(
+    r"\b(?:berkeley|college|corporation|department|facebook|google|institute|laborator(?:y|ies)|"
+    r"microsoft|research|runway|school|university)\b",
+    re.IGNORECASE,
+)
+_FRONT_EMAIL = re.compile(r"\S+@\S+")
+
+
+def _front_line_role(text: str) -> str:
+    if "{" in text or "}" in text or re.search(r"\bhttps?://|\bwww\.", text):
+        return "metadata"
+    email = _FRONT_EMAIL.search(text)
+    if email is not None:
+        prefix = text[: email.start()].strip(" ,;:({")
+        name_tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿŁł'’\-]+", prefix)
+        if len(name_tokens) >= 2 and not text.lstrip().startswith("{"):
+            return "author"
+        return "metadata"
+    if _FRONT_AFFILIATION.search(text):
+        return "affiliation"
+    if re.match(r"^\s*\(?version\b", text, re.IGNORECASE):
+        return "metadata"
+    return "author"
+
+
+def _front_lines_in_reading_order(
+    lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[list[dict[str, Any]]] = []
+    for line in sorted(
+        lines,
+        key=lambda value: (
+            (float(value["bboxNormalized"][1]) + float(value["bboxNormalized"][3]))
+            / 2,
+            float(value["bboxNormalized"][0]),
+        ),
+    ):
+        center = (
+            float(line["bboxNormalized"][1]) + float(line["bboxNormalized"][3])
+        ) / 2
+        matching = next(
+            (
+                row
+                for row in rows
+                if abs(
+                    center
+                    - sum(
+                        (
+                            float(value["bboxNormalized"][1])
+                            + float(value["bboxNormalized"][3])
+                        )
+                        / 2
+                        for value in row
+                    )
+                    / len(row)
+                )
+                <= 0.006
+            ),
+            None,
+        )
+        if matching is None:
+            rows.append([line])
+        else:
+            matching.append(line)
+    ordered: list[dict[str, Any]] = []
+    for row in rows:
+        ordered.extend(
+            sorted(row, key=lambda value: float(value["bboxNormalized"][0]))
+        )
+    return ordered
+
+
+def _recover_page_one_front_matter(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+    pdf_lines: list[dict[str, Any]],
+) -> int:
+    """Rebuild the title-to-abstract band in source-PDF row order."""
+
+    evidence_page = next(
+        (page for page in evidence.get("pages", []) if page.get("pageNumber") == 1),
+        None,
+    )
+    structure_page = next(
+        (page for page in structure.get("pages", []) if page.get("pageNumber") == 1),
+        None,
+    )
+    if evidence_page is None or structure_page is None:
+        return 0
+    blocks = {
+        str(block.get("blockId")): block for block in evidence_page.get("blocks", [])
+    }
+    all_blocks = {
+        str(block.get("blockId")): block
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    }
+    assignments = list(structure_page.get("blockAssignments", []))
+    title_assignments = [
+        assignment
+        for assignment in assignments
+        if not assignment.get("hidden")
+        and assignment.get("role") == "title"
+        and str(assignment.get("blockId")) in blocks
+    ]
+    if not title_assignments:
+        return 0
+    title_bottom = max(
+        float(blocks[str(assignment["blockId"])]["bboxNormalized"][3])
+        for assignment in title_assignments
+    )
+    boundary_candidates: list[tuple[float, dict[str, Any]]] = []
+    for assignment in assignments:
+        block = blocks.get(str(assignment.get("blockId")))
+        if (
+            block is None
+            or assignment.get("hidden")
+            or assignment.get("role") != "heading"
+        ):
+            continue
+        text = re.sub(r"\s+", " ", str(block.get("text", ""))).strip().lower()
+        text = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", text)
+        top = float(block["bboxNormalized"][1])
+        if top > title_bottom and text.rstrip(":") in {"abstract", "introduction"}:
+            boundary_candidates.append((top, assignment))
+    if not boundary_candidates:
+        return 0
+    boundary_top = min(value[0] for value in boundary_candidates)
+    candidate_lines = []
+    seen_lines: set[tuple[str, tuple[float, ...]]] = set()
+    for line in pdf_lines:
+        text = _normalize_extracted_text(
+            re.sub(r"\s+", " ", str(line.get("text", ""))).strip()
+        )
+        bbox = [float(value) for value in line.get("bboxNormalized", [])]
+        if (
+            not text
+            or len(bbox) != 4
+            or float(line.get("fontSizeMax", 0)) < 7.0
+            or bbox[1] < title_bottom - 0.002
+            or bbox[3] > boundary_top + 0.002
+        ):
+            continue
+        key = (text, tuple(round(value, 5) for value in bbox))
+        if key in seen_lines:
+            continue
+        seen_lines.add(key)
+        candidate_lines.append({**line, "text": text, "bboxNormalized": bbox})
+    ordered_lines = _front_lines_in_reading_order(candidate_lines)
+    if not ordered_lines or not any(
+        _front_line_role(line["text"]) == "author" for line in ordered_lines
+    ):
+        return 0
+
+    candidate_ids: set[str] = set()
+    allowed_roles = {
+        "affiliation",
+        "author",
+        "footnote",
+        "list_item",
+        "metadata",
+        "paragraph",
+    }
+    for assignment in assignments:
+        block_id = str(assignment.get("blockId"))
+        block = blocks.get(block_id)
+        if block is None or assignment.get("role") not in allowed_roles:
+            continue
+        bbox = [float(value) for value in block.get("bboxNormalized", [])]
+        if len(bbox) != 4:
+            continue
+        center = (bbox[1] + bbox[3]) / 2
+        if title_bottom - 0.002 <= center <= boundary_top + 0.002:
+            candidate_ids.add(block_id)
+            assignment["role"] = "noise"
+            assignment["paragraphId"] = None
+            assignment["continuesFrom"] = None
+            assignment["hidden"] = True
+            assignment.setdefault("warnings", []).append(
+                "A Docling column-ordered front-matter block was replaced by source-PDF row geometry."
+            )
+    all_assignments_by_id = {
+        str(assignment["blockId"]): assignment
+        for page in structure.get("pages", [])
+        for assignment in page.get("blockAssignments", [])
+    }
+    for page in structure.get("pages", []):
+        for visual in page.get("visualObjects", []):
+            if str(visual.get("insertAfterBlockId") or "") not in candidate_ids:
+                continue
+            caption_anchor = next(
+                (
+                    str(block_id)
+                    for block_id in reversed(visual.get("captionBlockIds", []))
+                    if str(block_id) in all_assignments_by_id
+                    and not all_assignments_by_id[str(block_id)].get("hidden")
+                ),
+                None,
+            )
+            if caption_anchor is not None:
+                visual["insertAfterBlockId"] = caption_anchor
+                visual.setdefault("warnings", []).append(
+                    "A visual anchored to misordered front matter was reanchored to its exact caption."
+                )
+    ordered_assignments = [
+        assignment
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    for position, assignment in enumerate(ordered_assignments):
+        if str(assignment.get("continuesFrom") or "") not in candidate_ids:
+            continue
+        text = str(all_blocks.get(str(assignment.get("blockId")), {}).get("text", "")).lstrip()
+        previous = None
+        if text[:1].islower() or text[:1] in ",.;:)]}":
+            previous = next(
+                (
+                    value
+                    for value in reversed(ordered_assignments[:position])
+                    if not value.get("hidden")
+                    and str(value.get("blockId")) not in candidate_ids
+                    and value.get("role") == assignment.get("role")
+                    and value.get("sectionId") == assignment.get("sectionId")
+                    and value.get("paragraphId")
+                ),
+                None,
+            )
+        if previous is not None:
+            assignment["paragraphId"] = previous["paragraphId"]
+            assignment["continuesFrom"] = previous["blockId"]
+            warning = (
+                "A lowercase body tail falsely attached to page-one front matter "
+                "was rejoined to the latest visible paragraph in its section."
+            )
+        else:
+            assignment["paragraphId"] = f"para-{assignment['blockId']}"
+            assignment["continuesFrom"] = None
+            warning = "A false body continuation from page-one front matter was severed."
+        assignment.setdefault("warnings", []).append(warning)
+
+    width = float(evidence_page.get("widthPdf", 1))
+    height = float(evidence_page.get("heightPdf", 1))
+    synthetic_blocks: list[dict[str, Any]] = []
+    synthetic_assignments: list[dict[str, Any]] = []
+    for index, line in enumerate(ordered_lines, start=1):
+        block_id = f"pdf-front-{index:03d}"
+        bbox = line["bboxNormalized"]
+        role = _front_line_role(line["text"])
+        synthetic_blocks.append(
+            {
+                "blockId": block_id,
+                "sourceBlockId": block_id,
+                "text": line["text"],
+                "bboxPdf": [
+                    round(bbox[0] * width, 2),
+                    round(bbox[1] * height, 2),
+                    round(bbox[2] * width, 2),
+                    round(bbox[3] * height, 2),
+                ],
+                "bboxNormalized": [round(value, 5) for value in bbox],
+                "lineCount": 1,
+                "fontSizeMin": float(line.get("fontSizeMax", 0)),
+                "fontSizeMax": float(line.get("fontSizeMax", 0)),
+                "fonts": [],
+                "bold": float(line.get("boldRatio", 0)) >= 0.5,
+                "italic": False,
+                "mathCharacterRatio": float(line.get("mathRatio", 0)),
+                "embeddedVisualOwnerRefs": [],
+                "suppressedVisualText": False,
+                "visualCaptionCandidate": False,
+                "associatedVisualCaption": False,
+            }
+        )
+        synthetic_assignments.append(
+            {
+                "blockId": block_id,
+                "role": role,
+                "readingOrder": 0,
+                "sectionId": None,
+                "paragraphId": None,
+                "continuesFrom": None,
+                "hidden": False,
+                "citations": [],
+                "objectReferences": [],
+                "referenceLabel": None,
+                "suppressedVisualText": False,
+                "visualCaptionCandidate": False,
+                "associatedVisualCaption": False,
+                "confidence": 1.0,
+                "warnings": [
+                    "Front matter was reconstructed in row-major order from exact source-PDF text geometry."
+                ],
+            }
+        )
+
+    title_position = max(
+        index
+        for index, assignment in enumerate(assignments)
+        if assignment in title_assignments
+    )
+    assignments[title_position + 1 : title_position + 1] = synthetic_assignments
+    for reading_order, assignment in enumerate(assignments, start=1):
+        assignment["readingOrder"] = reading_order
+    evidence_page["blocks"].extend(synthetic_blocks)
+    structure_page["blockAssignments"] = assignments
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics["reconstructedFrontMatterBlocks"] = len(synthetic_assignments)
+    return len(synthetic_assignments)
+
+
+def _recover_page_one_front_matter_from_pdf(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> int:
+    try:
+        with fitz.open(source) as pdf:
+            if pdf.page_count < 1:
+                return 0
+            lines = [
+                line
+                for region in _pdf_text_regions(pdf[0])
+                for line in region.get("lines", [])
+            ]
+    except (OSError, RuntimeError, ValueError):
+        return 0
+    return _recover_page_one_front_matter(evidence, structure, lines)
+
+
+_EXTRACTED_URL_START = re.compile(
+    r"\bhttps?\s*:\s*/\s*/", re.IGNORECASE
+)
+
+
+def _pdf_url_alignment_span(
+    text: str, start: int, uri: str
+) -> dict[str, Any] | None:
+    """Align a printed PDF URL with its annotation, ignoring PDF spacing.
+
+    PDF text extraction commonly inserts spaces around punctuation or at a
+    column boundary.  Comparing only ASCII alphanumerics lets the annotation
+    supply the canonical punctuation without consuming the prose that follows
+    the printed URL.
+    """
+
+    expected = re.sub(r"[^a-z0-9]", "", uri.casefold())
+    if not expected or not 0 <= start < len(text):
+        return None
+    cursor = start
+    matched = 0
+    last_match_end = start
+    while cursor < len(text) and matched < len(expected):
+        character = text[cursor]
+        if character.isascii() and character.isalnum():
+            if character.casefold() != expected[matched]:
+                break
+            matched += 1
+            last_match_end = cursor + 1
+        cursor += 1
+    complete = matched == len(expected)
+    end = last_match_end
+    if complete and uri.rstrip().endswith("/"):
+        trailing_slash = re.match(r"\s*/", text[end:])
+        if trailing_slash is not None:
+            end += trailing_slash.end()
+    elif not complete:
+        # Retain only URL-like continuation punctuation.  A following full
+        # stop/comma belongs to prose and must not be swallowed by repair.
+        continuation = re.match(r"[\s\-_/]*", text[end:])
+        if continuation is not None:
+            end += continuation.end()
+        end = len(text[:end].rstrip())
+    ratio = matched / max(1, len(expected))
+    candidate = text[start:end]
+    literal_prefix = _normalize_spaced_urls(candidate).casefold()
+    accepted_prefix = (
+        literal_prefix.endswith(("-", "_", "/"))
+        and uri.casefold().startswith(literal_prefix)
+    )
+    return {
+        "start": start,
+        "end": end,
+        "complete": complete,
+        "ratio": ratio,
+        "accepted": complete or ratio >= 0.55 or accepted_prefix,
+        "printed": candidate,
+    }
+
+
+def _normalize_url_text_with_annotations(
+    text: str, uris: list[str]
+) -> str:
+    """Canonicalize URL-like spans in derived text such as caption overrides."""
+
+    value = _normalize_displaced_pdf_diacritics(text)
+    for match in reversed(list(_EXTRACTED_URL_START.finditer(value))):
+        ranked: list[tuple[tuple[int, float, int], str, dict[str, Any]]] = []
+        for uri in dict.fromkeys(uris):
+            alignment = _pdf_url_alignment_span(value, match.start(), uri)
+            if alignment is None or not alignment["accepted"]:
+                continue
+            ranked.append(
+                (
+                    (
+                        int(bool(alignment["complete"])),
+                        float(alignment["ratio"]),
+                        int(alignment["end"]),
+                    ),
+                    uri,
+                    alignment,
+                )
+            )
+        if not ranked:
+            continue
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        score, uri, alignment = ranked[0]
+        if (
+            not alignment["complete"]
+            and any(item[0] == score and item[1] != uri for item in ranked[1:])
+        ):
+            continue
+        value = value[: match.start()] + uri + value[int(alignment["end"]) :]
+    return _normalize_unannotated_printed_urls(value)
+
+
+def _recover_pdf_link_annotations(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Restore printed URLs from canonical PDF link annotations."""
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics.setdefault("recoveredExternalLinks", [])
+    diagnostics.setdefault("unrecoveredPrintedUrlLinks", [])
+    try:
+        pdf = fitz.open(source)
+    except Exception:
+        return []
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    structure_pages = {
+        int(page["pageNumber"]): page for page in structure.get("pages", [])
+    }
+    recovered: list[dict[str, str]] = []
+    unresolved: list[dict[str, str]] = []
+    try:
+        for page_number in sorted(evidence_pages):
+            if not 1 <= page_number <= len(pdf):
+                continue
+            pdf_page = pdf[page_number - 1]
+            uri_rects: dict[str, list[list[float]]] = {}
+            for link in pdf_page.get_links():
+                uri = str(link.get("uri") or "").strip()
+                rect = link.get("from")
+                if (
+                    not uri.lower().startswith(("http://", "https://"))
+                    or rect is None
+                ):
+                    continue
+                uri_rects.setdefault(uri, []).append(
+                    _normalized_pdf_rect(fitz.Rect(rect), pdf_page)
+                )
+            if not uri_rects:
+                continue
+            assignments = {
+                str(assignment["blockId"]): assignment
+                for assignment in structure_pages.get(page_number, {}).get(
+                    "blockAssignments", []
+                )
+            }
+            records: list[dict[str, Any]] = []
+            for evidence_index, block in enumerate(
+                evidence_pages[page_number].get("blocks", [])
+            ):
+                block_id = str(block["blockId"])
+                assignment = assignments.get(block_id)
+                if assignment is None or assignment.get("hidden"):
+                    continue
+                bbox = [
+                    float(value) for value in block.get("bboxNormalized", [])
+                ]
+                if len(bbox) != 4:
+                    continue
+                text = _normalize_extracted_text(str(block.get("text", "")))
+                block["text"] = text
+                overlapping_uris: list[str] = []
+                for uri, rects in uri_rects.items():
+                    if any(
+                        _rectangle_intersection_area(bbox, rect)
+                        / max(
+                            1e-9,
+                            (rect[2] - rect[0]) * (rect[3] - rect[1]),
+                        )
+                        >= 0.25
+                        for rect in rects
+                    ):
+                        overlapping_uris.append(uri)
+                records.append(
+                    {
+                        "block": block,
+                        "blockId": block_id,
+                        "assignment": assignment,
+                        "bbox": bbox,
+                        "uris": list(dict.fromkeys(overlapping_uris)),
+                        "evidenceIndex": evidence_index,
+                    }
+                )
+            records.sort(
+                key=lambda value: (
+                    int(value["assignment"].get("readingOrder", 10**9)),
+                    int(value["evidenceIndex"]),
+                )
+            )
+            for record_index, record in enumerate(records):
+                block = record["block"]
+                assignment = record["assignment"]
+                if assignment.get("hidden"):
+                    continue
+                text = str(block.get("text", ""))
+                matches = list(_EXTRACTED_URL_START.finditer(text))
+                if not matches:
+                    continue
+                if not record["uris"]:
+                    block["text"] = _normalize_unannotated_printed_urls(text)
+                    continue
+                links = list(block.get("externalLinks", []))
+                for match in reversed(matches):
+                    start = match.start()
+                    ranked: list[dict[str, Any]] = []
+                    for uri in record["uris"]:
+                        stream = text[start:]
+                        segments = [
+                            {
+                                "recordIndex": record_index,
+                                "streamStart": 0,
+                                "length": len(stream),
+                                "localStart": start,
+                            }
+                        ]
+                        for continuation_index in range(
+                            record_index + 1, len(records)
+                        ):
+                            continuation = records[continuation_index]
+                            if continuation["assignment"].get("hidden"):
+                                continue
+                            if uri not in continuation["uris"]:
+                                break
+                            continuation_text = str(
+                                continuation["block"].get("text", "")
+                            )
+                            stream += " "
+                            stream_start = len(stream)
+                            stream += continuation_text
+                            segments.append(
+                                {
+                                    "recordIndex": continuation_index,
+                                    "streamStart": stream_start,
+                                    "length": len(continuation_text),
+                                    "localStart": 0,
+                                }
+                            )
+                        alignment = _pdf_url_alignment_span(stream, 0, uri)
+                        if alignment is None or not alignment["accepted"]:
+                            continue
+                        ranked.append(
+                            {
+                                "uri": uri,
+                                "alignment": alignment,
+                                "segments": segments,
+                                "score": (
+                                    int(bool(alignment["complete"])),
+                                    float(alignment["ratio"]),
+                                    int(alignment["end"]),
+                                ),
+                            }
+                        )
+                    if not ranked:
+                        unresolved.append(
+                            {
+                                "blockId": str(record["blockId"]),
+                                "pageNumber": str(page_number),
+                                "printedUrl": text[start : start + 200],
+                            }
+                        )
+                        continue
+                    ranked.sort(key=lambda value: value["score"], reverse=True)
+                    best = ranked[0]
+                    tied = [
+                        value
+                        for value in ranked
+                        if value["score"] == best["score"]
+                        and value["uri"] != best["uri"]
+                    ]
+                    if tied and not best["alignment"]["complete"]:
+                        unresolved.append(
+                            {
+                                "blockId": str(record["blockId"]),
+                                "pageNumber": str(page_number),
+                                "printedUrl": text[start : start + 200],
+                            }
+                        )
+                        continue
+                    uri = str(best["uri"])
+                    alignment = best["alignment"]
+                    end = int(alignment["end"])
+                    final_segment = best["segments"][0]
+                    for segment in best["segments"]:
+                        segment_end = int(segment["streamStart"]) + int(
+                            segment["length"]
+                        )
+                        if end <= segment_end:
+                            final_segment = segment
+                            break
+                    final_record_index = int(final_segment["recordIndex"])
+                    merged_block_ids: list[str] = []
+                    if final_record_index == record_index:
+                        text = text[:start] + uri + text[start + end :]
+                    else:
+                        final_record = records[final_record_index]
+                        local_end = max(
+                            0, end - int(final_segment["streamStart"])
+                        )
+                        suffix = str(final_record["block"].get("text", ""))[
+                            local_end:
+                        ]
+                        suffix = re.sub(r"^\s+([,.;:)])", r"\1", suffix)
+                        text = text[:start] + uri
+                        paragraph_id = assignment.get("paragraphId") or (
+                            f"para-{record['blockId']}"
+                        )
+                        assignment["paragraphId"] = paragraph_id
+                        for merged_index in range(
+                            record_index + 1, final_record_index + 1
+                        ):
+                            merged_record = records[merged_index]
+                            is_final_suffix = (
+                                merged_index == final_record_index
+                                and bool(suffix.strip())
+                            )
+                            if is_final_suffix:
+                                merged_record["block"]["text"] = suffix
+                                merged_assignment = merged_record["assignment"]
+                                for field in (
+                                    "role",
+                                    "sectionId",
+                                    "referenceLabel",
+                                ):
+                                    merged_assignment[field] = assignment.get(field)
+                                merged_assignment["paragraphId"] = paragraph_id
+                                merged_assignment["continuesFrom"] = str(
+                                    record["blockId"]
+                                )
+                                merged_assignment["hidden"] = False
+                                merged_assignment.setdefault("warnings", []).append(
+                                    "URL suffix remains in its source block and "
+                                    "continues the annotation-backed URL block."
+                                )
+                            else:
+                                merged_record["block"]["text"] = ""
+                                merged_record["assignment"]["hidden"] = True
+                                merged_record["assignment"].setdefault(
+                                    "warnings", []
+                                ).append(
+                                    "URL continuation was consolidated into the "
+                                    "preceding source block from PDF link geometry."
+                                )
+                                assignment.setdefault(
+                                    "mergedSourceBlockIds", []
+                                ).append(str(merged_record["blockId"]))
+                            merged_block_ids.append(
+                                str(merged_record["blockId"])
+                            )
+                    links.append(uri)
+                    recovered.append(
+                        {
+                            "blockId": str(record["blockId"]),
+                            "pageNumber": str(page_number),
+                            "original": str(alignment["printed"]),
+                            "uri": uri,
+                            "similarity": f"{float(alignment['ratio']):.3f}",
+                            "mergedBlockIds": merged_block_ids,
+                        }
+                    )
+                block["text"] = text
+                if links:
+                    unique_links = list(dict.fromkeys(str(value) for value in links))
+                    block["externalLinks"] = unique_links
+                    assignment["externalLinks"] = unique_links
+    finally:
+        pdf.close()
+    diagnostics["recoveredExternalLinks"] = recovered
+    diagnostics["unrecoveredPrintedUrlLinks"] = unresolved
+    return recovered
+
+
+def _restore_lexical_linebreak_hyphens_from_pdf(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Restore compounds whose hyphen is lexical elsewhere in the same PDF."""
+
+    try:
+        pdf = fitz.open(source)
+    except Exception:
+        return []
+    canonical_terms: dict[str, str] = {}
+    break_candidates: list[dict[str, Any]] = []
+    try:
+        for page_number in range(1, len(pdf) + 1):
+            regions = _pdf_text_regions(pdf[page_number - 1])
+            for region in regions:
+                lines = region.get("lines", [])
+                for line in lines:
+                    for term in re.findall(
+                        r"(?<![\w-])([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)(?![\w-])",
+                        str(line.get("text", "")),
+                    ):
+                        parts = term.split("-")
+                        for left_part, right_part in zip(parts, parts[1:]):
+                            pair = f"{left_part}-{right_part}"
+                            canonical_terms.setdefault(pair.casefold(), pair)
+                for left, right in zip(lines, lines[1:]):
+                    left_match = re.search(
+                        r"([A-Za-z0-9]+)-\s*$", str(left.get("text", ""))
+                    )
+                    right_match = re.match(
+                        r"\s*([A-Za-z0-9]+)\b", str(right.get("text", ""))
+                    )
+                    if left_match is not None and right_match is not None:
+                        break_candidates.append(
+                            {
+                                "pageNumber": page_number,
+                                "left": left_match.group(1),
+                                "right": right_match.group(1),
+                                "bboxNormalized": [
+                                    min(
+                                        float(left["bboxNormalized"][0]),
+                                        float(right["bboxNormalized"][0]),
+                                    ),
+                                    min(
+                                        float(left["bboxNormalized"][1]),
+                                        float(right["bboxNormalized"][1]),
+                                    ),
+                                    max(
+                                        float(left["bboxNormalized"][2]),
+                                        float(right["bboxNormalized"][2]),
+                                    ),
+                                    max(
+                                        float(left["bboxNormalized"][3]),
+                                        float(right["bboxNormalized"][3]),
+                                    ),
+                                ],
+                            }
+                        )
+    finally:
+        pdf.close()
+    recoverable: list[dict[str, Any]] = []
+    for candidate in break_candidates:
+        left = str(candidate["left"])
+        right = str(candidate["right"])
+        canonical = canonical_terms.get(f"{left}-{right}".casefold())
+        if canonical is not None:
+            recoverable.append(
+                {
+                    **candidate,
+                    "collapsed": left + right,
+                    "canonical": canonical,
+                }
+            )
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    if not recoverable:
+        diagnostics["restoredLexicalLinebreakHyphens"] = []
+        diagnostics["ambiguousLexicalLinebreakHyphens"] = []
+        return []
+    assignments = {
+        str(assignment["blockId"]): assignment
+        for page in structure.get("pages", [])
+        for assignment in page.get("blockAssignments", [])
+    }
+    repaired: list[dict[str, str]] = []
+    ambiguous: list[dict[str, str]] = []
+    for page in evidence.get("pages", []):
+        page_number = int(page["pageNumber"])
+        for block in page.get("blocks", []):
+            block_id = str(block["blockId"])
+            assignment = assignments.get(block_id)
+            if assignment is None or assignment.get("hidden"):
+                continue
+            block_bbox = [
+                float(value) for value in block.get("bboxNormalized", [])
+            ]
+            if len(block_bbox) != 4:
+                continue
+            text = str(block.get("text", ""))
+            grouped: dict[tuple[str, str], int] = {}
+            for candidate in recoverable:
+                if int(candidate["pageNumber"]) != page_number:
+                    continue
+                candidate_bbox = [
+                    float(value) for value in candidate["bboxNormalized"]
+                ]
+                candidate_area = max(
+                    1e-9,
+                    (candidate_bbox[2] - candidate_bbox[0])
+                    * (candidate_bbox[3] - candidate_bbox[1]),
+                )
+                if (
+                    _rectangle_intersection_area(block_bbox, candidate_bbox)
+                    / candidate_area
+                    < 0.5
+                ):
+                    continue
+                key = (str(candidate["collapsed"]), str(candidate["canonical"]))
+                grouped[key] = grouped.get(key, 0) + 1
+            for (collapsed, canonical), expected_count in sorted(
+                grouped.items(), key=lambda value: len(value[0][0]), reverse=True
+            ):
+                canonical_parts = canonical.split("-", 1)
+                spaced_hyphen = (
+                    rf"{re.escape(canonical_parts[0])}-\s+"
+                    rf"{re.escape(canonical_parts[1])}"
+                    if len(canonical_parts) == 2
+                    else r"(?!)"
+                )
+                pattern = re.compile(
+                    rf"(?<!\w)(?:{re.escape(collapsed)}|{spaced_hyphen})(?!\w)",
+                    re.IGNORECASE,
+                )
+                actual_count = len(pattern.findall(text))
+                if actual_count == 0:
+                    continue
+                if actual_count != expected_count:
+                    ambiguous.append(
+                        {
+                            "blockId": block_id,
+                            "collapsed": collapsed,
+                            "canonical": canonical,
+                        }
+                    )
+                    continue
+
+                def restore_case(match: re.Match[str]) -> str:
+                    matched = match.group(0)
+                    if matched.islower():
+                        return canonical.lower()
+                    if matched.isupper():
+                        return canonical.upper()
+                    return canonical
+
+                text = pattern.sub(restore_case, text)
+                repaired.append(
+                    {
+                        "blockId": block_id,
+                        "collapsed": collapsed,
+                        "canonical": canonical,
+                    }
+                )
+            block["text"] = text
+    blocks_by_id = {
+        str(block["blockId"]): block
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    }
+    assignments_by_id = {
+        str(assignment["blockId"]): assignment
+        for page in structure.get("pages", [])
+        for assignment in page.get("blockAssignments", [])
+    }
+    for page in structure.get("pages", []):
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value.get("readingOrder", 0)),
+        ):
+            if assignment.get("hidden") or not assignment.get("continuesFrom"):
+                continue
+            block_id = str(assignment["blockId"])
+            previous_id = str(assignment["continuesFrom"])
+            previous_assignment = assignments_by_id.get(previous_id)
+            block = blocks_by_id.get(block_id)
+            previous_block = blocks_by_id.get(previous_id)
+            if (
+                previous_assignment is None
+                or block is None
+                or previous_block is None
+                or previous_assignment.get("hidden")
+                or assignment.get("paragraphId")
+                != previous_assignment.get("paragraphId")
+            ):
+                continue
+            left_text = str(previous_block.get("text", ""))
+            right_text = str(block.get("text", ""))
+            left_match = re.search(r"([A-Za-z0-9]+)-\s*$", left_text)
+            right_match = re.match(r"\s*([A-Za-z0-9]+)\b", right_text)
+            if left_match is None or right_match is None:
+                continue
+            canonical = canonical_terms.get(
+                f"{left_match.group(1)}-{right_match.group(1)}".casefold()
+            )
+            if canonical is None:
+                continue
+            previous_block["text"] = left_text[: left_match.start()].rstrip()
+            block["text"] = (
+                canonical + right_text[right_match.end() :]
+            )
+            repaired.append(
+                {
+                    "blockId": block_id,
+                    "collapsed": (
+                        left_match.group(1) + right_match.group(1)
+                    ),
+                    "canonical": canonical,
+                    "boundaryFromBlockId": previous_id,
+                }
+            )
+    diagnostics["restoredLexicalLinebreakHyphens"] = repaired
+    diagnostics["ambiguousLexicalLinebreakHyphens"] = ambiguous
+    return repaired
+
+
 def _best_pdf_text_region(
     block: dict[str, Any], regions: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -1896,6 +2973,806 @@ def _suppress_blank_docling_headings(
         )
         if warning not in structure.setdefault("warnings", []):
             structure["warnings"].append(warning)
+
+
+def _demote_mislabeled_docling_headings(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[str]:
+    """Return unmistakable inline labels that Docling promoted into the TOC."""
+
+    blocks = {
+        str(block["blockId"]): block
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    }
+    assignments = [
+        assignment
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    assignment_positions = {
+        str(assignment["blockId"]): index
+        for index, assignment in enumerate(assignments)
+    }
+    sections = list(structure.get("sections", []))
+    section_by_title = {
+        str(section.get("titleBlockId")): section for section in sections
+    }
+    demotions: dict[str, tuple[str, str]] = {}
+    plate_label = re.compile(
+        r"^(?:nearest\s+neighbors|random\s+(?:class\s+conditional\s+)?samples?\b|"
+        r"layout-to-image\s+synthesis\b|semantic\s+synthesis\b|"
+        r"text-to-image\s+synthesis\b)",
+        re.IGNORECASE,
+    )
+    visual_owners_by_block: dict[str, list[str]] = {}
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    for page in structure.get("pages", []):
+        page_number = int(page["pageNumber"])
+        page_blocks = {
+            str(block["blockId"]): block
+            for block in evidence_pages.get(page_number, {}).get("blocks", [])
+        }
+        for assignment in page.get("blockAssignments", []):
+            if assignment.get("role") != "heading" or assignment.get("hidden"):
+                continue
+            block_id = str(assignment["blockId"])
+            block_bbox = [
+                float(value)
+                for value in page_blocks.get(block_id, {}).get("bboxNormalized", [])
+            ]
+            if len(block_bbox) != 4:
+                continue
+            area = max(
+                1e-9,
+                (block_bbox[2] - block_bbox[0])
+                * (block_bbox[3] - block_bbox[1]),
+            )
+            owners = [
+                str(visual["objectId"])
+                for visual in page.get("visualObjects", [])
+                if visual.get("objectId")
+                and _rectangle_intersection_area(
+                    block_bbox,
+                    [float(value) for value in visual.get("bboxNormalized", [])],
+                )
+                / area
+                >= 0.5
+            ]
+            if owners:
+                visual_owners_by_block[block_id] = owners
+    for assignment in assignments:
+        block_id = str(assignment.get("blockId"))
+        block = blocks.get(block_id)
+        section = section_by_title.get(block_id)
+        if (
+            block is None
+            or section is None
+            or assignment.get("hidden")
+            or assignment.get("role") != "heading"
+        ):
+            continue
+        text = re.sub(r"\s+", " ", str(block.get("text", ""))).strip()
+        if not text or _NUMBERED_HEADING.match(text) or _APPENDIX_HEADING.match(text):
+            continue
+        normalized = text.rstrip(":").casefold()
+        if normalized in {
+            "abstract",
+            "acknowledgment",
+            "acknowledgments",
+            "acknowledgement",
+            "acknowledgements",
+            "bibliography",
+            "conclusion",
+            "conclusions",
+            "introduction",
+            "references",
+        }:
+            continue
+        level = int(section.get("level", 1))
+        role: str | None = None
+        reason = ""
+        if re.match(r"^\s*\[\d+\]\s+\S", text):
+            role = "reference"
+            reason = "reference entry"
+        elif re.match(r"^\s*[•·▪◦‣]\s*\S", text):
+            role = "list_item"
+            reason = "bullet item"
+        elif level >= 4 and re.fullmatch(
+            r"\s*\[(?!\d+\]$)[^\]]+\]\s*", text
+        ):
+            role = "paragraph"
+            reason = "bracketed inline label"
+        elif (
+            level >= 4
+            and
+            len(text) >= 2
+            and text[0] in "'\"‘“"
+            and text[-1] in "'\"’”"
+        ):
+            role = "paragraph"
+            reason = "quoted prompt"
+        elif level >= 4 and plate_label.match(text):
+            role = "paragraph"
+            reason = "qualitative plate label"
+        if role is not None:
+            if role == "paragraph" and block_id in visual_owners_by_block:
+                role = "noise"
+                reason = "figure-internal label"
+            demotions[block_id] = (role, reason)
+    if not demotions:
+        structure.setdefault("doclingDiagnostics", {}).setdefault(
+            "demotedMislabeledHeadingBlockIds", []
+        )
+        return []
+
+    removed_sections = {
+        str(section["sectionId"]): section
+        for section in sections
+        if str(section.get("titleBlockId")) in demotions
+    }
+    removed_ids = set(removed_sections)
+    fallback_by_section: dict[str, str | None] = {}
+    for section_id, section in removed_sections.items():
+        parent = section.get("parentSectionId")
+        fallback = str(parent) if parent else None
+        if fallback is None or fallback in removed_ids:
+            title_id = str(section.get("titleBlockId"))
+            position = assignment_positions.get(title_id, 0)
+            previous = next(
+                (
+                    value
+                    for value in reversed(assignments[:position])
+                    if not value.get("hidden")
+                    and value.get("sectionId")
+                    and str(value.get("sectionId")) not in removed_ids
+                ),
+                None,
+            )
+            fallback = (
+                str(previous["sectionId"]) if previous is not None else None
+            )
+        fallback_by_section[section_id] = fallback
+
+    def surviving_parent(section_id: str | None) -> str | None:
+        seen: set[str] = set()
+        while section_id and section_id in removed_sections and section_id not in seen:
+            seen.add(section_id)
+            parent = removed_sections[section_id].get("parentSectionId")
+            section_id = (
+                str(parent) if parent else fallback_by_section.get(section_id)
+            )
+        return section_id
+
+    for assignment in assignments:
+        section_id = assignment.get("sectionId")
+        if section_id and str(section_id) in removed_sections:
+            assignment["sectionId"] = surviving_parent(str(section_id))
+    for section in sections:
+        parent = section.get("parentSectionId")
+        if parent and str(parent) in removed_sections:
+            section["parentSectionId"] = surviving_parent(str(parent))
+    structure["sections"] = [
+        section
+        for section in sections
+        if str(section["sectionId"]) not in removed_sections
+    ]
+
+    for block_id, (role, reason) in demotions.items():
+        assignment = next(
+            value for value in assignments if str(value.get("blockId")) == block_id
+        )
+        block = blocks[block_id]
+        assignment["role"] = role
+        assignment["paragraphId"] = None if role == "noise" else (
+            f"reference-{block.get('sourceBlockId', block_id)}"
+            if role == "reference"
+            else f"para-{block_id}"
+        )
+        assignment["continuesFrom"] = None
+        if role == "noise":
+            owners = visual_owners_by_block[block_id]
+            assignment["hidden"] = True
+            assignment["suppressedVisualText"] = True
+            block["embeddedVisualOwnerRefs"] = owners
+            block["suppressedVisualText"] = True
+        assignment["referenceLabel"] = (
+            _reference_label(str(block.get("text", "")))
+            if role == "reference"
+            else None
+        )
+        assignment.setdefault("warnings", []).append(
+            f"A Docling section header was restored as a {reason}."
+        )
+
+    demoted_ids = sorted(demotions)
+    structure.setdefault("doclingDiagnostics", {})[
+        "demotedMislabeledHeadingBlockIds"
+    ] = demoted_ids
+    return demoted_ids
+
+
+def _repair_lowercase_body_continuations(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+    pdf_lines_by_page: dict[int, list[dict[str, Any]]] | None = None,
+) -> list[str]:
+    """Join a lowercase tail only across an incomplete same-section paragraph."""
+
+    block_entries = {
+        str(block["blockId"]): (int(page["pageNumber"]), block)
+        for page in evidence.get("pages", [])
+        for block in page.get("blocks", [])
+    }
+    ordered = [
+        (int(page["pageNumber"]), assignment)
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    repaired: list[str] = []
+    body_roles = {"abstract", "paragraph"}
+    terminal = re.compile(r"[.!?;:](?:['\"’”\])}]*)\s*$")
+    for position, (page_number, assignment) in enumerate(ordered):
+        block_id = str(assignment.get("blockId"))
+        block_entry = block_entries.get(block_id)
+        if (
+            block_entry is None
+            or assignment.get("hidden")
+            or assignment.get("role") not in body_roles
+            or not assignment.get("sectionId")
+            or any(
+                str(warning).startswith(
+                    "A Docling section header was restored as a "
+                )
+                for warning in assignment.get("warnings", [])
+            )
+        ):
+            continue
+        text = str(block_entry[1].get("text", "")).lstrip()
+        if not text[:1].islower() and text[:1] not in ",.;)]}":
+            continue
+        previous_entry = next(
+            (
+                (previous_page, previous)
+                for previous_page, previous in reversed(ordered[:position])
+                if not previous.get("hidden")
+                and previous.get("role") == assignment.get("role")
+                and previous.get("sectionId") == assignment.get("sectionId")
+                and previous.get("paragraphId")
+                and str(previous.get("blockId")) in block_entries
+            ),
+            None,
+        )
+        if previous_entry is None:
+            continue
+        previous_page, previous = previous_entry
+        previous_id = str(previous["blockId"])
+        previous_block = block_entries[previous_id][1]
+        previous_text = str(previous_block.get("text", "")).rstrip()
+        source_block_id = str(block_entry[1].get("sourceBlockId") or "")
+        previous_source_block_id = str(previous_block.get("sourceBlockId") or "")
+        if (
+            source_block_id
+            and source_block_id == previous_source_block_id
+            and assignment.get("paragraphId") == previous.get("paragraphId")
+            and assignment.get("continuesFrom") == previous_id
+        ):
+            # Character-span partitioning has already linked exact segments of
+            # one Docling item.  A single PDF line can overlap only part of
+            # such a segment, so treating that line as a replacement would
+            # silently discard the segment's remaining characters.
+            continue
+        if terminal.search(previous_text) or page_number - previous_page not in {0, 1}:
+            continue
+        previous_bbox = [
+            float(value) for value in previous_block.get("bboxNormalized", [])
+        ]
+        block_bbox = [float(value) for value in block_entry[1].get("bboxNormalized", [])]
+        if len(previous_bbox) != 4 or len(block_bbox) != 4:
+            continue
+        if page_number == previous_page:
+            same_column = abs(previous_bbox[0] - block_bbox[0]) <= 0.04
+            touches_previous = block_bbox[1] <= previous_bbox[3] + 0.025
+            if not same_column or not touches_previous:
+                continue
+        elif previous_bbox[3] < 0.72:
+            continue
+
+        candidate_block = block_entry[1]
+        original_candidate_text = str(candidate_block.get("text", ""))
+        original_previous_text = str(previous_block.get("text", ""))
+        original_paragraph_id = assignment.get("paragraphId")
+        original_continues_from = assignment.get("continuesFrom")
+        lines = (pdf_lines_by_page or {}).get(page_number, [])
+        exact_line = None
+        area = max(
+            1e-9,
+            (block_bbox[2] - block_bbox[0]) * (block_bbox[3] - block_bbox[1]),
+        )
+        ranked_lines = sorted(
+            (
+                (
+                    _rectangle_intersection_area(
+                        block_bbox,
+                        [float(value) for value in line.get("bboxNormalized", [])],
+                    )
+                    / area,
+                    line,
+                )
+                for line in lines
+                if len(line.get("bboxNormalized", [])) == 4
+                and str(line.get("text", "")).strip()
+            ),
+            key=lambda value: value[0],
+            reverse=True,
+        )
+        if ranked_lines and ranked_lines[0][0] >= 0.5:
+            best_line = ranked_lines[0][1]
+            line_bbox = [
+                float(value) for value in best_line.get("bboxNormalized", [])
+            ]
+            block_width = max(1e-9, block_bbox[2] - block_bbox[0])
+            horizontal_tolerance = max(0.012, block_width * 0.05)
+            horizontally_equivalent = (
+                len(line_bbox) == 4
+                and abs(line_bbox[0] - block_bbox[0]) <= horizontal_tolerance
+                and abs(line_bbox[2] - block_bbox[2]) <= horizontal_tolerance
+                and (line_bbox[2] - line_bbox[0]) <= block_width * 1.12
+            )
+            if horizontally_equivalent:
+                line_text = re.sub(
+                    r"\s+", " ", str(best_line.get("text", ""))
+                ).strip()
+                normalized_tail = re.sub(r"\s+", " ", text)
+                if SequenceMatcher(None, normalized_tail, line_text).ratio() >= 0.82:
+                    exact_line = line_text
+        if exact_line is not None:
+            candidate_block["text"] = exact_line
+            assignment["citations"] = _citations(exact_line)
+            assignment["objectReferences"] = _object_references(exact_line)
+            trailing_token = re.search(r"\b([A-Za-z0-9])\b\s*$", previous_text)
+            if (
+                trailing_token is not None
+                and re.search(
+                    rf"\b{re.escape(trailing_token.group(1))}\b", exact_line
+                )
+                and not re.search(
+                    rf"\b{re.escape(trailing_token.group(1))}\b", text
+                )
+            ):
+                previous_block["text"] = previous_text[: trailing_token.start()].rstrip()
+                previous["citations"] = _citations(previous_block["text"])
+                previous["objectReferences"] = _object_references(
+                    previous_block["text"]
+                )
+        assignment["paragraphId"] = previous["paragraphId"]
+        assignment["continuesFrom"] = previous_id
+        linkage_changed = (
+            original_paragraph_id != assignment.get("paragraphId")
+            or original_continues_from != assignment.get("continuesFrom")
+        )
+        text_changed = (
+            original_candidate_text != str(candidate_block.get("text", ""))
+            or original_previous_text != str(previous_block.get("text", ""))
+        )
+        if not linkage_changed and not text_changed:
+            continue
+        warnings = assignment.setdefault("warnings", [])
+        if linkage_changed:
+            warning = (
+                "A lowercase body tail separated by float traversal was "
+                "rejoined to its incomplete source paragraph."
+            )
+            if warning not in warnings:
+                warnings.append(warning)
+        if text_changed:
+            warning = (
+                "A lowercase body tail was restored from a horizontally "
+                "matching source-PDF line."
+            )
+            if warning not in warnings:
+                warnings.append(warning)
+        repaired.append(block_id)
+    structure.setdefault("doclingDiagnostics", {})[
+        "rejoinedLowercaseBodyBlockIds"
+    ] = sorted(repaired)
+    return sorted(repaired)
+
+
+def _repair_lowercase_body_continuations_from_pdf(
+    source: Path,
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[str]:
+    try:
+        with fitz.open(source) as pdf:
+            lines_by_page = {
+                page_number: [
+                    line
+                    for region in _pdf_text_regions(pdf[page_number - 1])
+                    for line in region.get("lines", [])
+                ]
+                for page_number in range(1, len(pdf) + 1)
+            }
+    except (OSError, RuntimeError, ValueError):
+        lines_by_page = {}
+    return _repair_lowercase_body_continuations(
+        evidence, structure, lines_by_page
+    )
+
+
+def _suppress_overlapping_equation_fragments(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[str]:
+    """Remove symbol-only overlays duplicated by a numbered equation stack."""
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    suppressed: list[str] = []
+    for page in structure.get("pages", []):
+        page_number = int(page["pageNumber"])
+        blocks = {
+            str(block["blockId"]): block
+            for block in evidence_pages.get(page_number, {}).get("blocks", [])
+        }
+        assignments = {
+            str(assignment["blockId"]): assignment
+            for assignment in page.get("blockAssignments", [])
+        }
+        equations = [
+            visual
+            for visual in page.get("visualObjects", [])
+            if visual.get("kind") == "equation"
+            and len(visual.get("bboxNormalized", [])) == 4
+        ]
+        duplicate_ids: set[str] = set()
+        for candidate in equations:
+            source_id = f"dl-{str(candidate.get('objectId', '')).removeprefix('equation-')}"
+            source_block = blocks.get(source_id)
+            if source_block is None:
+                continue
+            source_text = str(source_block.get("text", ""))
+            if (
+                len(re.findall(r"[A-Za-z0-9]", source_text)) > 3
+                or re.search(
+                    r"\(\s*\d+[A-Za-z]?\s*\)\s*$", source_text
+                )
+                is not None
+            ):
+                continue
+            candidate_bbox = [
+                float(value) for value in candidate["bboxNormalized"]
+            ]
+            overlaps = 0
+            for other in equations:
+                if other is candidate:
+                    continue
+                other_source_id = (
+                    f"dl-{str(other.get('objectId', '')).removeprefix('equation-')}"
+                )
+                other_text = str(blocks.get(other_source_id, {}).get("text", ""))
+                if re.search(r"\(\s*\d+[A-Za-z]?\s*\)\s*$", other_text) is None:
+                    continue
+                other_bbox = [float(value) for value in other["bboxNormalized"]]
+                horizontal_overlap = max(
+                    0.0,
+                    min(candidate_bbox[2], other_bbox[2])
+                    - max(candidate_bbox[0], other_bbox[0]),
+                )
+                vertical_overlap = max(
+                    0.0,
+                    min(candidate_bbox[3], other_bbox[3])
+                    - max(candidate_bbox[1], other_bbox[1]),
+                )
+                if (
+                    horizontal_overlap
+                    / max(
+                        1e-9,
+                        min(
+                            candidate_bbox[2] - candidate_bbox[0],
+                            other_bbox[2] - other_bbox[0],
+                        ),
+                    )
+                    >= 0.65
+                    and vertical_overlap
+                    / max(1e-9, other_bbox[3] - other_bbox[1])
+                    >= 0.55
+                ):
+                    overlaps += 1
+            if overlaps >= 2:
+                duplicate_ids.add(str(candidate["objectId"]))
+                assignment = assignments.get(source_id)
+                if assignment is not None:
+                    assignment["role"] = "noise"
+                    assignment["hidden"] = True
+                    assignment["paragraphId"] = None
+                    assignment["continuesFrom"] = None
+                    assignment["suppressedVisualText"] = True
+                    warning = (
+                        "A symbol-only equation overlay duplicated a numbered "
+                        "equation stack and was suppressed."
+                    )
+                    warnings = assignment.setdefault("warnings", [])
+                    if warning not in warnings:
+                        warnings.append(warning)
+                source_block["suppressedVisualText"] = True
+                suppressed.append(str(candidate["objectId"]))
+        if duplicate_ids:
+            page["visualObjects"] = [
+                visual
+                for visual in page.get("visualObjects", [])
+                if str(visual.get("objectId")) not in duplicate_ids
+            ]
+    structure.setdefault("doclingDiagnostics", {})[
+        "suppressedOverlappingEquationObjectIds"
+    ] = sorted(suppressed)
+    return sorted(suppressed)
+
+
+def _absorb_adjacent_equation_signs(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[str]:
+    """Expand an equation crop to include its immediately preceding sign."""
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    absorbed: list[str] = []
+    for page in structure.get("pages", []):
+        page_number = int(page["pageNumber"])
+        blocks = {
+            str(block["blockId"]): block
+            for block in evidence_pages.get(page_number, {}).get("blocks", [])
+        }
+        assignments = sorted(
+            page.get("blockAssignments", []),
+            key=lambda assignment: int(assignment.get("readingOrder", 0)),
+        )
+        assignment_positions = {
+            str(assignment["blockId"]): index
+            for index, assignment in enumerate(assignments)
+        }
+        assignment_by_id = {
+            str(assignment["blockId"]): assignment for assignment in assignments
+        }
+        for visual in page.get("visualObjects", []):
+            if visual.get("kind") != "equation":
+                continue
+            source_id = (
+                f"dl-{str(visual.get('objectId', '')).removeprefix('equation-')}"
+            )
+            source_position = assignment_positions.get(source_id)
+            if source_position is None or source_position == 0:
+                continue
+            sign_assignment = assignments[source_position - 1]
+            sign_id = str(sign_assignment["blockId"])
+            sign_block = blocks.get(sign_id)
+            if (
+                sign_block is None
+                or sign_assignment.get("hidden")
+                or str(sign_block.get("text", "")).strip() not in {"-", "−", "+", "="}
+                or str(visual.get("insertAfterBlockId") or "") != sign_id
+            ):
+                continue
+            sign_bbox = [
+                float(value) for value in sign_block.get("bboxNormalized", [])
+            ]
+            visual_bbox = [
+                float(value) for value in visual.get("bboxNormalized", [])
+            ]
+            if len(sign_bbox) != 4 or len(visual_bbox) != 4:
+                continue
+            vertical_overlap = max(
+                0.0,
+                min(sign_bbox[3], visual_bbox[3])
+                - max(sign_bbox[1], visual_bbox[1]),
+            )
+            horizontal_gap = visual_bbox[0] - sign_bbox[2]
+            if (
+                vertical_overlap / max(1e-9, sign_bbox[3] - sign_bbox[1]) < 0.55
+                or not -0.003 <= horizontal_gap <= 0.025
+            ):
+                continue
+            visual["bboxNormalized"] = [
+                min(sign_bbox[0], visual_bbox[0]),
+                min(sign_bbox[1], visual_bbox[1]),
+                max(sign_bbox[2], visual_bbox[2]),
+                max(sign_bbox[3], visual_bbox[3]),
+            ]
+            fallback = next(
+                (
+                    assignment
+                    for assignment in reversed(assignments[: source_position - 1])
+                    if not assignment.get("hidden")
+                    and assignment.get("role")
+                    in {"abstract", "equation", "footnote", "heading", "list_item", "paragraph"}
+                ),
+                None,
+            )
+            if fallback is not None:
+                visual["insertAfterBlockId"] = str(fallback["blockId"])
+            sign_assignment["role"] = "noise"
+            sign_assignment["hidden"] = True
+            sign_assignment["paragraphId"] = None
+            sign_assignment["continuesFrom"] = None
+            sign_assignment["suppressedVisualText"] = True
+            sign_block["suppressedVisualText"] = True
+            sign_block["embeddedVisualOwnerRefs"] = [str(visual["objectId"])]
+            warning = (
+                "An immediately preceding standalone sign was folded into its "
+                "source-equation crop."
+            )
+            warnings = visual.setdefault("warnings", [])
+            if warning not in warnings:
+                warnings.append(warning)
+            absorbed.append(sign_id)
+    structure.setdefault("doclingDiagnostics", {})[
+        "absorbedEquationSignBlockIds"
+    ] = sorted(absorbed)
+    return sorted(absorbed)
+
+
+def _reanchor_equations_by_geometry(
+    evidence: dict[str, Any],
+    structure: dict[str, Any],
+) -> list[str]:
+    """Anchor equations after the closest source block above them, then split prose."""
+
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    structure_pages = {
+        int(page["pageNumber"]): page for page in structure.get("pages", [])
+    }
+    changed: list[str] = []
+    anchor_roles = {
+        "abstract",
+        "equation",
+        "footnote",
+        "heading",
+        "list_item",
+        "paragraph",
+    }
+    for page_number, page in structure_pages.items():
+        blocks = {
+            str(block["blockId"]): block
+            for block in evidence_pages.get(page_number, {}).get("blocks", [])
+        }
+        assignments = {
+            str(assignment["blockId"]): assignment
+            for assignment in page.get("blockAssignments", [])
+        }
+        for visual in page.get("visualObjects", []):
+            if visual.get("kind") != "equation":
+                continue
+            visual_bbox = [
+                float(value) for value in visual.get("bboxNormalized", [])
+            ]
+            if len(visual_bbox) != 4:
+                continue
+            visual_width = max(1e-9, visual_bbox[2] - visual_bbox[0])
+            source_suffix = str(visual.get("objectId", "")).removeprefix(
+                "equation-"
+            )
+            source_block_id = f"dl-{source_suffix}"
+            existing_anchor_id = str(visual.get("insertAfterBlockId") or "")
+            candidates: list[tuple[float, float, int, str]] = []
+            for block_id, assignment in assignments.items():
+                block = blocks.get(block_id)
+                if (
+                    block is None
+                    or block_id == source_block_id
+                    or assignment.get("hidden")
+                    or assignment.get("role") not in anchor_roles
+                ):
+                    continue
+                bbox = [float(value) for value in block.get("bboxNormalized", [])]
+                if (
+                    len(bbox) != 4
+                    or bbox[1] > visual_bbox[1] + 0.002
+                    or bbox[3] > visual_bbox[1] + 0.016
+                ):
+                    continue
+                horizontal_overlap = max(
+                    0.0, min(bbox[2], visual_bbox[2]) - max(bbox[0], visual_bbox[0])
+                )
+                minimum_width = max(
+                    1e-9, min(bbox[2] - bbox[0], visual_width)
+                )
+                if (
+                    horizontal_overlap / minimum_width < 0.15
+                    and block_id != existing_anchor_id
+                ):
+                    continue
+                candidates.append(
+                    (
+                        bbox[1],
+                        bbox[3],
+                        int(assignment.get("readingOrder", 0)),
+                        block_id,
+                    )
+                )
+            if not candidates:
+                continue
+            anchor_id = max(candidates)[3]
+            if str(visual.get("insertAfterBlockId") or "") != anchor_id:
+                visual["insertAfterBlockId"] = anchor_id
+                visual.setdefault("warnings", []).append(
+                    "Equation order was recovered from source-page geometry."
+                )
+                changed.append(str(visual.get("objectId")))
+
+    ordered_assignments = [
+        assignment
+        for page in sorted(
+            structure.get("pages", []), key=lambda value: int(value["pageNumber"])
+        )
+        for assignment in sorted(
+            page.get("blockAssignments", []),
+            key=lambda value: int(value["readingOrder"]),
+        )
+    ]
+    positions = {
+        str(assignment["blockId"]): index
+        for index, assignment in enumerate(ordered_assignments)
+    }
+    assignment_by_id = {
+        str(assignment["blockId"]): assignment
+        for assignment in ordered_assignments
+    }
+    equation_visuals = [
+        visual
+        for page in structure.get("pages", [])
+        for visual in page.get("visualObjects", [])
+        if visual.get("kind") == "equation"
+    ]
+    for visual in sorted(
+        equation_visuals,
+        key=lambda value: positions.get(str(value.get("insertAfterBlockId")), 10**12),
+    ):
+        anchor_id = str(visual.get("insertAfterBlockId") or "")
+        anchor = assignment_by_id.get(anchor_id)
+        if anchor is None or not anchor.get("paragraphId"):
+            continue
+        anchor_position = positions[anchor_id]
+        paragraph_id = anchor["paragraphId"]
+        tails = [
+            assignment
+            for assignment in ordered_assignments[anchor_position + 1 :]
+            if assignment.get("paragraphId") == paragraph_id
+            and not assignment.get("hidden")
+        ]
+        if not tails:
+            continue
+        new_paragraph_id = f"para-{tails[0]['blockId']}"
+        previous_tail_id: str | None = None
+        for tail in tails:
+            tail["paragraphId"] = new_paragraph_id
+            tail["continuesFrom"] = previous_tail_id
+            tail.setdefault("warnings", []).append(
+                "A multi-provenance paragraph was split at an intervening equation."
+            )
+            previous_tail_id = str(tail["blockId"])
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics["geometryReanchoredEquationObjectIds"] = sorted(set(changed))
+    return sorted(set(changed))
 
 
 def _absorb_aligned_figure_panel_headings(
@@ -3361,6 +5238,275 @@ def _merge_split_panel_figures(
             structure["warnings"].append(warning)
 
 
+_PARALLEL_TABLE_LABEL = re.compile(
+    r"^\s*(Table)\s+(\d+[A-Za-z]?)\s*[:.]\s*\S", re.IGNORECASE
+)
+_PARALLEL_ALGORITHM_LABEL = re.compile(
+    r"^\s*(Algorithm)\s+(\d+[A-Za-z]?)\b(?:\s*[:.]|\s+\S)",
+    re.IGNORECASE,
+)
+
+
+def _join_parallel_caption_lines(parts: list[str]) -> str:
+    """Join caption lines while distinguishing soft and compound hyphens."""
+
+    result = ""
+    for part in parts:
+        value = re.sub(r"\s+", " ", part).strip()
+        if not value:
+            continue
+        if not result:
+            result = value
+            continue
+        if result.endswith("-") and value[:1].islower():
+            trailing_word = result.rsplit(" ", 1)[-1]
+            if trailing_word.count("-") >= 2:
+                result += value
+            else:
+                result = result[:-1] + value
+        else:
+            result += " " + value
+    return result
+
+
+def _parallel_labeled_visual_split_plan(
+    lines: list[dict[str, Any]], visual_bbox: list[float]
+) -> dict[str, Any] | None:
+    """Plan a safe two-column split from explicit source-PDF object labels."""
+
+    if (
+        len(visual_bbox) != 4
+        or visual_bbox[2] - visual_bbox[0] < 0.45
+        or visual_bbox[3] <= visual_bbox[1]
+    ):
+        return None
+    nearby_lines = [
+        line
+        for line in lines
+        if len(line.get("bboxNormalized", [])) == 4
+        and float(line["bboxNormalized"][2]) >= visual_bbox[0] - 0.025
+        and float(line["bboxNormalized"][0]) <= visual_bbox[2] + 0.025
+        and float(line["bboxNormalized"][3]) >= visual_bbox[1] - 0.032
+        and float(line["bboxNormalized"][1]) <= visual_bbox[3] + 0.006
+    ]
+    labeled: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    for line in sorted(
+        nearby_lines,
+        key=lambda value: (
+            float(value["bboxNormalized"][1]),
+            float(value["bboxNormalized"][0]),
+        ),
+    ):
+        text = re.sub(r"\s+", " ", str(line.get("text", ""))).strip()
+        match = _PARALLEL_TABLE_LABEL.match(text) or _PARALLEL_ALGORITHM_LABEL.match(
+            text
+        )
+        if match is None:
+            continue
+        family = match.group(1).title()
+        label = f"{family} {match.group(2)}"
+        if label.casefold() in seen_labels:
+            continue
+        seen_labels.add(label.casefold())
+        labeled.append(
+            {
+                "family": family,
+                "kind": family.casefold(),
+                "label": label,
+                "text": text,
+                "bbox": [float(value) for value in line["bboxNormalized"]],
+            }
+        )
+    if len(labeled) != 2 or labeled[0]["family"] != labeled[1]["family"]:
+        return None
+    labeled.sort(key=lambda value: (value["bbox"][0] + value["bbox"][2]) / 2)
+    visual_center = (visual_bbox[0] + visual_bbox[2]) / 2
+    left_center = (labeled[0]["bbox"][0] + labeled[0]["bbox"][2]) / 2
+    right_center = (labeled[1]["bbox"][0] + labeled[1]["bbox"][2]) / 2
+    if (
+        left_center >= visual_center - 0.035
+        or right_center <= visual_center + 0.035
+        or right_center - left_center < 0.18
+    ):
+        return None
+
+    # The explicit right label gives a stable column start. Line centres are
+    # unsafe here: a wide final header cell can cross the page midpoint while
+    # still belonging wholly to the left-hand table.
+    right_column_start = labeled[1]["bbox"][0]
+    body_lines = [
+        line
+        for line in nearby_lines
+        if float(line["bboxNormalized"][3]) >= visual_bbox[1] - 0.004
+        and float(line["bboxNormalized"][1]) <= visual_bbox[3] + 0.004
+    ]
+    left_lines = [
+        line
+        for line in body_lines
+        if float(line["bboxNormalized"][0]) < right_column_start - 0.012
+    ]
+    right_lines = [
+        line
+        for line in body_lines
+        if float(line["bboxNormalized"][0]) >= right_column_start - 0.012
+    ]
+    if not left_lines or not right_lines:
+        return None
+    left_ink_right = max(float(line["bboxNormalized"][2]) for line in left_lines)
+    right_ink_left = min(float(line["bboxNormalized"][0]) for line in right_lines)
+    if right_ink_left - left_ink_right < 0.003:
+        return None
+    separator = (left_ink_right + right_ink_left) / 2
+    if separator - visual_bbox[0] < 0.20 or visual_bbox[2] - separator < 0.20:
+        return None
+
+    all_lines = sorted(
+        nearby_lines,
+        key=lambda value: (
+            float(value["bboxNormalized"][1]),
+            float(value["bboxNormalized"][0]),
+        ),
+    )
+    for candidate in labeled:
+        caption_parts = [candidate["text"]]
+        current_bottom = candidate["bbox"][3]
+        candidate_left = candidate["bbox"][0]
+        candidate_is_left = candidate_left < separator
+        while True:
+            continuation = next(
+                (
+                    line
+                    for line in all_lines
+                    if str(line.get("text", "")).strip()
+                    and float(line["bboxNormalized"][1]) >= current_bottom - 0.001
+                    and float(line["bboxNormalized"][1])
+                    <= current_bottom + 0.0045
+                    and abs(float(line["bboxNormalized"][0]) - candidate_left)
+                    <= 0.04
+                    and (float(line["bboxNormalized"][0]) < separator)
+                    == candidate_is_left
+                    and re.sub(r"\s+", " ", str(line.get("text", ""))).strip()
+                    not in caption_parts
+                ),
+                None,
+            )
+            if continuation is None:
+                break
+            continuation_text = re.sub(
+                r"\s+", " ", str(continuation.get("text", ""))
+            ).strip()
+            if _PARALLEL_TABLE_LABEL.match(
+                continuation_text
+            ) or _PARALLEL_ALGORITHM_LABEL.match(continuation_text):
+                break
+            caption_parts.append(continuation_text)
+            current_bottom = float(continuation["bboxNormalized"][3])
+        candidate["captionText"] = _join_parallel_caption_lines(caption_parts)
+    return {"separator": separator, "objects": labeled}
+
+
+def _split_parallel_labeled_visuals(
+    source: Path, evidence: dict[str, Any], structure: dict[str, Any]
+) -> list[str]:
+    """Split two side-by-side tables/algorithms merged into one Docling table."""
+
+    diagnostics = structure.setdefault("doclingDiagnostics", {})
+    diagnostics.setdefault("splitParallelLabeledVisuals", [])
+    try:
+        pdf = fitz.open(source)
+    except Exception:
+        return []
+    evidence_pages = {
+        int(page["pageNumber"]): page for page in evidence.get("pages", [])
+    }
+    split_ids: list[str] = []
+    try:
+        for page_structure in structure.get("pages", []):
+            page_number = int(page_structure["pageNumber"])
+            if not 1 <= page_number <= len(pdf):
+                continue
+            lines = [
+                line
+                for region in _pdf_text_regions(pdf[page_number - 1])
+                for line in region.get("lines", [])
+            ]
+            blocks = {
+                str(block["blockId"]): block
+                for block in evidence_pages.get(page_number, {}).get("blocks", [])
+            }
+            replacements: list[dict[str, Any]] = []
+            for visual in page_structure.get("visualObjects", []):
+                if visual.get("kind") != "table":
+                    replacements.append(visual)
+                    continue
+                bbox = [float(value) for value in visual.get("bboxNormalized", [])]
+                plan = _parallel_labeled_visual_split_plan(lines, bbox)
+                if plan is None:
+                    replacements.append(visual)
+                    continue
+                object_id = str(visual["objectId"])
+                separator = float(plan["separator"])
+                original_caption_ids = [
+                    str(value) for value in visual.get("captionBlockIds", [])
+                ]
+                original_label = str(visual.get("label") or "").strip()
+                created: list[dict[str, Any]] = []
+                for index, candidate in enumerate(plan["objects"]):
+                    clone = copy.deepcopy(visual)
+                    label = str(candidate["label"])
+                    suffix = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-")
+                    clone["objectId"] = f"{object_id}-split-{suffix}"
+                    clone["kind"] = str(candidate["kind"])
+                    clone["label"] = label
+                    clone["bboxNormalized"] = [
+                        bbox[0] if index == 0 else separator,
+                        bbox[1],
+                        separator if index == 0 else bbox[2],
+                        bbox[3],
+                    ]
+                    matching_caption_ids = [
+                        block_id
+                        for block_id in original_caption_ids
+                        if block_id in blocks
+                        and re.search(
+                            rf"\b{re.escape(label)}\b",
+                            str(blocks[block_id].get("text", "")),
+                            re.IGNORECASE,
+                        )
+                    ]
+                    if (
+                        not matching_caption_ids
+                        and label.casefold() == original_label.casefold()
+                    ):
+                        matching_caption_ids = original_caption_ids
+                    clone["captionBlockIds"] = matching_caption_ids
+                    clone["captionTextOverride"] = str(candidate["captionText"])
+                    clone.pop("asset", None)
+                    clone.pop("bboxPdf", None)
+                    warning = (
+                        "A Docling table crop containing two explicitly labeled "
+                        "parallel objects was split at the source-PDF column gap."
+                    )
+                    warnings = clone.setdefault("warnings", [])
+                    if warning not in warnings:
+                        warnings.append(warning)
+                    created.append(clone)
+                    split_ids.append(str(clone["objectId"]))
+                replacements.extend(created)
+                diagnostics["splitParallelLabeledVisuals"].append(
+                    {
+                        "sourceObjectId": object_id,
+                        "objectIds": [str(value["objectId"]) for value in created],
+                        "separator": round(separator, 6),
+                    }
+                )
+            page_structure["visualObjects"] = replacements
+    finally:
+        pdf.close()
+    return sorted(split_ids)
+
+
 def _source_name(document: Mapping[str, Any], source_file: str | Path | None) -> str:
     if source_file is not None:
         return Path(source_file).name
@@ -3597,22 +5743,11 @@ def docling_document_to_ir(
         if len(provenance_values) <= 1:
             segment_values = [(text, provenance_values[0] if provenance_values else None, [])]
         else:
-            spans = [_char_span(value, len(raw_text)) for value in provenance_values]
-            spans_are_complete = all(span is not None for span in spans)
-            previous_end = 0
-            if spans_are_complete:
-                for span in spans:
-                    assert span is not None
-                    start, end = span
-                    if start < previous_end or raw_text[previous_end:start].strip():
-                        spans_are_complete = False
-                        break
-                    previous_end = end
-                if raw_text[previous_end:].strip():
-                    spans_are_complete = False
-            if spans_are_complete:
+            spans = _partition_provenance_char_spans(
+                provenance_values, raw_text
+            )
+            if spans is not None:
                 for provenance, span in zip(provenance_values, spans, strict=True):
-                    assert span is not None
                     segment = raw_text[span[0] : span[1]].strip()
                     if segment:
                         segment_values.append((segment, provenance, []))
@@ -3637,6 +5772,7 @@ def docling_document_to_ir(
             base_role = "header"
         previous_block_id: str | None = None
         for segment_index, (segment, provenance, segment_warnings) in enumerate(segment_values, start=1):
+            segment = _normalize_extracted_text(segment)
             block_id = base_id if segment_index == 1 else f"{base_id}-s{segment_index}"
             page_number = _page_number(provenance or {}) or 1
             if page_number not in page_sizes:
@@ -3756,6 +5892,80 @@ def docling_document_to_ir(
     visuals_by_page: dict[int, list[dict[str, Any]]] = {page: [] for page in page_sizes}
     visual_entries: list[dict[str, Any]] = []
     explicit_caption_owners: dict[str, set[str]] = {}
+    record_positions = {
+        str(record["blockId"]): index for index, record in enumerate(records)
+    }
+
+    def preserve_unrenderable_algorithm(ref: str, reason: str) -> bool:
+        targets = [record for record in records if record["ref"] == ref]
+        if not targets:
+            return False
+        preserved = False
+        joinable_roles = {
+            "abstract",
+            "paragraph",
+            "list_item",
+            "footnote",
+            "reference",
+        }
+        for record in targets:
+            text = str(record.get("text", ""))
+            if not text.strip():
+                continue
+            position = record_positions.get(str(record["blockId"]), 0)
+            previous = next(
+                (
+                    candidate
+                    for candidate in reversed(records[:position])
+                    if candidate["pageNumber"] == record["pageNumber"]
+                    and not candidate["furniture"]
+                ),
+                None,
+            )
+            is_adjacent_right_fragment = False
+            if previous is not None and previous.get("bboxValid") and record.get("bboxValid"):
+                previous_bbox = previous["bboxNormalized"]
+                record_bbox = record["bboxNormalized"]
+                previous_height = max(0.0, previous_bbox[3] - previous_bbox[1])
+                record_height = max(0.0, record_bbox[3] - record_bbox[1])
+                maximum_height = max(previous_height, record_height)
+                height_ratio = (
+                    min(previous_height, record_height) / maximum_height
+                    if maximum_height > 0
+                    else 0.0
+                )
+                rightward_gap = record_bbox[0] - previous_bbox[2]
+                is_adjacent_right_fragment = (
+                    -0.002 <= rightward_gap <= 0.012 and height_ratio >= 0.35
+                )
+            if (
+                previous is not None
+                and previous["role"] in joinable_roles
+                and previous.get("paragraphId")
+                and previous.get("sectionId") == record.get("sectionId")
+                and _caption_same_line_vertical(previous, record)
+                and is_adjacent_right_fragment
+            ):
+                record["role"] = previous["role"]
+                record["sectionId"] = previous.get("sectionId")
+                record["paragraphId"] = previous["paragraphId"]
+                record["continuesFrom"] = previous["blockId"]
+                warning = (
+                    "An exact nonempty code fragment with an unrenderable crop "
+                    "was joined to its adjacent same-line text block."
+                )
+            else:
+                record["role"] = "verbatim"
+                record["paragraphId"] = f"verbatim-{record['sourceBlockId']}"
+                record["continuesFrom"] = None
+                warning = (
+                    "An exact nonempty code fragment with an unrenderable crop "
+                    "was preserved as standalone verbatim text."
+                )
+            record["warnings"].append(f"{warning} Source crop issue: {reason}")
+            preserved = True
+        return preserved
+
     for order, ref, collection, item, _furniture_item in traversal:
         kind = _visual_kind(collection, item)
         if kind is None:
@@ -3763,6 +5973,15 @@ def docling_document_to_ir(
         provenance = next(iter(_provenance(item)), None)
         page_number = _page_number(provenance or {}) or 1
         if provenance is None or page_number not in page_sizes:
+            if (
+                kind == "algorithm"
+                and _raw_text(item).strip()
+                and preserve_unrenderable_algorithm(ref, "missing page provenance")
+            ):
+                document_warnings.append(
+                    f"Preserved nonempty {kind} {ref} as exact text because its crop lacked page provenance."
+                )
+                continue
             document_warnings.append(f"Skipped {kind} {ref}: missing page provenance.")
             continue
         _pdf_bbox, normalized_bbox, bbox_warnings, valid_bbox = _bbox(
@@ -3772,6 +5991,17 @@ def docling_document_to_ir(
             0.0, normalized_bbox[3] - normalized_bbox[1]
         )
         if not valid_bbox or area < 0.0005:
+            if (
+                kind == "algorithm"
+                and _raw_text(item).strip()
+                and preserve_unrenderable_algorithm(
+                    ref, "invalid or implausibly small crop"
+                )
+            ):
+                document_warnings.append(
+                    f"Preserved nonempty {kind} {ref} as exact text because its crop was invalid or implausibly small."
+                )
+                continue
             document_warnings.append(f"Skipped {kind} {ref}: invalid or implausibly small crop.")
             continue
         explicit_caption_refs = [
@@ -4305,18 +6535,47 @@ def extract_docling_semantics(
         timeout_seconds=worker_timeout_seconds,
     )
     evidence, structure = docling_document_to_ir(raw_document, source_file=source.name)
+    _recover_page_one_front_matter_from_pdf(source, evidence, structure)
+    _restore_lexical_linebreak_hyphens_from_pdf(source, evidence, structure)
     _suppress_blank_docling_headings(source, evidence, structure)
     _absorb_aligned_figure_panel_headings(source, evidence, structure)
+    _demote_mislabeled_docling_headings(evidence, structure)
+    _repair_lowercase_body_continuations_from_pdf(source, evidence, structure)
+    _absorb_adjacent_equation_signs(evidence, structure)
+    _suppress_overlapping_equation_fragments(evidence, structure)
+    _reanchor_equations_by_geometry(evidence, structure)
     _recover_overlarge_docling_pictures(source, evidence, structure)
     _merge_split_panel_figures(source, evidence, structure)
+    _split_parallel_labeled_visuals(source, evidence, structure)
+    # Visibility recovery can restore prose that Docling originally buried
+    # inside a picture node, so canonicalize links only after that pass.
+    _recover_pdf_link_annotations(source, evidence, structure)
     caption_overrides = refine_pdf_caption_texts(source, evidence, structure)
+    recovered_links_by_page: dict[int, list[str]] = {}
+    for value in structure.get("doclingDiagnostics", {}).get(
+        "recoveredExternalLinks", []
+    ):
+        try:
+            page_number = int(value.get("pageNumber", 0))
+        except (TypeError, ValueError):
+            continue
+        uri = str(value.get("uri") or "").strip()
+        if page_number > 0 and uri:
+            recovered_links_by_page.setdefault(page_number, []).append(uri)
     missing_required_overrides: list[str] = []
     for page in structure.get("pages", []):
+        page_number = int(page.get("pageNumber", 0))
         for visual in page.get("visualObjects", []):
             object_id = str(visual.get("objectId") or "")
             if override := caption_overrides.get(object_id):
-                visual["captionTextOverride"] = override
+                visual["captionTextOverride"] = _normalize_url_text_with_annotations(
+                    override, recovered_links_by_page.get(page_number, [])
+                )
                 continue
+            if override := visual.get("captionTextOverride"):
+                visual["captionTextOverride"] = _normalize_url_text_with_annotations(
+                    str(override), recovered_links_by_page.get(page_number, [])
+                )
             if any(
                 "exact interleaving" in str(warning).lower()
                 for warning in visual.get("warnings", [])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ from urllib.parse import unquote, urlsplit
 import pymupdf as fitz
 from bs4 import BeautifulSoup
 
-from .semantic import TRANSLATABLE_ROLES, iter_translatable_units
+from .semantic import PRESERVED_TEXT_ROLES, TRANSLATABLE_ROLES, iter_translatable_units
 from .structure import is_near_certain_blank_pixmap
 
 
@@ -210,6 +211,7 @@ def write_semantic_pdf_qa(
 
     index = publication_dir / "index.html"
     unresolved_links: list[str] = []
+    unlinked_external_url_texts: list[str] = []
     missing_assets: list[str] = []
     if index.exists():
         soup = BeautifulSoup(index.read_text(encoding="utf-8"), "html.parser")
@@ -218,6 +220,21 @@ def write_semantic_pdf_qa(
             href = str(anchor.get("href", ""))
             if href.startswith("#") and len(href) > 1 and unquote(href[1:]) not in known_ids:
                 unresolved_links.append(href)
+        url_start = re.compile(r"\bhttps?\s*:\s*/\s*/", re.IGNORECASE)
+        for node in soup.find_all(string=url_start):
+            parent = node.parent
+            if parent is None or parent.name in {"script", "style"}:
+                continue
+            linked_parent = parent.find_parent("a", href=True)
+            if parent.name == "a" and parent.get("href"):
+                linked_parent = parent
+            if linked_parent is not None and str(
+                linked_parent.get("href", "")
+            ).lower().startswith(("http://", "https://")):
+                continue
+            snippet = re.sub(r"\s+", " ", str(node)).strip()
+            if snippet and snippet not in unlinked_external_url_texts:
+                unlinked_external_url_texts.append(snippet[:240])
         for tag, attribute in (("img", "src"), ("object", "data"), ("source", "src")):
             for element in soup.find_all(tag):
                 raw_url = str(element.get(attribute, ""))
@@ -245,7 +262,8 @@ def write_semantic_pdf_qa(
         for section in document.get("sections", [])
         for item in section.get("content", [])
         if item.get("type") == "unit"
-        and item.get("value", {}).get("kind") in TRANSLATABLE_ROLES | {"reference"}
+        and item.get("value", {}).get("kind")
+        in TRANSLATABLE_ROLES | PRESERVED_TEXT_ROLES | {"reference"}
         and str(item.get("value", {}).get("original", "")).strip()
     ]
     evidence_pages = evidence.get("pages", []) if evidence else []
@@ -293,6 +311,7 @@ def write_semantic_pdf_qa(
         "list_item",
         "footnote",
         "reference",
+        "verbatim",
         "caption",
     }
     expected_blocks = {
@@ -454,11 +473,39 @@ def write_semantic_pdf_qa(
         )
         if value
     )
+    suppressed_overlapping_equation_object_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get(
+            "suppressedOverlappingEquationObjectIds", []
+        )
+        if value
+    )
+    split_parallel_labeled_visuals = list(
+        docling_diagnostics.get("splitParallelLabeledVisuals", [])
+    )
+    absorbed_equation_sign_block_ids = sorted(
+        str(value)
+        for value in docling_diagnostics.get("absorbedEquationSignBlockIds", [])
+        if value
+    )
+    recovered_external_links = list(
+        docling_diagnostics.get("recoveredExternalLinks", [])
+    )
+    unrecovered_printed_url_links = list(
+        docling_diagnostics.get("unrecoveredPrintedUrlLinks", [])
+    )
+    restored_lexical_linebreak_hyphens = list(
+        docling_diagnostics.get("restoredLexicalLinebreakHyphens", [])
+    )
+    ambiguous_lexical_linebreak_hyphens = list(
+        docling_diagnostics.get("ambiguousLexicalLinebreakHyphens", [])
+    )
     qa = {
         "schemaVersion": PDF_JOB_SCHEMA_VERSION,
         "status": (
             "passed"
             if not unresolved_links
+            and not unlinked_external_url_texts
             and not missing_assets
             and not invalid_geometry_pages
             and not all_text_pages_empty
@@ -475,6 +522,7 @@ def write_semantic_pdf_qa(
             and not dangling_parent_section_ids
             and not blank_visible_heading_block_ids
             and not unabsorbed_panel_heading_block_ids
+            and not unrecovered_printed_url_links
             and not emitted_blank_visual_assets
             and bool(semantic_body_units)
             else "failed"
@@ -518,10 +566,22 @@ def write_semantic_pdf_qa(
         "blankVisibleHeadingBlockIds": blank_visible_heading_block_ids,
         "suppressedBlankHeadingBlockIds": suppressed_blank_heading_block_ids,
         "unabsorbedPanelHeadingBlockIds": unabsorbed_panel_heading_block_ids,
+        "suppressedOverlappingEquationObjectIds": (
+            suppressed_overlapping_equation_object_ids
+        ),
+        "splitParallelLabeledVisuals": split_parallel_labeled_visuals,
+        "absorbedEquationSignBlockIds": absorbed_equation_sign_block_ids,
+        "recoveredExternalLinks": recovered_external_links,
+        "unrecoveredPrintedUrlLinks": unrecovered_printed_url_links,
+        "restoredLexicalLinebreakHyphens": restored_lexical_linebreak_hyphens,
+        "ambiguousLexicalLinebreakHyphens": (
+            ambiguous_lexical_linebreak_hyphens
+        ),
         "emittedBlankVisualAssets": emitted_blank_visual_assets,
         "filteredBlankVisuals": filtered_blank_visuals,
         "unresolvedInternalLinks": len(unresolved_links),
         "unresolvedInternalLinkTargets": unresolved_links,
+        "unlinkedExternalUrlText": unlinked_external_url_texts,
         "missingLocalAssets": missing_assets,
         "warnings": list(document.get("warnings", [])),
     }

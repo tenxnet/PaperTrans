@@ -12,6 +12,7 @@ from markupsafe import Markup
 
 
 CITATION_GROUP_RE = re.compile(r"\[(\d+(?:\s*[-,]\s*\d+)*)\]")
+EXTERNAL_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
 def _link_filter(document: dict[str, Any]):
@@ -26,7 +27,27 @@ def _link_filter(document: dict[str, Any]):
                 object_labels[str(value["label"])] = f"visual-{value['objectId']}"
 
     def link_text(text: str) -> Markup:
-        rendered = html.escape(text or "")
+        external_anchors: list[str] = []
+
+        def external_url(match: re.Match[str]) -> str:
+            value = match.group(0)
+            trailing = ""
+            while value and value[-1] in ".,;:":
+                trailing = value[-1] + trailing
+                value = value[:-1]
+            while value.endswith(")") and value.count("(") < value.count(")"):
+                trailing = ")" + trailing
+                value = value[:-1]
+            token = f"\x00papertrans-external-{len(external_anchors)}\x00"
+            escaped_value = html.escape(value, quote=True)
+            external_anchors.append(
+                f'<a class="external" href="{escaped_value}" '
+                f'rel="noopener noreferrer">{escaped_value}</a>'
+            )
+            return token + trailing
+
+        tokenized = EXTERNAL_URL_RE.sub(external_url, text or "")
+        rendered = html.escape(tokenized)
         for label in sorted(object_labels, key=len, reverse=True):
             target = object_labels[label]
             escaped_label = html.escape(label)
@@ -48,6 +69,10 @@ def _link_filter(document: dict[str, Any]):
             return f'<span class="citation">[{linked}]</span>'
 
         rendered = CITATION_GROUP_RE.sub(citation, rendered)
+        for index, anchor in enumerate(external_anchors):
+            rendered = rendered.replace(
+                f"\x00papertrans-external-{index}\x00", anchor
+            )
         return Markup(rendered)
 
     return link_text
@@ -84,4 +109,3 @@ def render_semantic_document(
         json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return index_path
-

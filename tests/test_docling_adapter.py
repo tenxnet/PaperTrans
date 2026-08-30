@@ -3123,3 +3123,1138 @@ def test_absorbs_aligned_panel_headings_and_reanchors_following_figures(
             "fallbackSectionId": "sec-main",
         }
     ]
+
+
+def test_preserves_nonempty_code_when_visual_crop_is_too_small() -> None:
+    document = sample_docling_document()
+    paragraph_index = len(document["texts"])
+    quote_index = paragraph_index + 1
+    placeholder_index = paragraph_index + 2
+    paragraph_ref = f"#/texts/{paragraph_index}"
+    quote_ref = f"#/texts/{quote_index}"
+    placeholder_ref = f"#/texts/{placeholder_index}"
+    paragraph_text = "RESPONSE: ' {}"
+    document["texts"].extend(
+        [
+            {
+                "self_ref": paragraph_ref,
+                "label": "paragraph",
+                "orig": paragraph_text,
+                "text": paragraph_text,
+                "prov": [
+                    {
+                        "page_no": 2,
+                        "bbox": {
+                            "l": 60,
+                            "t": 300,
+                            "r": 150,
+                            "b": 288,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, len(paragraph_text)],
+                    }
+                ],
+            },
+            {
+                "self_ref": quote_ref,
+                "label": "code",
+                "orig": "'",
+                "text": "'",
+                "prov": [
+                    {
+                        "page_no": 2,
+                        "bbox": {
+                            "l": 150,
+                            "t": 300,
+                            "r": 154,
+                            "b": 288,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, 1],
+                    }
+                ],
+            },
+            {
+                "self_ref": placeholder_ref,
+                "label": "code",
+                "orig": "{}",
+                "text": "{}",
+                "prov": [
+                    {
+                        "page_no": 2,
+                        "bbox": {
+                            "l": 60,
+                            "t": 270,
+                            "r": 70,
+                            "b": 260,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, 2],
+                    }
+                ],
+            },
+        ]
+    )
+    reference_heading_index = next(
+        index
+        for index, child in enumerate(document["groups"][0]["children"])
+        if child["$ref"] == "#/texts/7"
+    )
+    document["groups"][0]["children"][
+        reference_heading_index:reference_heading_index
+    ] = [
+        {"$ref": paragraph_ref},
+        {"$ref": quote_ref},
+        {"$ref": placeholder_ref},
+    ]
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+
+    assert assignments[f"dl-texts-{quote_index}"]["role"] == "paragraph"
+    assert assignments[f"dl-texts-{quote_index}"]["paragraphId"] == (
+        f"para-dl-texts-{paragraph_index}"
+    )
+    assert assignments[f"dl-texts-{quote_index}"]["continuesFrom"] == (
+        f"dl-texts-{paragraph_index}"
+    )
+    assert assignments[f"dl-texts-{placeholder_index}"]["role"] == "verbatim"
+    assert not any(
+        visual["objectId"]
+        in {
+            f"algorithm-texts-{quote_index}",
+            f"algorithm-texts-{placeholder_index}",
+        }
+        for page in structure["pages"]
+        for visual in page["visualObjects"]
+    )
+    assert not any("Skipped algorithm" in warning for warning in structure["warnings"])
+
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    units = [
+        item["value"]
+        for section in semantic["sections"]
+        for item in section["content"]
+        if item["type"] == "unit"
+    ]
+    assert any(
+        unit["kind"] == "paragraph" and unit["original"] == "RESPONSE: ' {}'"
+        for unit in units
+    )
+    assert any(
+        unit["kind"] == "verbatim" and unit["original"] == "{}"
+        for unit in units
+    )
+
+
+def test_does_not_append_a_small_code_fragment_located_left_of_previous_text() -> None:
+    document = sample_docling_document()
+    paragraph_index = len(document["texts"])
+    code_index = paragraph_index + 1
+    paragraph_ref = f"#/texts/{paragraph_index}"
+    code_ref = f"#/texts/{code_index}"
+    document["texts"].extend(
+        [
+            {
+                "self_ref": paragraph_ref,
+                "label": "paragraph",
+                "orig": "Right-hand paragraph",
+                "text": "Right-hand paragraph",
+                "prov": [
+                    {
+                        "page_no": 2,
+                        "bbox": {
+                            "l": 100,
+                            "t": 300,
+                            "r": 180,
+                            "b": 288,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, 20],
+                    }
+                ],
+            },
+            {
+                "self_ref": code_ref,
+                "label": "code",
+                "orig": "{}",
+                "text": "{}",
+                "prov": [
+                    {
+                        "page_no": 2,
+                        "bbox": {
+                            "l": 94,
+                            "t": 300,
+                            "r": 98,
+                            "b": 288,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                        "charspan": [0, 2],
+                    }
+                ],
+            },
+        ]
+    )
+    reference_heading_index = next(
+        index
+        for index, child in enumerate(document["groups"][0]["children"])
+        if child["$ref"] == "#/texts/7"
+    )
+    document["groups"][0]["children"][
+        reference_heading_index:reference_heading_index
+    ] = [{"$ref": paragraph_ref}, {"$ref": code_ref}]
+
+    evidence, structure = docling_document_to_ir(document)
+    assignments = _assignments(structure)
+
+    assert assignments[f"dl-texts-{code_index}"]["role"] == "verbatim"
+    semantic = build_semantic_document(
+        evidence, structure, _rendered_visuals(evidence, structure)
+    )
+    units = [
+        item["value"]
+        for section in semantic["sections"]
+        for item in section["content"]
+        if item["type"] == "unit"
+    ]
+    assert any(
+        unit["kind"] == "verbatim" and unit["original"] == "{}"
+        for unit in units
+    )
+    assert not any(unit["original"].endswith("{}") for unit in units if unit["kind"] == "paragraph")
+
+
+def test_reconstructs_page_one_authors_in_pdf_row_order_and_severs_body_link() -> None:
+    evidence = {
+        "sourceFile": "authors.pdf",
+        "pageCount": 2,
+        "pages": [
+            {
+                "pageNumber": 1,
+                "widthPdf": 600,
+                "heightPdf": 800,
+                "blocks": [
+                    {
+                        "blockId": "title",
+                        "text": "Paper Title",
+                        "bboxNormalized": [0.2, 0.1, 0.8, 0.15],
+                    },
+                    {
+                        "blockId": "column-a",
+                        "text": "A One C Three",
+                        "bboxNormalized": [0.1, 0.18, 0.3, 0.22],
+                    },
+                    {
+                        "blockId": "column-b",
+                        "text": "B Two D Four",
+                        "bboxNormalized": [0.5, 0.18, 0.7, 0.22],
+                    },
+                    {
+                        "blockId": "abstract-heading",
+                        "text": "Abstract",
+                        "bboxNormalized": [0.4, 0.3, 0.6, 0.32],
+                    },
+                    {
+                        "blockId": "abstract-body",
+                        "text": "Abstract body.",
+                        "bboxNormalized": [0.1, 0.34, 0.9, 0.4],
+                    },
+                    {
+                        "blockId": "caption",
+                        "text": "Figure 1: Example.",
+                        "bboxNormalized": [0.1, 0.42, 0.9, 0.44],
+                    },
+                ],
+            },
+            {
+                "pageNumber": 2,
+                "widthPdf": 600,
+                "heightPdf": 800,
+                "blocks": [
+                    {
+                        "blockId": "body",
+                        "text": "Real body continuation.",
+                        "bboxNormalized": [0.1, 0.1, 0.9, 0.2],
+                    }
+                ],
+            },
+        ],
+    }
+    structure = {
+        "warnings": [],
+        "sections": [
+            {
+                "sectionId": "sec-abstract",
+                "number": None,
+                "titleBlockId": "abstract-heading",
+                "level": 1,
+                "parentSectionId": None,
+                "pageStart": 1,
+            }
+        ],
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": block_id,
+                        "role": role,
+                        "readingOrder": index,
+                        "sectionId": section_id,
+                        "paragraphId": paragraph_id,
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "confidence": 1,
+                        "warnings": [],
+                    }
+                    for index, (block_id, role, section_id, paragraph_id) in enumerate(
+                        [
+                            ("title", "title", None, None),
+                            ("column-a", "paragraph", None, "para-column-a"),
+                            ("abstract-heading", "heading", "sec-abstract", None),
+                            ("abstract-body", "abstract", "sec-abstract", "para-abstract"),
+                            ("column-b", "paragraph", "sec-abstract", "para-column-b"),
+                            ("caption", "caption", "sec-abstract", None),
+                        ],
+                        1,
+                    )
+                ],
+                "visualObjects": [
+                    {
+                        "objectId": "figure-1",
+                        "kind": "figure",
+                        "label": "Figure 1",
+                        "bboxNormalized": [0.1, 0.45, 0.9, 0.7],
+                        "captionBlockIds": ["caption"],
+                        "insertAfterBlockId": "column-b",
+                        "pageNumber": 1,
+                        "asset": "assets/figure-1.png",
+                        "confidence": 1,
+                        "warnings": [],
+                    }
+                ],
+            },
+            {
+                "pageNumber": 2,
+                "blockAssignments": [
+                    {
+                        "blockId": "body",
+                        "role": "paragraph",
+                        "readingOrder": 1,
+                        "sectionId": "sec-abstract",
+                        "paragraphId": "para-column-b",
+                        "continuesFrom": "column-b",
+                        "hidden": False,
+                        "confidence": 1,
+                        "warnings": [],
+                    }
+                ],
+                "visualObjects": [],
+            },
+        ],
+    }
+    pdf_lines = [
+        {
+            "text": text,
+            "bboxNormalized": [x, y, x + 0.15, y + 0.012],
+            "fontSizeMax": 10,
+            "boldRatio": 1 if role == "author" else 0,
+            "mathRatio": 0,
+        }
+        for text, x, y, role in [
+            ("A One", 0.1, 0.18, "author"),
+            ("B Two", 0.5, 0.181, "author"),
+            ("C Three", 0.1, 0.205, "author"),
+            ("D Four", 0.5, 0.206, "author"),
+            ("Example Institute", 0.3, 0.23, "affiliation"),
+            ("team@example.org", 0.3, 0.25, "metadata"),
+        ]
+    ]
+
+    recovered = adapter._recover_page_one_front_matter(
+        evidence, structure, pdf_lines
+    )
+
+    assert recovered == 6
+    page_one_assignments = structure["pages"][0]["blockAssignments"]
+    block_text = {
+        block["blockId"]: block["text"] for block in evidence["pages"][0]["blocks"]
+    }
+    assert [
+        block_text[assignment["blockId"]]
+        for assignment in page_one_assignments
+        if assignment["role"] == "author"
+    ] == ["A One", "B Two", "C Three", "D Four"]
+    assert next(
+        assignment
+        for assignment in structure["pages"][1]["blockAssignments"]
+        if assignment["blockId"] == "body"
+    )["continuesFrom"] is None
+    assert structure["pages"][0]["visualObjects"][0]["insertAfterBlockId"] == (
+        "caption"
+    )
+    semantic = build_semantic_document(evidence, structure, [])
+    assert [value["original"] for value in semantic["frontMatter"]["authors"]] == [
+        "A One",
+        "B Two",
+        "C Three",
+        "D Four",
+    ]
+    originals = [
+        item["value"]["original"]
+        for section in semantic["sections"]
+        for item in section["content"]
+        if item["type"] == "unit"
+    ]
+    assert "B Two D Four" not in originals
+    assert "Real body continuation." in originals
+
+
+def test_front_line_roles_do_not_promote_affiliations_or_split_email_lists() -> None:
+    assert adapter._front_line_role("UC Berkeley") == "affiliation"
+    assert adapter._front_line_role("{alice, bob,") == "metadata"
+    assert adapter._front_line_role("carol, dave}@example.org") == "metadata"
+    assert adapter._front_line_role("Ada Lovelace ada@example.org") == "author"
+    assert adapter._front_line_role("Runway ML") == "affiliation"
+    assert adapter._front_line_role("https://example.org/project") == "metadata"
+
+
+def test_demotes_inline_labels_without_removing_real_numbered_sections() -> None:
+    texts = {
+        "parent": "Appendix O. Prompts",
+        "label": "[original toxic prompt]",
+        "body": "Prompt text.",
+        "bullet": "· Batch size: 16, 32",
+        "reference": "[36] T. Liao et al. Example paper.",
+        "real": "2.1 Real subsection",
+    }
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {
+                        "blockId": block_id,
+                        "sourceBlockId": block_id,
+                        "text": text,
+                    }
+                    for block_id, text in texts.items()
+                ],
+            }
+        ]
+    }
+    assignments = [
+        {
+            "blockId": block_id,
+            "role": "paragraph" if block_id == "body" else "heading",
+            "readingOrder": index,
+            "sectionId": (
+                "sec-label" if block_id in {"label", "body"} else f"sec-{block_id}"
+            ),
+            "paragraphId": "para-body" if block_id == "body" else None,
+            "continuesFrom": None,
+            "hidden": False,
+            "confidence": 1,
+            "warnings": [],
+        }
+        for index, block_id in enumerate(texts, 1)
+    ]
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": assignments,
+                "visualObjects": [],
+            }
+        ],
+        "sections": [
+            {
+                "sectionId": "sec-parent",
+                "number": "O",
+                "titleBlockId": "parent",
+                "level": 3,
+                "parentSectionId": None,
+                "pageStart": 1,
+            },
+            *[
+                {
+                    "sectionId": section_id,
+                    "number": "2.1" if block_id == "real" else None,
+                    "titleBlockId": block_id,
+                    "level": 5,
+                    "parentSectionId": "sec-parent",
+                    "pageStart": 1,
+                }
+                for block_id, section_id in (
+                    ("label", "sec-label"),
+                    ("bullet", "sec-bullet"),
+                    ("reference", "sec-reference"),
+                    ("real", "sec-real"),
+                )
+            ],
+        ],
+    }
+
+    demoted = adapter._demote_mislabeled_docling_headings(evidence, structure)
+
+    assert demoted == ["bullet", "label", "reference"]
+    by_id = {assignment["blockId"]: assignment for assignment in assignments}
+    assert by_id["label"]["role"] == "paragraph"
+    assert by_id["bullet"]["role"] == "list_item"
+    assert by_id["reference"]["role"] == "reference"
+    assert by_id["body"]["sectionId"] == "sec-parent"
+    assert by_id["real"]["role"] == "heading"
+    assert {section["sectionId"] for section in structure["sections"]} == {
+        "sec-parent",
+        "sec-real",
+    }
+
+
+def _continuation_fixture(
+    *,
+    candidate_text: str = "projection dimension , do not affect performance.",
+    candidate_bbox: list[float] | None = None,
+) -> tuple[dict, dict]:
+    candidate_bbox = candidate_bbox or [0.2, 0.22, 0.62, 0.24]
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {
+                        "blockId": "previous",
+                        "text": "Other hyperparameters, such as the r",
+                        "bboxNormalized": [0.2, 0.18, 0.62, 0.21],
+                    },
+                    {
+                        "blockId": "candidate",
+                        "text": candidate_text,
+                        "bboxNormalized": candidate_bbox,
+                    },
+                ],
+            }
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": "previous",
+                        "role": "paragraph",
+                        "readingOrder": 1,
+                        "sectionId": "sec-1",
+                        "paragraphId": "para-previous",
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "warnings": [],
+                    },
+                    {
+                        "blockId": "candidate",
+                        "role": "paragraph",
+                        "readingOrder": 2,
+                        "sectionId": "sec-1",
+                        "paragraphId": "para-candidate",
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "warnings": [],
+                    },
+                ],
+                "visualObjects": [],
+            }
+        ],
+        "sections": [],
+    }
+    return evidence, structure
+
+
+def test_lowercase_repair_restores_only_a_horizontally_matching_pdf_line() -> None:
+    evidence, structure = _continuation_fixture()
+    repaired = adapter._repair_lowercase_body_continuations(
+        evidence,
+        structure,
+        {
+            1: [
+                {
+                    "text": "projection dimension r, do not affect performance.",
+                    "bboxNormalized": [0.2, 0.22, 0.62, 0.24],
+                }
+            ]
+        },
+    )
+
+    blocks = {
+        block["blockId"]: block
+        for page in evidence["pages"]
+        for block in page["blocks"]
+    }
+    candidate = structure["pages"][0]["blockAssignments"][1]
+    assert repaired == ["candidate"]
+    assert blocks["previous"]["text"] == "Other hyperparameters, such as the"
+    assert blocks["candidate"]["text"] == (
+        "projection dimension r, do not affect performance."
+    )
+    assert candidate["paragraphId"] == "para-previous"
+    assert candidate["continuesFrom"] == "previous"
+
+
+def test_lowercase_repair_does_not_expand_a_middle_fragment_to_full_pdf_line() -> None:
+    evidence, structure = _continuation_fixture(
+        candidate_text=(
+            "to place all mass on a blank image, and, for the sake of argument, "
+            "taking"
+        ),
+        candidate_bbox=[0.3, 0.22, 0.7, 0.24],
+    )
+    adapter._repair_lowercase_body_continuations(
+        evidence,
+        structure,
+        {
+            1: [
+                {
+                    "text": (
+                        "p(xT) to place all mass on a blank image, and, for the "
+                        "sake of argument, taking ptheta(xt-1|xt) to"
+                    ),
+                    "bboxNormalized": [0.1, 0.22, 0.9, 0.24],
+                }
+            ]
+        },
+    )
+
+    candidate = evidence["pages"][0]["blocks"][1]
+    assert candidate["text"] == (
+        "to place all mass on a blank image, and, for the sake of argument, "
+        "taking"
+    )
+
+
+def test_lowercase_repair_preserves_exact_segments_from_one_docling_item() -> None:
+    evidence, structure = _continuation_fixture(
+        candidate_text="relative to 16-bit floating point.",
+    )
+    previous_block, candidate_block = evidence["pages"][0]["blocks"]
+    previous_block["text"] = "without degradation"
+    previous_block["sourceBlockId"] = "#/texts/86"
+    candidate_block["sourceBlockId"] = "#/texts/86"
+    previous, candidate = structure["pages"][0]["blockAssignments"]
+    candidate["paragraphId"] = previous["paragraphId"]
+    candidate["continuesFrom"] = previous["blockId"]
+
+    repaired = adapter._repair_lowercase_body_continuations(
+        evidence,
+        structure,
+        {
+            1: [
+                {
+                    "text": "degradation rel-",
+                    "bboxNormalized": [0.2, 0.22, 0.62, 0.24],
+                }
+            ]
+        },
+    )
+
+    assert repaired == []
+    assert previous_block["text"] == "without degradation"
+    assert candidate_block["text"] == "relative to 16-bit floating point."
+    assert candidate["warnings"] == []
+
+
+def test_lowercase_repair_skips_demoted_plate_labels_and_clean_noops() -> None:
+    evidence, structure = _continuation_fixture(
+        candidate_text="layout-to-image synthesis on the COCO dataset"
+    )
+    candidate = structure["pages"][0]["blockAssignments"][1]
+    candidate["warnings"] = [
+        "A Docling section header was restored as a qualitative plate label."
+    ]
+
+    assert adapter._repair_lowercase_body_continuations(
+        evidence, structure
+    ) == []
+    assert candidate["paragraphId"] == "para-candidate"
+    assert candidate["continuesFrom"] is None
+
+    candidate["warnings"] = []
+    candidate["paragraphId"] = "para-previous"
+    candidate["continuesFrom"] = "previous"
+    assert adapter._repair_lowercase_body_continuations(
+        evidence, structure
+    ) == []
+    assert candidate["warnings"] == []
+
+
+def test_normalizes_plural_object_references_and_displaced_diaeresis() -> None:
+    assert adapter._object_references(
+        "See Figs. 3 and 4, Tables 2 and 3, and Algorithms 5 and 6."
+    ) == [
+        "Figure 3",
+        "Figure 4",
+        "Table 2",
+        "Table 3",
+        "Algorithm 5",
+        "Algorithm 6",
+    ]
+    assert adapter._object_references("Eq. (14) and Figure B.1") == [
+        "Equation 14",
+        "Figure B.1",
+    ]
+    assert adapter._normalize_displaced_pdf_diacritics("Bj¨ orn Ommer") == (
+        "Björn Ommer"
+    )
+
+
+def test_plans_parallel_table_split_from_the_actual_column_gap() -> None:
+    lines = [
+        {
+            "text": "Table 1: Left results.",
+            "bboxNormalized": [0.19, 0.09, 0.49, 0.105],
+        },
+        {
+            "text": "NLL Test (Train)",
+            "bboxNormalized": [0.47, 0.11, 0.55, 0.12],
+        },
+        {
+            "text": "Table 2: Right ablation",
+            "bboxNormalized": [0.56, 0.115, 0.81, 0.128],
+        },
+        {
+            "text": "continued caption text",
+            "bboxNormalized": [0.56, 0.129, 0.81, 0.141],
+        },
+        {
+            "text": "Objective",
+            "bboxNormalized": [0.57, 0.19, 0.64, 0.20],
+        },
+    ]
+
+    plan = adapter._parallel_labeled_visual_split_plan(
+        lines, [0.175, 0.104, 0.825, 0.33]
+    )
+
+    assert plan is not None
+    assert plan["separator"] == pytest.approx(0.555)
+    assert [value["label"] for value in plan["objects"]] == [
+        "Table 1",
+        "Table 2",
+    ]
+    assert plan["objects"][1]["captionText"] == (
+        "Table 2: Right ablation continued caption text"
+    )
+    assert (
+        adapter._parallel_labeled_visual_split_plan(
+            lines[:2], [0.175, 0.104, 0.825, 0.33]
+        )
+        is None
+    )
+    assert adapter._join_parallel_caption_lines(
+        ["Table 2: objec-", "tive on out-of-", "range data."]
+    ) == "Table 2: objective on out-of-range data."
+
+
+def test_suppresses_only_unnumbered_equation_overlays_spanning_a_stack() -> None:
+    block_specs = {
+        "dl-texts-1": ("x = 1 (1)", [0.2, 0.20, 0.8, 0.25]),
+        "dl-texts-2": ("y = 2 (2)", [0.2, 0.26, 0.8, 0.31]),
+        "dl-texts-overlay": ("≥ | ≥", [0.3, 0.19, 0.5, 0.32]),
+        "dl-texts-numbered": ("x (3)", [0.3, 0.19, 0.5, 0.32]),
+        "dl-texts-single": ("≥", [0.21, 0.20, 0.25, 0.24]),
+    }
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {"blockId": block_id, "text": text, "bboxNormalized": bbox}
+                    for block_id, (text, bbox) in block_specs.items()
+                ],
+            }
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": block_id,
+                        "role": "equation",
+                        "readingOrder": index,
+                        "sectionId": "sec-1",
+                        "paragraphId": None,
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "warnings": [],
+                    }
+                    for index, block_id in enumerate(block_specs, 1)
+                ],
+                "visualObjects": [
+                    {
+                        "objectId": f"equation-{block_id.removeprefix('dl-')}",
+                        "kind": "equation",
+                        "bboxNormalized": bbox,
+                        "insertAfterBlockId": "dl-texts-1",
+                    }
+                    for block_id, (_text, bbox) in block_specs.items()
+                ],
+            }
+        ]
+    }
+
+    suppressed = adapter._suppress_overlapping_equation_fragments(
+        evidence, structure
+    )
+
+    assert suppressed == ["equation-texts-overlay"]
+    remaining = {
+        visual["objectId"] for visual in structure["pages"][0]["visualObjects"]
+    }
+    assert "equation-texts-numbered" in remaining
+    assert "equation-texts-single" in remaining
+
+
+def test_equation_reanchor_allows_small_overlap_and_keeps_narrow_existing_anchor() -> None:
+    block_specs = {
+        "dl-texts-190": ("z = 0 (3)", [0.2, 0.80, 0.8, 0.86], "equation", 1),
+        "dl-texts-191": ("q = 1 (4)", [0.3, 0.885, 0.8, 0.92], "equation", 2),
+        "dl-texts-192": ("where the next term is", [0.2, 0.87, 0.8, 0.897], "paragraph", 3),
+        "dl-texts-343": ("a = 1 (13)", [0.37, 0.14, 0.89, 0.17], "equation", 4),
+        "dl-texts-344": ("Following [30], we use the reparameterization", [0.08, 0.173, 0.382, 0.184], "paragraph", 5),
+        "dl-texts-345": ("b = 2 (14)", [0.375, 0.200, 0.89, 0.215], "equation", 6),
+    }
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {"blockId": key, "text": value[0], "bboxNormalized": value[1]}
+                    for key, value in block_specs.items()
+                ],
+            }
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": key,
+                        "role": value[2],
+                        "readingOrder": value[3],
+                        "sectionId": "sec-1",
+                        "paragraphId": f"para-{key}" if value[2] == "paragraph" else None,
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "warnings": [],
+                    }
+                    for key, value in block_specs.items()
+                ],
+                "visualObjects": [
+                    {
+                        "objectId": "equation-texts-191",
+                        "kind": "equation",
+                        "bboxNormalized": block_specs["dl-texts-191"][1],
+                        "insertAfterBlockId": "dl-texts-190",
+                        "warnings": [],
+                    },
+                    {
+                        "objectId": "equation-texts-345",
+                        "kind": "equation",
+                        "bboxNormalized": block_specs["dl-texts-345"][1],
+                        "insertAfterBlockId": "dl-texts-344",
+                        "warnings": [],
+                    },
+                ],
+            }
+        ]
+    }
+
+    adapter._reanchor_equations_by_geometry(evidence, structure)
+
+    visuals = {
+        visual["objectId"]: visual
+        for visual in structure["pages"][0]["visualObjects"]
+    }
+    assert visuals["equation-texts-191"]["insertAfterBlockId"] == "dl-texts-192"
+    assert visuals["equation-texts-345"]["insertAfterBlockId"] == "dl-texts-344"
+
+
+def test_absorbs_an_immediately_preceding_equation_minus_into_the_crop() -> None:
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {
+                        "blockId": "intro",
+                        "text": "The ELBO decomposes as",
+                        "bboxNormalized": [0.1, 0.60, 0.8, 0.63],
+                    },
+                    {
+                        "blockId": "minus",
+                        "text": "-",
+                        "bboxNormalized": [0.210, 0.678, 0.223, 0.689],
+                    },
+                    {
+                        "blockId": "dl-texts-335",
+                        "text": "log p(x) <= KL(q|p) (9)",
+                        "bboxNormalized": [0.227, 0.665, 0.89, 0.703],
+                    },
+                ],
+            }
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": block_id,
+                        "role": role,
+                        "readingOrder": index,
+                        "sectionId": "sec-1",
+                        "paragraphId": f"para-{block_id}" if role == "paragraph" else None,
+                        "continuesFrom": None,
+                        "hidden": False,
+                        "warnings": [],
+                    }
+                    for index, (block_id, role) in enumerate(
+                        [("intro", "paragraph"), ("minus", "paragraph"), ("dl-texts-335", "equation")],
+                        1,
+                    )
+                ],
+                "visualObjects": [
+                    {
+                        "objectId": "equation-texts-335",
+                        "kind": "equation",
+                        "bboxNormalized": [0.227, 0.665, 0.89, 0.703],
+                        "insertAfterBlockId": "minus",
+                        "warnings": [],
+                    }
+                ],
+            }
+        ]
+    }
+
+    assert adapter._absorb_adjacent_equation_signs(evidence, structure) == [
+        "minus"
+    ]
+    visual = structure["pages"][0]["visualObjects"][0]
+    minus = structure["pages"][0]["blockAssignments"][1]
+    assert visual["bboxNormalized"] == [0.21, 0.665, 0.89, 0.703]
+    assert visual["insertAfterBlockId"] == "intro"
+    assert minus["role"] == "noise"
+    assert minus["hidden"] is True
+
+
+def test_url_alignment_preserves_following_prose_and_pdf_spacing() -> None:
+    canonical = "https://www-cdn.anthropic.com/Model_Card_Claude_3_Addendum.pdf"
+    printed = (
+        "https: //www-cdn.anthropic.com/Model_Card_ "
+        "Claude_3_Addendum.pdf . The result follows."
+    )
+
+    alignment = adapter._pdf_url_alignment_span(printed, 0, canonical)
+
+    assert alignment is not None
+    assert alignment["complete"] is True
+    assert printed[alignment["end"] :] == " . The result follows."
+    assert adapter._normalize_spaced_urls("https : / /foo.test/ and prose") == (
+        "https://foo.test/ and prose"
+    )
+    assert adapter._normalize_unannotated_printed_urls(
+        "https://crfm. stanford. edu/2023/alpaca. html , 2023"
+    ) == "https://crfm.stanford.edu/2023/alpaca.html , 2023"
+    assert adapter._normalize_unannotated_printed_urls(
+        "https://foo.com . The result"
+    ) == "https://foo.com . The result"
+    assert adapter._normalize_url_text_with_annotations(
+        "Table (http://host.test/leaderboard/ displaylb.php?id=4).",
+        ["http://host.test/leaderboard/displaylb.php?id=4"],
+    ) == "Table (http://host.test/leaderboard/displaylb.php?id=4)."
+    assert adapter._char_span({"charspan": [110, 1033]}, 1031) == (110, 1031)
+    assert adapter._partition_provenance_char_spans(
+        [
+            {"charspan": [0, 9]},
+            {"charspan": [10, 18]},
+        ],
+        "main metric used",
+    ) == [(0, 11), (11, 16)]
+
+
+def test_recovers_a_url_split_across_adjacent_pdf_blocks(tmp_path: Path) -> None:
+    canonical = (
+        "https://developer.nvidia.com/blog/"
+        "getting-immediate-speedups-with-a100-tf32"
+    )
+    source = tmp_path / "split-url.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=600, height=800)
+    page.insert_text((50, 100), "https: //developer.nvidia.com/blog/getting-")
+    page.insert_text((330, 100), "immediate-speedups-with-a100-tf32 , 2020.")
+    page.insert_text((50, 180), "NVIDIA Developer Blog")
+    page.insert_link(
+        {
+            "kind": fitz.LINK_URI,
+            "from": fitz.Rect(45, 84, 290, 106),
+            "uri": canonical,
+        }
+    )
+    page.insert_link(
+        {
+            "kind": fitz.LINK_URI,
+            "from": fitz.Rect(325, 84, 555, 106),
+            "uri": canonical,
+        }
+    )
+    page.insert_link(
+        {
+            "kind": fitz.LINK_URI,
+            "from": fitz.Rect(45, 164, 180, 186),
+            "uri": "https://developer.nvidia.com/",
+        }
+    )
+    pdf.save(source)
+    pdf.close()
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {
+                        "blockId": "url-start",
+                        "text": "https: //developer.nvidia.com/blog/getting-",
+                        "bboxNormalized": [0.07, 0.10, 0.50, 0.14],
+                    },
+                    {
+                        "blockId": "url-end",
+                        "text": "immediate-speedups-with-a100-tf32 , 2020.",
+                        "bboxNormalized": [0.53, 0.10, 0.94, 0.14],
+                    },
+                    {
+                        "blockId": "display-name",
+                        "text": "NVIDIA Developer Blog",
+                        "bboxNormalized": [0.07, 0.20, 0.32, 0.25],
+                    },
+                ],
+            }
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {
+                        "blockId": block_id,
+                        "readingOrder": reading_order,
+                        "hidden": False,
+                        "warnings": [],
+                    }
+                    for reading_order, block_id in enumerate(
+                        ("url-start", "url-end", "display-name"), 1
+                    )
+                ],
+            }
+        ]
+    }
+
+    recovered = adapter._recover_pdf_link_annotations(source, evidence, structure)
+
+    assert evidence["pages"][0]["blocks"][0]["text"] == canonical
+    assert evidence["pages"][0]["blocks"][1]["text"] == ", 2020."
+    assert structure["pages"][0]["blockAssignments"][1]["hidden"] is False
+    assert structure["pages"][0]["blockAssignments"][1]["continuesFrom"] == (
+        "url-start"
+    )
+    assert recovered[0]["mergedBlockIds"] == ["url-end"]
+    assert structure["doclingDiagnostics"]["unrecoveredPrintedUrlLinks"] == []
+
+
+def test_restores_lexical_hyphen_only_in_the_source_line_region(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "linebreak-hyphen.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=600, height=800)
+    page.insert_textbox(
+        fitz.Rect(50, 70, 220, 145),
+        "OR-\nBench comprises\nBench-\nHard subset",
+    )
+    page.insert_text((50, 180), "OR-Bench and OR-Bench-Hard benchmark")
+    pdf.save(source)
+    pdf.close()
+    evidence = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blocks": [
+                    {
+                        "blockId": "near",
+                        "text": "OR- Bench comprises and OR-BenchHard subset",
+                        "bboxNormalized": [0.07, 0.08, 0.40, 0.19],
+                    },
+                    {
+                        "blockId": "far",
+                        "text": "ORBench remains literal here",
+                        "bboxNormalized": [0.55, 0.60, 0.92, 0.67],
+                    },
+                    {
+                        "blockId": "boundary-left",
+                        "text": "Results for OR-",
+                        "bboxNormalized": [0.07, 0.70, 0.40, 0.74],
+                    },
+                    {
+                        "blockId": "boundary-right",
+                        "text": "Bench-Hard subset",
+                        "bboxNormalized": [0.55, 0.10, 0.92, 0.14],
+                    },
+                ],
+            }
+        ]
+    }
+    structure = {
+        "pages": [
+            {
+                "pageNumber": 1,
+                "blockAssignments": [
+                    {"blockId": "near", "hidden": False},
+                    {"blockId": "far", "hidden": False},
+                    {
+                        "blockId": "boundary-left",
+                        "readingOrder": 3,
+                        "paragraphId": "boundary",
+                        "continuesFrom": None,
+                        "hidden": False,
+                    },
+                    {
+                        "blockId": "boundary-right",
+                        "readingOrder": 4,
+                        "paragraphId": "boundary",
+                        "continuesFrom": "boundary-left",
+                        "hidden": False,
+                    },
+                ],
+            }
+        ]
+    }
+
+    adapter._restore_lexical_linebreak_hyphens_from_pdf(
+        source, evidence, structure
+    )
+
+    assert evidence["pages"][0]["blocks"][0]["text"] == (
+        "OR-Bench comprises and OR-Bench-Hard subset"
+    )
+    assert evidence["pages"][0]["blocks"][1]["text"] == (
+        "ORBench remains literal here"
+    )
+    assert evidence["pages"][0]["blocks"][2]["text"] == "Results for"
+    assert evidence["pages"][0]["blocks"][3]["text"] == (
+        "OR-Bench-Hard subset"
+    )

@@ -205,6 +205,24 @@ def test_pdf_qa_fails_closed_for_broken_local_references(tmp_path: Path):
     assert qa["missingLocalAssets"] == ["../escape.png"]
 
 
+def test_pdf_qa_fails_for_a_visible_unlinked_or_spaced_url(tmp_path: Path):
+    publication = tmp_path / "html"
+    publication.mkdir()
+    (publication / "index.html").write_text(
+        "<html><body><p>See https: //example.org/paper.</p></body></html>",
+        encoding="utf-8",
+    )
+
+    qa = write_semantic_pdf_qa(
+        sample_document(), publication, pdf_parser="docling"
+    )
+
+    assert qa["status"] == "failed"
+    assert qa["unlinkedExternalUrlText"] == [
+        "See https: //example.org/paper."
+    ]
+
+
 def test_pdf_qa_rejects_docling_pages_with_missing_geometry(tmp_path: Path):
     publication = tmp_path / "html"
     publication.mkdir()
