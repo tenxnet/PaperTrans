@@ -181,7 +181,7 @@ def _visual_candidates(page: dict[str, Any]) -> list[tuple[float, float, float, 
     return values
 
 
-def _visual_score(
+def visual_caption_score(
     kind: str,
     caption: tuple[float, float, float, float],
     candidate: tuple[float, float, float, float],
@@ -192,16 +192,15 @@ def _visual_score(
         return -1.0
     above_gap = caption[1] - candidate[3]
     below_gap = candidate[1] - caption[3]
-    if kind == "figure" and -0.015 <= above_gap <= 0.75:
-        return 2.0 + overlap - max(0.0, above_gap)
     if kind == "table":
         primary_gap, secondary_gap = below_gap, above_gap
     else:
         primary_gap, secondary_gap = above_gap, below_gap
-    if -0.015 <= primary_gap <= 0.22:
-        return 2.0 + overlap - max(0.0, primary_gap) * 5
+    primary_limit = 0.35 if kind == "figure" else 0.22
+    if -0.015 <= primary_gap <= primary_limit:
+        return 3.0 + overlap - max(0.0, primary_gap) * 6
     if -0.015 <= secondary_gap <= 0.12:
-        return 0.8 + overlap - max(0.0, secondary_gap) * 5
+        return 2.85 + overlap - max(0.0, secondary_gap) * 6
     return -1.0
 
 
@@ -275,7 +274,7 @@ def _detect_visuals(
         caption_rect = _rect(block["bboxNormalized"])
         ranked = sorted(
             (
-                (_visual_score(kind, caption_rect, candidate), candidate)
+                (visual_caption_score(kind, caption_rect, candidate), candidate)
                 for candidate in candidates
                 if candidate not in used_candidates
             ),

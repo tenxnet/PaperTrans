@@ -1,37 +1,131 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import html
+import io
 import json
+import math
 import os
 import re
+import select
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import Any
 
-import pymupdf
 from bs4 import BeautifulSoup, NavigableString, Tag
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
 
+from .arxiv_markdown import render_arxiv_markdown_document
+from .dom_ir import deserialize_article, serialize_article
 from .metrics import record_stage, utc_now
-from .render import create_bundle
+from .render import ARXIV_HTML_TEMPLATE, arxiv_html_artifact_version, create_bundle
 from .translate import _parse_result
 
 
 ARXIV_ORIGIN = "https://arxiv.org"
-ARXIV_ID_RE = re.compile(r"(?P<id>\d{4}\.\d{4,5})(?P<version>v\d+)?", re.IGNORECASE)
+ARXIV_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+ARXIV_MAX_ASSET_BYTES = 32 * 1024 * 1024
+ARXIV_MAX_ASSET_REQUESTS = 512
+ARXIV_MAX_TOTAL_ASSET_BYTES = 256 * 1024 * 1024
+ARXIV_MAX_TOTAL_ASSET_SECONDS = 120.0
+ARXIV_MAX_SVG_BYTES = 4 * 1024 * 1024
+ARXIV_MAX_SVG_ELEMENTS = 5_000
+ARXIV_MAX_SVG_DEPTH = 128
+ARXIV_MAX_EMBEDDED_RASTER_DIMENSION = 8192
+ARXIV_MAX_RASTER_DIMENSION = 4096
+ARXIV_MAX_RASTER_PIXELS = 16_777_216
+ARXIV_IMAGE_WORKER_TIMEOUT_SECONDS = 10.0
+ARXIV_IMAGE_WORKER_CPU_SECONDS = 8
+ARXIV_IMAGE_WORKER_MEMORY_BYTES = 512 * 1024 * 1024
+ARXIV_IMAGE_WORKER_MEMORY_POLL_SECONDS = 0.05
+ARXIV_IMAGE_WORKER_HEARTBEAT_STARTUP_SECONDS = 5.0
+ARXIV_IMAGE_WORKER_HEARTBEAT_STALE_SECONDS = 2.0
+ARXIV_ASSET_MANIFEST_FILENAME = ".papertrans-assets-v2.json"
+ARXIV_ASSET_MANIFEST_SCHEMA = "papertrans.localized-assets"
+ARXIV_ASSET_MANIFEST_VERSION = 2
+ARXIV_ID_RE = re.compile(
+    r"(?P<id>(?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7}))(?P<version>v\d+)?",
+    re.IGNORECASE,
+)
 PLACEHOLDER_RE = re.compile(r"\[\[PTX_\d{4}\]\]")
-DISALLOWED_TAGS = {"script", "iframe", "form", "input", "button", "textarea"}
+DISALLOWED_TAGS = {
+    "animate",
+    "animatemotion",
+    "animatetransform",
+    "applet",
+    "audio",
+    "base",
+    "button",
+    "discard",
+    "embed",
+    "foreignobject",
+    "form",
+    "frame",
+    "frameset",
+    "iframe",
+    "input",
+    "link",
+    "meta",
+    "option",
+    "script",
+    "select",
+    "set",
+    "source",
+    "style",
+    "textarea",
+    "track",
+    "video",
+}
 PROTECTED_TAGS = {"math", "cite", "code", "pre", "svg", "img", "object"}
+PASSIVE_SVG_ELEMENTS = {
+    "circle",
+    "clippath",
+    "defs",
+    "desc",
+    "ellipse",
+    "g",
+    "image",
+    "line",
+    "lineargradient",
+    "marker",
+    "mask",
+    "metadata",
+    "path",
+    "pattern",
+    "polygon",
+    "polyline",
+    "radialgradient",
+    "rect",
+    "stop",
+    "style",
+    "svg",
+    "switch",
+    "symbol",
+    "text",
+    "textpath",
+    "title",
+    "tspan",
+    "use",
+    "view",
+}
+SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace"
+XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
 GLOSSARY = [
     {"source": "LLM", "decision": "preserve", "target": "LLM"},
     {"source": "LLM fingerprinting", "decision": "preserve", "target": "LLM fingerprinting"},
@@ -52,15 +146,135 @@ GLOSSARY = [
 ]
 
 
+class ArxivAcquisitionLimitError(RuntimeError):
+    """Raised before an arXiv response can exceed its acquisition budget."""
+
+
+class _AssetDownloadBudget:
+    """Bound all network and byte work performed while localizing one paper."""
+
+    def __init__(
+        self,
+        *,
+        max_requests: int | None = None,
+        max_total_bytes: int | None = None,
+        max_seconds: float | None = None,
+    ) -> None:
+        self.max_requests = (
+            ARXIV_MAX_ASSET_REQUESTS if max_requests is None else max_requests
+        )
+        self.max_total_bytes = (
+            ARXIV_MAX_TOTAL_ASSET_BYTES
+            if max_total_bytes is None
+            else max_total_bytes
+        )
+        self.max_seconds = (
+            ARXIV_MAX_TOTAL_ASSET_SECONDS if max_seconds is None else max_seconds
+        )
+        self.started_at = perf_counter()
+        self.requests = 0
+        self.total_bytes = 0
+        self.stored_bytes = 0
+        self.exhausted = False
+
+    def _check_time(self) -> None:
+        if perf_counter() - self.started_at > self.max_seconds:
+            self.exhausted = True
+            raise ArxivAcquisitionLimitError(
+                "arXiv aggregate asset time limit exceeded "
+                f"({self.max_seconds:g} seconds)"
+            )
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, self.max_total_bytes - self.total_bytes)
+
+    def begin_request(self) -> int:
+        self._check_time()
+        if self.exhausted or self.requests >= self.max_requests:
+            self.exhausted = True
+            raise ArxivAcquisitionLimitError(
+                f"arXiv asset request limit exceeded ({self.max_requests})"
+            )
+        if self.remaining_bytes <= 0:
+            self.exhausted = True
+            raise ArxivAcquisitionLimitError(
+                f"arXiv aggregate asset limit exceeded ({self.max_total_bytes} bytes)"
+            )
+        self.requests += 1
+        return min(ARXIV_MAX_ASSET_BYTES, self.remaining_bytes)
+
+    def commit(self, size: int) -> None:
+        self._check_time()
+        if size < 0 or size > self.remaining_bytes:
+            self.exhausted = True
+            raise ArxivAcquisitionLimitError(
+                f"arXiv aggregate asset limit exceeded ({self.max_total_bytes} bytes)"
+            )
+        self.total_bytes += size
+
+    def commit_store(self, size: int) -> None:
+        self._check_time()
+        if size < 0 or size > self.max_total_bytes - self.stored_bytes:
+            self.exhausted = True
+            raise ArxivAcquisitionLimitError(
+                f"arXiv stored asset limit exceeded ({self.max_total_bytes} bytes)"
+            )
+        self.stored_bytes += size
+
+    def exhaust(self) -> None:
+        self.exhausted = True
+
+
+def _require_arxiv_https_url(url: str) -> str:
+    """Accept only the official arXiv HTTPS origin for acquired content."""
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("arXiv acquisition URL is invalid") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != "arxiv.org"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        raise ValueError("arXiv acquisition URL must use the official HTTPS origin")
+    return url
+
+
+class _ArxivRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before urllib can contact a non-arXiv destination."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        _require_arxiv_https_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def normalize_arxiv_id(value: str) -> str:
     match = ARXIV_ID_RE.search(value.strip())
     if not match:
         raise ValueError(f"invalid arXiv identifier: {value}")
+    identifier = match.group("id")
+    if "/" in identifier:
+        identifier = identifier.lower()
     version = match.group("version") or ""
-    return f"{match.group('id')}{version.lower()}"
+    return f"{identifier}{version.lower()}"
 
 
-def _request_bytes(url: str, timeout: int = 60) -> tuple[bytes, str, str | None]:
+def _request_bytes(
+    url: str,
+    timeout: int = 60,
+    *,
+    max_bytes: int = ARXIV_MAX_RESPONSE_BYTES,
+) -> tuple[bytes, str, str | None]:
+    if max_bytes <= 0 or max_bytes > ARXIV_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"arXiv response limit must be between 1 and {ARXIV_MAX_RESPONSE_BYTES} bytes"
+        )
+    _require_arxiv_https_url(url)
     request = urllib.request.Request(
         url,
         headers={
@@ -68,20 +282,147 @@ def _request_bytes(url: str, timeout: int = 60) -> tuple[bytes, str, str | None]
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read(), response.geturl(), response.headers.get("Content-Type")
+    opener = urllib.request.build_opener(_ArxivRedirectHandler())
+    with opener.open(request, timeout=timeout) as response:
+        final_url = _require_arxiv_https_url(response.geturl())
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except (TypeError, ValueError):
+                declared_size = None
+            if declared_size is not None and declared_size > max_bytes:
+                raise ArxivAcquisitionLimitError(
+                    f"arXiv response exceeds {max_bytes} bytes"
+                )
+        payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise ArxivAcquisitionLimitError(
+                f"arXiv response exceeds {max_bytes} bytes"
+            )
+        return payload, final_url, response.headers.get("Content-Type")
 
 
-def _sanitize_tree(root: Tag) -> None:
+def _has_unsafe_url_scheme(value: str) -> bool:
+    compact = re.sub(r"[\x00-\x20\x7f]+", "", value)
+    scheme = urllib.parse.urlsplit(compact).scheme.lower()
+    return bool(scheme and scheme not in {"http", "https", "mailto", "tel"})
+
+
+def _has_unsafe_css_reference(value: str) -> bool:
+    without_comments = re.sub(r"/\*.*?\*/", "", value, flags=re.DOTALL)
+    compact = re.sub(r"[\x00-\x20\x7f]+", "", without_comments).lower()
+    if any(
+        marker in compact
+        for marker in (
+            "@import",
+            "behavior:",
+            "data:",
+            "expression(",
+            "file:",
+            "image-set(",
+            "javascript:",
+            "-moz-binding",
+            "//",
+            "://",
+        )
+    ):
+        return True
+    if "\\" in value:
+        return True
+    for reference in re.findall(
+        r"url\(([^)]*)\)",
+        without_comments,
+        flags=re.IGNORECASE,
+    ):
+        normalized = reference.strip().strip("\"'")
+        if not normalized.startswith("#"):
+            return True
+    return False
+
+
+def _is_local_artifact_asset(value: str) -> bool:
+    parsed = urllib.parse.urlsplit(value.strip())
+    if parsed.scheme or parsed.netloc or parsed.query:
+        return False
+    path = PurePosixPath(parsed.path)
+    return (
+        not path.is_absolute()
+        and len(path.parts) >= 2
+        and path.parts[0] == "assets"
+        and ".." not in path.parts
+    )
+
+
+def _sanitize_tree(root: Tag, *, local_resources_only: bool = False) -> None:
+    # LaTeXML sometimes uses foreignObject as a layout wrapper for visible code
+    # or prose. Preserve its children as ordinary HTML before removing active
+    # descendants; dropping the wrapper wholesale loses paper content.
+    for foreign_object in root.find_all("foreignobject"):
+        foreign_object.name = "div"
+        foreign_object.attrs = {"class": ["papertrans-foreign-object"]}
     for tag in list(root.find_all(DISALLOWED_TAGS)):
         tag.decompose()
     for tag in root.find_all(True):
         for attribute in list(tag.attrs):
-            if attribute.lower().startswith("on"):
+            normalized_attribute = attribute.lower()
+            if normalized_attribute.startswith("on") or normalized_attribute in {
+                "base",
+                "xml:base",
+            }:
                 del tag.attrs[attribute]
-        href = tag.get("href")
-        if isinstance(href, str) and href.strip().lower().startswith("javascript:"):
-            del tag.attrs["href"]
+        tag.attrs.pop("srcdoc", None)
+        for attribute in ("background", "imagesrcset", "ping", "srcset"):
+            tag.attrs.pop(attribute, None)
+        for attribute in (
+            "action",
+            "data",
+            "formaction",
+            "href",
+            "poster",
+            "src",
+            "xlink:href",
+        ):
+            value = tag.get(attribute)
+            if isinstance(value, str) and _has_unsafe_url_scheme(value):
+                tag.attrs.pop(attribute, None)
+        style = tag.get("style")
+        if isinstance(style, str) and _has_unsafe_css_reference(style):
+            tag.attrs.pop("style", None)
+        for attribute in (
+            "clip-path",
+            "cursor",
+            "fill",
+            "filter",
+            "marker-end",
+            "marker-mid",
+            "marker-start",
+            "mask",
+            "stroke",
+        ):
+            value = tag.get(attribute)
+            if isinstance(value, str) and _has_unsafe_css_reference(value):
+                tag.attrs.pop(attribute, None)
+        in_svg = tag.name == "svg" or tag.find_parent("svg") is not None
+        if in_svg and tag.name not in {"a", "image"}:
+            for attribute in ("href", "xlink:href"):
+                value = tag.get(attribute)
+                if isinstance(value, str) and not value.strip().startswith("#"):
+                    tag.attrs.pop(attribute, None)
+        if local_resources_only:
+            media_attributes = {
+                "image": ("href", "xlink:href"),
+                "img": ("src",),
+                "object": ("data",),
+            }.get(tag.name, ())
+            for attribute in media_attributes:
+                value = tag.get(attribute)
+                if not isinstance(value, str):
+                    continue
+                if tag.name == "image" and value.strip().startswith("#"):
+                    continue
+                if not _is_local_artifact_asset(value):
+                    tag.attrs.pop(attribute, None)
 
 
 def _citation_metadata(soup: BeautifulSoup) -> dict[str, Any]:
@@ -139,17 +480,659 @@ def _citation_metadata(soup: BeautifulSoup) -> dict[str, Any]:
     return {"authors": authors, "publishedAt": published_at}
 
 
-def _safe_asset_name(url: str) -> str:
+def _safe_asset_name(url: str, *, suffix: str | None = None) -> str:
     parsed = urllib.parse.urlparse(url)
     basename = Path(parsed.path).name or "asset"
+    if suffix is not None:
+        basename = Path(basename).stem
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", basename).strip("-.") or "asset"
+    safe = safe[:80].rstrip("-.") or "asset"
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
-    return f"{digest}-{safe}"
+    return f"{digest}-{safe}{suffix or ''}"
+
+
+def _raster_image_type(payload: bytes) -> tuple[str, str] | None:
+    """Identify supported raster bytes without trusting a URL or MIME header."""
+
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png", "image/png"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return ".jpg", "image/jpeg"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif", "image/gif"
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    return None
+
+
+def _xml_local_name(value: str) -> str:
+    return value.rsplit("}", 1)[-1].lower()
+
+
+def _xml_namespace(value: str) -> str:
+    if value.startswith("{") and "}" in value:
+        return value[1:].split("}", 1)[0]
+    return ""
+
+
+def _validate_embedded_svg_image(value: str) -> None:
+    match = re.fullmatch(
+        r"data:image/(?P<kind>png|jpeg);base64,(?P<data>[A-Za-z0-9+/=\s]+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError("SVG image references must be local fragments or passive data images")
+    encoded = re.sub(r"\s+", "", match.group("data"))
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("SVG contains an invalid embedded image") from error
+    detected = _raster_image_type(decoded)
+    expected = ".png" if match.group("kind").lower() == "png" else ".jpg"
+    if detected is None or detected[0] != expected:
+        raise ValueError("SVG embedded image type does not match its bytes")
+    width, height = _raster_image_dimensions(decoded, detected[0])
+    if (
+        width <= 0
+        or height <= 0
+        or width > ARXIV_MAX_EMBEDDED_RASTER_DIMENSION
+        or height > ARXIV_MAX_EMBEDDED_RASTER_DIMENSION
+        or width * height > ARXIV_MAX_RASTER_PIXELS
+    ):
+        raise ArxivAcquisitionLimitError("SVG embedded image exceeds the pixel budget")
+
+
+def _raster_image_dimensions(payload: bytes, suffix: str) -> tuple[int, int]:
+    if suffix == ".png":
+        if len(payload) < 24 or payload[12:16] != b"IHDR":
+            raise ValueError("PNG is missing an IHDR header")
+        return (
+            int.from_bytes(payload[16:20], "big"),
+            int.from_bytes(payload[20:24], "big"),
+        )
+    if suffix == ".gif":
+        if len(payload) < 10 or not payload.startswith((b"GIF87a", b"GIF89a")):
+            raise ValueError("GIF is missing its logical screen descriptor")
+        return (
+            int.from_bytes(payload[6:8], "little"),
+            int.from_bytes(payload[8:10], "little"),
+        )
+    if suffix == ".webp":
+        if len(payload) < 30 or payload[:4] != b"RIFF" or payload[8:12] != b"WEBP":
+            raise ValueError("WebP is missing its container header")
+        chunk = payload[12:16]
+        if chunk == b"VP8X":
+            return (
+                int.from_bytes(payload[24:27], "little") + 1,
+                int.from_bytes(payload[27:30], "little") + 1,
+            )
+        if chunk == b"VP8 " and payload[23:26] == b"\x9d\x01\x2a":
+            return (
+                int.from_bytes(payload[26:28], "little") & 0x3FFF,
+                int.from_bytes(payload[28:30], "little") & 0x3FFF,
+            )
+        if chunk == b"VP8L" and len(payload) >= 25 and payload[20] == 0x2F:
+            dimensions = int.from_bytes(payload[21:25], "little")
+            return (
+                (dimensions & 0x3FFF) + 1,
+                ((dimensions >> 14) & 0x3FFF) + 1,
+            )
+        raise ValueError("WebP dimensions are missing")
+    if suffix != ".jpg" or not payload.startswith(b"\xff\xd8"):
+        raise ValueError("raster dimensions cannot be validated")
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    offset = 2
+    while offset < len(payload):
+        while offset < len(payload) and payload[offset] == 0xFF:
+            offset += 1
+        if offset >= len(payload):
+            break
+        marker = payload[offset]
+        offset += 1
+        if marker in {0x01, *range(0xD0, 0xDA)}:
+            continue
+        if marker in {0xD9, 0xDA} or offset + 2 > len(payload):
+            break
+        segment_length = int.from_bytes(payload[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(payload):
+            raise ValueError("JPEG contains an invalid segment")
+        if marker in sof_markers:
+            if segment_length < 7:
+                raise ValueError("JPEG contains an invalid frame header")
+            return (
+                int.from_bytes(payload[offset + 5 : offset + 7], "big"),
+                int.from_bytes(payload[offset + 3 : offset + 5], "big"),
+            )
+        offset += segment_length
+    raise ValueError("JPEG dimensions are missing")
+
+
+def _validate_raster_dimensions(
+    payload: bytes,
+    suffix: str,
+    *,
+    max_dimension: int,
+) -> tuple[int, int]:
+    width, height = _raster_image_dimensions(payload, suffix)
+    if (
+        width <= 0
+        or height <= 0
+        or width > max_dimension
+        or height > max_dimension
+        or width * height > ARXIV_MAX_RASTER_PIXELS
+    ):
+        raise ArxivAcquisitionLimitError("raster image exceeds the pixel budget")
+    return width, height
+
+
+def _validate_svg_element(element: ET.Element) -> None:
+    if _xml_namespace(element.tag) not in {"", SVG_NAMESPACE}:
+        raise ValueError("SVG contains a foreign element namespace")
+    element_name = _xml_local_name(element.tag)
+    if element_name not in PASSIVE_SVG_ELEMENTS:
+        raise ValueError(f"SVG element is not allowed: {element_name}")
+    for attribute, value in element.attrib.items():
+        attribute_namespace = _xml_namespace(attribute)
+        if attribute_namespace not in {"", XML_NAMESPACE, XLINK_NAMESPACE}:
+            raise ValueError("SVG contains a foreign attribute namespace")
+        attribute_name = _xml_local_name(attribute)
+        if attribute_namespace == XML_NAMESPACE and attribute_name not in {
+            "lang",
+            "space",
+        }:
+            raise ValueError("SVG contains an unsafe XML namespace attribute")
+        if attribute_namespace == XLINK_NAMESPACE and attribute_name != "href":
+            raise ValueError("SVG contains an unsupported XLink attribute")
+        if attribute_name == "base":
+            raise ValueError("SVG base URL attributes are not allowed")
+        if attribute_name.startswith("on"):
+            raise ValueError("SVG event handlers are not allowed")
+        if attribute_name == "href":
+            if value.startswith("#"):
+                if len(value) > 256 or re.search(r"[\x00-\x20\x7f]", value):
+                    raise ValueError("SVG fragment reference is invalid")
+            elif element_name == "image":
+                _validate_embedded_svg_image(value)
+            else:
+                raise ValueError("SVG external references are not allowed")
+        if attribute_name == "style" and _has_unsafe_css_reference(value):
+            raise ValueError("SVG style contains an external or active reference")
+        if attribute_name in {
+            "clip-path",
+            "cursor",
+            "fill",
+            "filter",
+            "marker-end",
+            "marker-mid",
+            "marker-start",
+            "mask",
+            "stroke",
+        } and _has_unsafe_css_reference(value):
+            raise ValueError("SVG presentation attribute contains an external reference")
+
+
+def _validate_passive_svg(payload: bytes) -> bytes:
+    if len(payload) > ARXIV_MAX_SVG_BYTES:
+        raise ArxivAcquisitionLimitError(
+            f"SVG exceeds {ARXIV_MAX_SVG_BYTES} bytes"
+        )
+    if re.search(br"<!\s*(?:DOCTYPE|ENTITY)\b", payload, flags=re.IGNORECASE):
+        raise ValueError("SVG document declarations are not allowed")
+    without_declaration = re.sub(
+        br"^\s*<\?xml(?:\s[^?]*?)?\?>",
+        b"",
+        payload,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if b"<?" in without_declaration:
+        raise ValueError("SVG processing instructions are not allowed")
+    try:
+        parser = ET.iterparse(io.BytesIO(payload), events=("start", "end"))
+        root: ET.Element | None = None
+        element_count = 0
+        depth = 0
+        for event, element in parser:
+            if event == "start":
+                depth += 1
+                element_count += 1
+                if root is None:
+                    root = element
+                if element_count > ARXIV_MAX_SVG_ELEMENTS:
+                    raise ArxivAcquisitionLimitError(
+                        f"SVG exceeds {ARXIV_MAX_SVG_ELEMENTS} elements"
+                    )
+                if depth > ARXIV_MAX_SVG_DEPTH:
+                    raise ArxivAcquisitionLimitError(
+                        f"SVG exceeds nesting depth {ARXIV_MAX_SVG_DEPTH}"
+                    )
+                _validate_svg_element(element)
+            else:
+                if _xml_local_name(element.tag) == "style":
+                    css = "".join(element.itertext())
+                    if _has_unsafe_css_reference(css):
+                        raise ValueError(
+                            "SVG style contains an external or active reference"
+                        )
+                depth -= 1
+    except ET.ParseError as error:
+        raise ValueError("downloaded SVG is not well-formed XML") from error
+    if root is None:
+        raise ValueError("downloaded SVG is empty")
+    if _xml_local_name(root.tag) != "svg":
+        raise ValueError("downloaded XML is not an SVG document")
+    ET.register_namespace("", SVG_NAMESPACE)
+    ET.register_namespace("xlink", XLINK_NAMESPACE)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _rasterize_passive_svg(payload: bytes) -> bytes:
+    import pymupdf
+
+    safe_payload = _validate_passive_svg(payload)
+    with pymupdf.open(stream=safe_payload, filetype="svg") as document:
+        if document.page_count != 1:
+            raise ValueError("SVG must contain exactly one renderable page")
+        page = document[0]
+        width = float(page.rect.width)
+        height = float(page.rect.height)
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(height)
+            or width <= 0
+            or height <= 0
+        ):
+            raise ValueError("SVG has invalid intrinsic dimensions")
+        scale = min(
+            2.0,
+            ARXIV_MAX_RASTER_DIMENSION / max(width, height),
+            math.sqrt(ARXIV_MAX_RASTER_PIXELS / (width * height)),
+        )
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("SVG raster scale is invalid")
+        pixmap = page.get_pixmap(
+            matrix=pymupdf.Matrix(scale, scale),
+            alpha=False,
+        )
+        if (
+            pixmap.width <= 0
+            or pixmap.height <= 0
+            or pixmap.width > ARXIV_MAX_RASTER_DIMENSION
+            or pixmap.height > ARXIV_MAX_RASTER_DIMENSION
+            or pixmap.width * pixmap.height > ARXIV_MAX_RASTER_PIXELS
+        ):
+            raise ArxivAcquisitionLimitError("SVG raster exceeds the output pixel budget")
+        rendered = pixmap.tobytes("png")
+    if len(rendered) > ARXIV_MAX_ASSET_BYTES:
+        raise ArxivAcquisitionLimitError("SVG raster exceeds the asset byte budget")
+    return rendered
+
+
+def _rasterize_passive_raster(payload: bytes, suffix: str) -> bytes:
+    import pymupdf
+
+    width, height = _validate_raster_dimensions(
+        payload,
+        suffix,
+        max_dimension=ARXIV_MAX_EMBEDDED_RASTER_DIMENSION,
+    )
+    filetype = {".png": "png", ".jpg": "jpeg", ".gif": "gif", ".webp": "webp"}[suffix]
+    try:
+        with pymupdf.open(stream=payload, filetype=filetype) as document:
+            if document.page_count != 1:
+                raise ValueError("animated or multi-page raster images are not supported")
+            page = document[0]
+            scale = min(
+                1.0,
+                ARXIV_MAX_RASTER_DIMENSION / max(width, height),
+                math.sqrt(ARXIV_MAX_RASTER_PIXELS / (width * height)),
+            )
+            pixmap = page.get_pixmap(
+                matrix=pymupdf.Matrix(scale, scale),
+                alpha=False,
+            )
+            if (
+                pixmap.width <= 0
+                or pixmap.height <= 0
+                or pixmap.width > ARXIV_MAX_RASTER_DIMENSION
+                or pixmap.height > ARXIV_MAX_RASTER_DIMENSION
+                or pixmap.width * pixmap.height > ARXIV_MAX_RASTER_PIXELS
+            ):
+                raise ArxivAcquisitionLimitError(
+                    "normalized raster exceeds the output pixel budget"
+                )
+            rendered = pixmap.tobytes("png")
+    except (ArxivAcquisitionLimitError, ValueError):
+        raise
+    except (OSError, RuntimeError) as error:
+        raise ValueError("raster image cannot be decoded safely") from error
+    if len(rendered) > ARXIV_MAX_ASSET_BYTES:
+        raise ArxivAcquisitionLimitError(
+            "normalized raster exceeds the asset byte budget"
+        )
+    return rendered
+
+
+def _normalize_passive_image_payload(payload: bytes) -> bytes:
+    """Decode untrusted bytes in the isolated worker and emit bounded PNG."""
+
+    detected = _raster_image_type(payload)
+    if detected is not None:
+        return _rasterize_passive_raster(payload, detected[0])
+    if re.search(br"<svg\b", payload[:4096], flags=re.IGNORECASE):
+        return _rasterize_passive_svg(payload)
+    raise ValueError("downloaded arXiv media is not a supported passive image")
+
+
+def _image_worker_environment() -> dict[str, str]:
+    return {
+        key: os.environ[key]
+        for key in ("LANG", "LC_ALL", "PATH", "SYSTEMROOT", "TMPDIR")
+        if key in os.environ
+    }
+
+
+def _run_image_worker(command: list[str], temporary_dir: Path) -> int:
+    """Run the image worker with an external liveness/RSS heartbeat guard."""
+
+    read_fd, write_fd = os.pipe()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        os.set_blocking(read_fd, False)
+        environment = _image_worker_environment()
+        environment["PAPERTRANS_IMAGE_HEARTBEAT_FD"] = str(write_fd)
+        process = subprocess.Popen(
+            command,
+            cwd=temporary_dir,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(write_fd,),
+            shell=False,
+            start_new_session=False,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        started_at = perf_counter()
+        last_heartbeat = started_at
+        heartbeat_seen = False
+        heartbeat_buffer = b""
+        while True:
+            now = perf_counter()
+            ready, _, _ = select.select([read_fd], [], [], 0.025)
+            if ready:
+                with suppress(BlockingIOError):
+                    heartbeat_buffer += os.read(read_fd, 4096)
+                while b"\n" in heartbeat_buffer:
+                    raw_value, heartbeat_buffer = heartbeat_buffer.split(b"\n", 1)
+                    try:
+                        resident_bytes = int(raw_value)
+                    except ValueError as error:
+                        raise ArxivAcquisitionLimitError(
+                            "arXiv image worker emitted an invalid memory heartbeat"
+                        ) from error
+                    if resident_bytes < 0 or resident_bytes > ARXIV_IMAGE_WORKER_MEMORY_BYTES:
+                        raise ArxivAcquisitionLimitError(
+                            "arXiv image normalization exceeded its memory limit"
+                        )
+                    heartbeat_seen = True
+                    last_heartbeat = now
+
+            returncode = process.poll()
+            if returncode is not None:
+                if returncode == 0 and not heartbeat_seen:
+                    raise ArxivAcquisitionLimitError(
+                        "arXiv image worker memory supervision did not start"
+                    )
+                return returncode
+            if now - started_at > ARXIV_IMAGE_WORKER_TIMEOUT_SECONDS:
+                raise ArxivAcquisitionLimitError(
+                    "arXiv image normalization exceeded its wall-clock limit"
+                )
+            heartbeat_limit = (
+                ARXIV_IMAGE_WORKER_HEARTBEAT_STALE_SECONDS
+                if heartbeat_seen
+                else ARXIV_IMAGE_WORKER_HEARTBEAT_STARTUP_SECONDS
+            )
+            heartbeat_reference = last_heartbeat if heartbeat_seen else started_at
+            if now - heartbeat_reference > heartbeat_limit:
+                raise ArxivAcquisitionLimitError(
+                    "arXiv image worker memory supervision became unresponsive"
+                )
+    finally:
+        if write_fd >= 0:
+            with suppress(OSError):
+                os.close(write_fd)
+        with suppress(OSError):
+            os.close(read_fd)
+        if process is not None and process.poll() is None:
+            with suppress(OSError):
+                process.kill()
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+
+
+def _normalize_passive_image(payload: bytes) -> tuple[bytes, str, str]:
+    """Normalize untrusted media in a supervised subprocess."""
+
+    if len(payload) > ARXIV_MAX_ASSET_BYTES:
+        raise ArxivAcquisitionLimitError(
+            f"arXiv media exceeds {ARXIV_MAX_ASSET_BYTES} bytes"
+        )
+    with tempfile.TemporaryDirectory(prefix="papertrans-image-") as temporary_name:
+        temporary_dir = Path(temporary_name)
+        input_path = temporary_dir / "input.bin"
+        output_path = temporary_dir / "output.png"
+        input_path.write_bytes(payload)
+        returncode = _run_image_worker(
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "papertrans.image_worker",
+                str(input_path),
+                str(output_path),
+            ],
+            temporary_dir,
+        )
+        if returncode == 2:
+            raise ValueError("downloaded arXiv media failed safe image validation")
+        if returncode == 3 or returncode < 0:
+            raise ArxivAcquisitionLimitError(
+                "arXiv image normalization exceeded a worker resource limit"
+            )
+        if returncode != 0:
+            raise ValueError("downloaded arXiv media could not be normalized")
+        try:
+            output_info = output_path.lstat()
+        except OSError as error:
+            raise ValueError("arXiv image worker did not produce an output") from error
+        if not stat.S_ISREG(output_info.st_mode) or output_path.is_symlink():
+            raise ValueError("arXiv image worker output is not a regular file")
+        if output_info.st_size > ARXIV_MAX_ASSET_BYTES:
+            raise ArxivAcquisitionLimitError(
+                "arXiv image worker output exceeds the asset byte budget"
+            )
+        with output_path.open("rb") as handle:
+            normalized = handle.read(ARXIV_MAX_ASSET_BYTES + 1)
+        if len(normalized) > ARXIV_MAX_ASSET_BYTES:
+            raise ArxivAcquisitionLimitError(
+                "arXiv image worker output exceeds the asset byte budget"
+            )
+        if _raster_image_type(normalized) != (".png", "image/png"):
+            raise ValueError("arXiv image worker output is not PNG")
+        _validate_raster_dimensions(
+            normalized,
+            ".png",
+            max_dimension=ARXIV_MAX_RASTER_DIMENSION,
+        )
+        return normalized, ".png", "image/png"
+
+
+def _write_asset_manifest(
+    assets_dir: Path,
+    downloaded: list[dict[str, Any]],
+) -> None:
+    manifest = {
+        "schema": ARXIV_ASSET_MANIFEST_SCHEMA,
+        "version": ARXIV_ASSET_MANIFEST_VERSION,
+        "assets": [
+            {
+                "path": asset["path"],
+                "bytes": asset["bytes"],
+                "sha256": asset["sha256"],
+                "contentType": asset["contentType"],
+            }
+            for asset in downloaded
+        ],
+    }
+    destination = assets_dir / ARXIV_ASSET_MANIFEST_FILENAME
+    temporary = assets_dir / f"{ARXIV_ASSET_MANIFEST_FILENAME}.tmp"
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+
+
+def _referenced_local_assets(article: Tag) -> list[str]:
+    references: set[str] = set()
+    selectors = (
+        ("img", "src"),
+        ("object", "data"),
+        ("image", "href"),
+        ("image", "xlink:href"),
+    )
+    for tag_name, attribute in selectors:
+        for tag in article.find_all(tag_name):
+            value = tag.get(attribute)
+            if not isinstance(value, str):
+                continue
+            if tag_name == "image" and value.strip().startswith("#"):
+                continue
+            if _is_local_artifact_asset(value):
+                references.add(urllib.parse.urlsplit(value.strip()).path)
+    return sorted(references)
+
+
+def _publish_local_assets(article: Tag, work_dir: Path, output_dir: Path) -> list[str]:
+    """Publish only acquisition-manifested PNG files referenced by final HTML."""
+
+    references = _referenced_local_assets(article)
+    output_assets = output_dir / "assets"
+    if output_assets.exists():
+        shutil.rmtree(output_assets)
+    if not references:
+        return []
+
+    source_assets = work_dir / "assets"
+    manifest_path = source_assets / ARXIV_ASSET_MANIFEST_FILENAME
+    try:
+        manifest_info = manifest_path.lstat()
+        if not stat.S_ISREG(manifest_info.st_mode) or manifest_path.is_symlink():
+            raise ValueError("localized asset manifest is not a regular file")
+        if manifest_info.st_size > 1024 * 1024:
+            raise ArxivAcquisitionLimitError("localized asset manifest is too large")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "localized assets predate the safe image pipeline; reacquire the arXiv source"
+        ) from error
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("localized asset manifest is invalid") from error
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != ARXIV_ASSET_MANIFEST_SCHEMA
+        or manifest.get("version") != ARXIV_ASSET_MANIFEST_VERSION
+        or not isinstance(manifest.get("assets"), list)
+    ):
+        raise RuntimeError("localized asset manifest is invalid")
+
+    entries: dict[str, dict[str, Any]] = {}
+    for raw_entry in manifest["assets"]:
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError("localized asset manifest is invalid")
+        path_value = raw_entry.get("path")
+        if (
+            not isinstance(path_value, str)
+            or not re.fullmatch(r"assets/[A-Za-z0-9._-]+\.png", path_value)
+            or path_value in entries
+        ):
+            raise RuntimeError("localized asset manifest contains an invalid path")
+        entries[path_value] = raw_entry
+
+    output_assets.mkdir(parents=True, exist_ok=True)
+    published: list[str] = []
+    try:
+        for reference in references:
+            entry = entries.get(reference)
+            if entry is None:
+                raise RuntimeError(
+                    f"localized asset is not covered by the safe manifest: {reference}"
+                )
+            expected_size = entry.get("bytes")
+            expected_digest = entry.get("sha256")
+            if (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or expected_size < 0
+                or expected_size > ARXIV_MAX_ASSET_BYTES
+                or not isinstance(expected_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+                or entry.get("contentType") != "image/png"
+            ):
+                raise RuntimeError("localized asset manifest entry is invalid")
+            source = source_assets / reference.removeprefix("assets/")
+            source_info = source.lstat()
+            if not stat.S_ISREG(source_info.st_mode) or source.is_symlink():
+                raise RuntimeError(f"localized asset is not a regular file: {reference}")
+            if source_info.st_size != expected_size:
+                raise RuntimeError(f"localized asset size changed: {reference}")
+            with source.open("rb") as handle:
+                payload = handle.read(ARXIV_MAX_ASSET_BYTES + 1)
+            if (
+                len(payload) != expected_size
+                or hashlib.sha256(payload).hexdigest() != expected_digest
+            ):
+                raise RuntimeError(f"localized asset digest changed: {reference}")
+            if _raster_image_type(payload) != (".png", "image/png"):
+                raise RuntimeError(f"localized asset is not normalized PNG: {reference}")
+            _validate_raster_dimensions(
+                payload,
+                ".png",
+                max_dimension=ARXIV_MAX_RASTER_DIMENSION,
+            )
+            destination = output_assets / source.name
+            destination.write_bytes(payload)
+            published.append(reference)
+    except BaseException:
+        shutil.rmtree(output_assets, ignore_errors=True)
+        raise
+    return published
 
 
 def _asset_url_candidates(base_url: str, raw_url: str) -> list[str]:
     """Return standards-based and arXiv-directory fallback asset URLs."""
+    _require_arxiv_https_url(base_url)
     standard_url = urllib.parse.urljoin(base_url, raw_url)
+    _require_arxiv_https_url(standard_url)
     candidates = [standard_url]
     parsed = urllib.parse.urlparse(raw_url)
     if parsed.scheme or parsed.netloc or raw_url.startswith(("/", "#")):
@@ -162,6 +1145,7 @@ def _asset_url_candidates(base_url: str, raw_url: str) -> list[str]:
         return candidates
 
     directory_url = urllib.parse.urljoin(f"{base_url.rstrip('/')}/", raw_url)
+    _require_arxiv_https_url(directory_url)
     if directory_url not in candidates:
         candidates.append(directory_url)
     return candidates
@@ -170,88 +1154,25 @@ def _asset_url_candidates(base_url: str, raw_url: str) -> list[str]:
 def _request_asset_bytes(
     base_url: str,
     raw_url: str,
+    budget: _AssetDownloadBudget | None = None,
 ) -> tuple[bytes, str, str | None]:
+    budget = budget or _AssetDownloadBudget()
     errors: list[str] = []
     for candidate in _asset_url_candidates(base_url, raw_url):
         try:
-            payload, final_url, content_type = _request_bytes(candidate)
+            max_bytes = budget.begin_request()
+            payload, final_url, content_type = _request_bytes(
+                candidate,
+                max_bytes=max_bytes,
+            )
+            budget.commit(len(payload))
             return payload, final_url, content_type
+        except ArxivAcquisitionLimitError:
+            budget.exhaust()
+            raise
         except Exception as error:
             errors.append(f"{candidate}: {error}")
     raise RuntimeError("; ".join(errors))
-
-
-def _localize_css_file(
-    css_url: str,
-    destination: Path,
-    assets_dir: Path,
-    downloaded: list[dict[str, Any]],
-    failures: list[dict[str, str]],
-    seen: dict[str, str],
-) -> None:
-    if css_url in seen:
-        return
-    seen[css_url] = destination.name
-    try:
-        payload, _, content_type = _request_bytes(css_url)
-        text = payload.decode("utf-8", errors="replace")
-    except Exception as error:
-        failures.append({"url": css_url, "error": str(error)})
-        return
-
-    import_re = re.compile(r"@import\s+([\"'])(?P<url>[^\"']+)\1(?P<suffix>[^;]*);", re.IGNORECASE)
-
-    def replace_import(match: re.Match[str]) -> str:
-        raw_url = match.group("url")
-        import_url = urllib.parse.urljoin(css_url, raw_url)
-        filename = seen.get(import_url) or _safe_asset_name(import_url)
-        _localize_css_file(
-            import_url,
-            assets_dir / filename,
-            assets_dir,
-            downloaded,
-            failures,
-            seen,
-        )
-        return f'@import "{filename}"{match.group("suffix")};'
-
-    text = import_re.sub(replace_import, text)
-    url_re = re.compile(r"url\((?P<quote>[\"']?)(?P<url>[^)\"']+)\1\)", re.IGNORECASE)
-
-    def replace_asset(match: re.Match[str]) -> str:
-        raw_url = match.group("url").strip()
-        if raw_url.startswith(("data:", "#", "http://", "https://")):
-            return match.group(0)
-        asset_url = urllib.parse.urljoin(css_url, raw_url)
-        filename = seen.get(asset_url) or _safe_asset_name(asset_url)
-        if asset_url not in seen:
-            seen[asset_url] = filename
-            try:
-                asset_payload, _, asset_type = _request_bytes(asset_url)
-                (assets_dir / filename).write_bytes(asset_payload)
-                downloaded.append(
-                    {
-                        "url": asset_url,
-                        "path": f"assets/{filename}",
-                        "bytes": len(asset_payload),
-                        "contentType": asset_type,
-                    }
-                )
-            except Exception as error:
-                failures.append({"url": asset_url, "error": str(error)})
-                return match.group(0)
-        return f'url("{filename}")'
-
-    text = url_re.sub(replace_asset, text)
-    destination.write_text(text, encoding="utf-8")
-    downloaded.append(
-        {
-            "url": css_url,
-            "path": f"assets/{destination.name}",
-            "bytes": len(text.encode("utf-8")),
-            "contentType": content_type,
-        }
-    )
 
 
 def _download_assets(
@@ -260,62 +1181,116 @@ def _download_assets(
     base_url: str,
     assets_dir: Path,
 ) -> dict[str, Any]:
+    if assets_dir.exists():
+        shutil.rmtree(assets_dir)
     assets_dir.mkdir(parents=True, exist_ok=True)
     downloaded: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
-    seen: dict[str, str] = {}
-
-    paper_css = next(
-        (
-            link.get("href")
-            for link in source_soup.find_all("link", href=True)
-            if "arxiv-html-papers" in str(link.get("href"))
-        ),
-        None,
-    )
-    if paper_css:
-        css_url = urllib.parse.urljoin(base_url, str(paper_css))
-        _localize_css_file(
-            css_url,
-            assets_dir / "arxiv-paper.css",
-            assets_dir,
-            downloaded,
-            failures,
-            seen,
-        )
-
-    for tag, attribute in [
+    budget = _AssetDownloadBudget()
+    localized: dict[tuple[str, ...], str] = {}
+    localized_final_urls: dict[str, str] = {}
+    failed: set[tuple[str, ...]] = set()
+    references = [
         *((value, "src") for value in article.find_all("img", src=True)),
         *((value, "data") for value in article.find_all("object", data=True)),
-    ]:
-        raw_url = str(tag.get(attribute, ""))
-        if not raw_url or raw_url.startswith("data:"):
+        *((value, "href") for value in article.find_all("image", href=True)),
+        *((value, "xlink:href") for value in article.find_all("image", attrs={"xlink:href": True})),
+    ]
+
+    def apply_local_reference(tag: Tag, attribute: str, filename: str) -> None:
+        if tag.name == "object":
+            replacement = source_soup.new_tag("img")
+            replacement["src"] = f"assets/{filename}"
+            replacement["alt"] = tag.get("aria-label") or "Original figure"
+            for key in ("class", "width", "height"):
+                if tag.get(key) is not None:
+                    replacement[key] = tag.get(key)
+            style = tag.get("style")
+            if isinstance(style, str) and not _has_unsafe_css_reference(style):
+                replacement["style"] = style
+            tag.replace_with(replacement)
+            return
+        tag[attribute] = f"assets/{filename}"
+
+    for index, (tag, attribute) in enumerate(references):
+        raw_url = str(tag.get(attribute, "")).strip()
+        candidates: tuple[str, ...] | None = None
+        if not raw_url:
+            tag.attrs.pop(attribute, None)
+            continue
+        if tag.name == "image" and raw_url.startswith("#"):
+            continue
+        if raw_url.lower().startswith("data:"):
+            failures.append(
+                {"url": "data:<redacted>", "error": "embedded data media cannot be localized"}
+            )
+            tag.attrs.pop(attribute, None)
             continue
         try:
-            payload, asset_url, content_type = _request_asset_bytes(base_url, raw_url)
-            filename = _safe_asset_name(asset_url)
+            candidates = tuple(_asset_url_candidates(base_url, raw_url))
+            if candidates in localized:
+                apply_local_reference(tag, attribute, localized[candidates])
+                continue
+            known_filename = next(
+                (
+                    localized_final_urls[candidate]
+                    for candidate in candidates
+                    if candidate in localized_final_urls
+                ),
+                None,
+            )
+            if known_filename is not None:
+                localized[candidates] = known_filename
+                apply_local_reference(tag, attribute, known_filename)
+                continue
+            if candidates in failed:
+                tag.attrs.pop(attribute, None)
+                continue
+            payload, asset_url, _ = _request_asset_bytes(base_url, raw_url, budget)
+            if asset_url in localized_final_urls:
+                filename = localized_final_urls[asset_url]
+                localized[candidates] = filename
+                apply_local_reference(tag, attribute, filename)
+                continue
+            normalized_payload, suffix, content_type = _normalize_passive_image(payload)
+            filename = _safe_asset_name(asset_url, suffix=suffix)
             destination = assets_dir / filename
-            destination.write_bytes(payload)
+            if destination.exists():
+                if destination.read_bytes() != normalized_payload:
+                    raise RuntimeError("localized asset filename collision")
+                localized[candidates] = filename
+                localized_final_urls[asset_url] = filename
+                apply_local_reference(tag, attribute, filename)
+                continue
+            budget.commit_store(len(normalized_payload))
+            destination.write_bytes(normalized_payload)
+            localized[candidates] = filename
+            localized_final_urls[asset_url] = filename
             downloaded.append(
                 {
                     "url": asset_url,
                     "path": f"assets/{filename}",
-                    "bytes": len(payload),
+                    "bytes": len(normalized_payload),
+                    "sha256": hashlib.sha256(normalized_payload).hexdigest(),
                     "contentType": content_type,
                 }
             )
-            if tag.name == "object":
-                replacement = source_soup.new_tag("img")
-                replacement["src"] = f"assets/{filename}"
-                replacement["alt"] = tag.get("aria-label") or "Original figure"
-                for key in ("class", "style", "width", "height"):
-                    if tag.get(key) is not None:
-                        replacement[key] = tag.get(key)
-                tag.replace_with(replacement)
-            else:
-                tag[attribute] = f"assets/{filename}"
-        except Exception as error:
+            apply_local_reference(tag, attribute, filename)
+        except ArxivAcquisitionLimitError as error:
+            tag.attrs.pop(attribute, None)
+            for pending_tag, pending_attribute in references[index + 1 :]:
+                pending_tag.attrs.pop(pending_attribute, None)
             failures.append({"url": raw_url, "error": str(error)})
+            break
+        except Exception as error:
+            if candidates is not None:
+                failed.add(candidates)
+            failures.append({"url": raw_url, "error": str(error)})
+            # A failed acquisition must not leave a browser- or Markdown-active
+            # remote reference in the normalized article. Accessible labels and
+            # object fallback children remain intact for textual projection.
+            tag.attrs.pop(attribute, None)
+    _write_asset_manifest(assets_dir, downloaded)
     return {"downloaded": downloaded, "failures": failures}
 
 
@@ -327,23 +1302,25 @@ def _decode_local_images(output_dir: Path, assets: list[str]) -> dict[str, Any]:
         path = (output_dir / asset).resolve()
         try:
             path.relative_to(root)
-            if not path.is_file():
-                continue
-            with pymupdf.open(path) as image:
-                if image.page_count < 1:
-                    raise ValueError("image has no renderable page")
-                page = image[0]
-                if page.rect.width <= 0 or page.rect.height <= 0:
-                    raise ValueError("image has no intrinsic dimensions")
-                scale = min(1.0, 64.0 / max(page.rect.width, page.rect.height))
-                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
-                if pixmap.width <= 0 or pixmap.height <= 0:
-                    raise ValueError("image decoded to zero dimensions")
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+                raise ValueError("image is not a regular file")
+            if info.st_size > ARXIV_MAX_ASSET_BYTES:
+                raise ArxivAcquisitionLimitError("image exceeds the byte budget")
+            with path.open("rb") as handle:
+                payload = handle.read(ARXIV_MAX_ASSET_BYTES + 1)
+            if _raster_image_type(payload) != (".png", "image/png"):
+                raise ValueError("image is not normalized PNG")
+            _validate_raster_dimensions(
+                payload,
+                ".png",
+                max_dimension=ARXIV_MAX_RASTER_DIMENSION,
+            )
             checked += 1
         except Exception as error:
             failures.append({"asset": asset, "error": str(error)})
     return {
-        "engine": "PyMuPDF",
+        "engine": "bounded PNG header",
         "checked": checked,
         "failures": failures,
     }
@@ -354,7 +1331,7 @@ def _find_resolved_id(soup: BeautifulSoup, requested: str) -> str:
     if watermark:
         match = ARXIV_ID_RE.search(watermark.get_text(" ", strip=True))
         if match:
-            return f"{match.group('id')}{(match.group('version') or '').lower()}"
+            return normalize_arxiv_id(match.group(0))
     return requested
 
 
@@ -453,6 +1430,13 @@ def _repair_section_hierarchy(article: Tag) -> dict[str, int]:
     stack: list[tuple[int, Tag]] = [(1, article)]
     for section in sections:
         level = _section_level(section)
+        is_bibliography = "ltx_bibliography" in section.get("class", [])
+        while (
+            len(stack) > 1
+            and "ltx_bibliography" in stack[-1][1].get("class", [])
+            and not is_bibliography
+        ):
+            stack.pop()
         while stack and stack[-1][0] >= level:
             stack.pop()
         parent = stack[-1][1] if stack else article
@@ -649,13 +1633,36 @@ def _sanitized_html(tag: Tag) -> str:
 def _tokenize_node(node: Tag) -> tuple[str, dict[str, str]]:
     placeholders: dict[str, str] = {}
     parts: list[str] = []
+    reserved_tokens: set[str] = set()
+
+    def collect_literals(current: Tag | NavigableString) -> None:
+        if isinstance(current, NavigableString):
+            reserved_tokens.update(PLACEHOLDER_RE.findall(str(current)))
+            return
+        if _is_protected(current):
+            return
+        for child in current.children:
+            if isinstance(child, (Tag, NavigableString)):
+                collect_literals(child)
+
+    collect_literals(node)
+    next_token = 1
+
+    def allocate_token() -> str:
+        nonlocal next_token
+        while next_token <= 9999:
+            token = f"[[PTX_{next_token:04d}]]"
+            next_token += 1
+            if token not in reserved_tokens and token not in placeholders:
+                return token
+        raise ValueError("source text exhausts the protected placeholder namespace")
 
     def walk(current: Tag | NavigableString) -> None:
         if isinstance(current, NavigableString):
             parts.append(str(current))
             return
         if _is_protected(current):
-            token = f"[[PTX_{len(placeholders) + 1:04d}]]"
+            token = allocate_token()
             placeholders[token] = _sanitized_html(current)
             parts.append(f" {token} ")
             return
@@ -777,6 +1784,9 @@ def normalize_article_document(
     article_path = work_dir / "article-normalized.html"
     article_path.write_text(str(article), encoding="utf-8")
     document = {
+        "schema": "papertrans.document-ir",
+        "schemaVersion": "1.0",
+        "profile": "official_arxiv_html",
         "version": 1,
         "sourceType": "official_arxiv_html",
         "source": {
@@ -786,10 +1796,13 @@ def normalize_article_document(
             "sha256": acquisition["sourceSha256"],
             "license": acquisition.get("license"),
         },
+        "metadata": acquisition.get("metadata", {}),
+        "assets": acquisition.get("assets", []),
         "status": "normalized",
         "model": {"translation": None, "reasoningEffort": None},
         "glossary": GLOSSARY,
         "validation": acquisition["validation"],
+        "content": serialize_article(article),
         "units": units,
         "warnings": [],
     }
@@ -1306,9 +2319,11 @@ def _validate_rendered_html(source_article: Tag, output_soup: BeautifulSoup) -> 
     for tag, attribute in [
         *((value, "src") for value in output_article.find_all("img", src=True)),
         *((value, "data") for value in output_article.find_all("object", data=True)),
+        *((value, "href") for value in output_article.find_all("image", href=True)),
+        *((value, "xlink:href") for value in output_article.find_all("image", attrs={"xlink:href": True})),
     ]:
         url = str(tag.get(attribute, ""))
-        if url and not url.startswith(("data:", "http://", "https://")):
+        if url and not url.startswith(("#", "data:", "http://", "https://")):
             local_assets.append(url)
     passed = (
         source_counts["figures"] == output_counts["figures"]
@@ -1349,13 +2364,23 @@ def render_arxiv_html_document(
     metrics_path: Path | None = None,
 ) -> Path:
     started = utc_now()
-    source_soup = BeautifulSoup(
-        (work_dir / "article-normalized.html").read_text(encoding="utf-8"), "html.parser"
-    )
-    source_article = source_soup.find("article", class_="ltx_document")
+    legacy_document = document.get("content") is None
+    if not legacy_document:
+        source_article = deserialize_article(document["content"])
+    else:
+        source_soup = BeautifulSoup(
+            (work_dir / "article-normalized.html").read_text(encoding="utf-8"), "html.parser"
+        )
+        source_article = source_soup.find("article", class_="ltx_document")
     if source_article is None:
         raise ValueError("article-normalized.html is invalid")
     _repair_section_hierarchy(source_article)
+    _sanitize_tree(source_article, local_resources_only=True)
+    if legacy_document:
+        document.setdefault("schema", "papertrans.document-ir")
+        document.setdefault("schemaVersion", "1.0")
+        document.setdefault("profile", "official_arxiv_html")
+    document["content"] = serialize_article(source_article)
     _refresh_unit_structure(document, source_article)
     article_soup = BeautifulSoup(str(source_article), "html.parser")
     article = article_soup.find("article", class_="ltx_document")
@@ -1366,6 +2391,7 @@ def render_arxiv_html_document(
     for unit in document["units"]:
         if unit["kind"] != "footnote":
             _render_unit(article, unit)
+    _sanitize_tree(article, local_resources_only=True)
 
     title_unit = next(unit for unit in document["units"] if unit["kind"] == "title")
     toc = []
@@ -1383,23 +2409,21 @@ def render_arxiv_html_document(
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_assets = output_dir / "assets"
-    if output_assets.exists():
-        shutil.rmtree(output_assets)
-    if (work_dir / "assets").exists():
-        shutil.copytree(work_dir / "assets", output_assets)
+    _publish_local_assets(article, work_dir, output_dir)
     environment = Environment(
         loader=FileSystemLoader(Path(__file__).parent / "templates"),
         autoescape=select_autoescape(["html", "xml"]),
         trim_blocks=True,
         lstrip_blocks=True,
     )
-    template = environment.get_template("arxiv-paper.html.j2")
+    template = environment.get_template(ARXIV_HTML_TEMPLATE)
+    artifact_version = arxiv_html_artifact_version()
     rendered = template.render(
         document=document,
         title=_translation_plain(title_unit),
         article=Markup(str(article)),
         toc=toc,
+        artifact_version=artifact_version,
     )
     index_path = output_dir / "index.html"
     index_path.write_text(rendered, encoding="utf-8")
@@ -1411,6 +2435,7 @@ def render_arxiv_html_document(
 
     output_soup = BeautifulSoup(rendered, "html.parser")
     qa = _validate_rendered_html(source_article, output_soup)
+    qa["artifactVersion"] = artifact_version
     missing_files = [
         asset for asset in qa["localAssets"] if not (output_dir / asset).exists()
     ]
@@ -1421,6 +2446,7 @@ def render_arxiv_html_document(
     (output_dir / "qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
     if qa["status"] != "passed":
         raise RuntimeError(f"rendered HTML QA failed: {qa}")
+    markdown_path = render_arxiv_markdown_document(document, output_dir)
     record_stage(
         metrics_path,
         "html_render_and_qa",
@@ -1428,6 +2454,8 @@ def render_arxiv_html_document(
         utc_now(),
         {
             "html": str(index_path),
+            "markdown": str(markdown_path),
+            "markdownQa": str(output_dir / "markdown-qa.json"),
             "qa": qa,
         },
     )
@@ -1483,6 +2511,7 @@ def run_arxiv_html_pipeline(
         publication_dir,
         metrics_path=metrics_path,
     )
+    markdown_path = publication_dir / "index.md"
     create_bundle(publication_dir, bundle_path)
     record_stage(
         metrics_path,
@@ -1491,6 +2520,7 @@ def run_arxiv_html_pipeline(
         utc_now(),
         {
             "html": str(index_path),
+            "markdown": str(markdown_path),
             "bundle": str(bundle_path),
             "route": "official_arxiv_html",
             "model": None if skip_translation else translation_model,
@@ -1502,6 +2532,7 @@ def run_arxiv_html_pipeline(
         shutil.copy2(cold_metrics, publication_dir / "cold-run-metrics.json")
     return {
         "html": str(index_path),
+        "markdown": str(markdown_path),
         "bundle": str(bundle_path),
         "metrics": str(metrics_path),
         "route": "official_arxiv_html",

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from html import escape
 from dataclasses import dataclass
@@ -15,6 +17,81 @@ from typing import Any
 import pymupdf as fitz
 
 from .metrics import record_stage, utc_now
+
+
+class PdfRenderLimitError(RuntimeError):
+    """Raised before PDF raster work exceeds a configured job budget."""
+
+
+@dataclass
+class PdfRenderBudget:
+    """Cumulative raster and artifact limits shared by one PDF job."""
+
+    max_renders: int
+    max_single_pixels: int
+    max_total_pixels: int
+    max_output_bytes: int
+    renders: int = 0
+    pixels: int = 0
+    output_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_renders",
+            "max_single_pixels",
+            "max_total_pixels",
+            "max_output_bytes",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive")
+
+    def reserve_render(self, width: float, height: float) -> None:
+        projected_width = max(1, math.ceil(float(width)))
+        projected_height = max(1, math.ceil(float(height)))
+        projected_pixels = projected_width * projected_height
+        if projected_pixels > self.max_single_pixels:
+            raise PdfRenderLimitError(
+                "PDF visual exceeds the per-render pixel limit "
+                f"({projected_pixels} > {self.max_single_pixels})"
+            )
+        if self.renders + 1 > self.max_renders:
+            raise PdfRenderLimitError(
+                f"PDF visual render count exceeds {self.max_renders}"
+            )
+        if self.pixels + projected_pixels > self.max_total_pixels:
+            raise PdfRenderLimitError(
+                "PDF cumulative visual pixels exceed the job limit "
+                f"({self.pixels + projected_pixels} > {self.max_total_pixels})"
+            )
+        self.renders += 1
+        self.pixels += projected_pixels
+
+    def record_output(self, size: int) -> None:
+        candidate = self.output_bytes + int(size)
+        if candidate > self.max_output_bytes:
+            raise PdfRenderLimitError(
+                "PDF visual artifact bytes exceed the job limit "
+                f"({candidate} > {self.max_output_bytes})"
+            )
+        self.output_bytes = candidate
+
+
+def _write_bytes_atomic(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _clean_text(value: str) -> str:
@@ -576,38 +653,111 @@ def analyze_layout(
     return combined
 
 
+def is_near_certain_blank_pixmap(pixmap: fitz.Pixmap) -> bool:
+    """Return true only when a rendered RGB/gray crop contains no visible ink.
+
+    The deliberately strict test retains a crop as soon as any sample is darker
+    than near-white. This avoids discarding sparse rules, dots, or fine diagrams.
+    Unsupported color layouts fail open and are retained for human/QA review.
+    """
+
+    width = int(pixmap.width)
+    height = int(pixmap.height)
+    components = int(pixmap.n) - int(bool(pixmap.alpha))
+    if width <= 0 or height <= 0 or pixmap.alpha or components not in {1, 3}:
+        return False
+    row_bytes = width * components
+    samples = pixmap.samples_mv
+    if int(pixmap.stride) == row_bytes:
+        return re.search(rb"[\x00-\xf9]", samples) is None
+    for row_index in range(height):
+        start = row_index * int(pixmap.stride)
+        if re.search(rb"[\x00-\xf9]", samples[start : start + row_bytes]) is not None:
+            return False
+    return True
+
+
 def render_visual_objects(
     source: Path,
     structure: dict[str, Any],
     output_dir: Path,
+    *,
+    budget: PdfRenderBudget | None = None,
 ) -> list[dict[str, Any]]:
-    pdf = fitz.open(source)
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[dict[str, Any]] = []
-    for page_result in structure["pages"]:
-        page_number = int(page_result["pageNumber"])
-        page = pdf[page_number - 1]
-        for visual in page_result["visualObjects"]:
-            x0, y0, x1, y1 = [float(value) for value in visual["bboxNormalized"]]
-            rect = fitz.Rect(
-                x0 * page.rect.width,
-                y0 * page.rect.height,
-                x1 * page.rect.width,
-                y1 * page.rect.height,
-            )
-            safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", visual["objectId"]).strip("-")
-            asset_name = f"page-{page_number:03d}-{safe_id}.png"
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), clip=rect, alpha=False)
-            pixmap.save(output_dir / asset_name)
-            rendered.append(
-                {
-                    **visual,
-                    "pageNumber": page_number,
-                    "asset": f"assets/{asset_name}",
-                    "bboxPdf": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
-                }
-            )
-    pdf.close()
+    with fitz.open(source) as pdf:
+        for page_result in structure["pages"]:
+            page_number = int(page_result["pageNumber"])
+            if not 1 <= page_number <= pdf.page_count:
+                raise PdfRenderLimitError(
+                    f"PDF visual references invalid page {page_number}"
+                )
+            page = pdf[page_number - 1]
+            retained_visuals: list[dict[str, Any]] = []
+            for visual in page_result["visualObjects"]:
+                x0, y0, x1, y1 = [
+                    float(value) for value in visual["bboxNormalized"]
+                ]
+                rect = fitz.Rect(
+                    x0 * page.rect.width,
+                    y0 * page.rect.height,
+                    x1 * page.rect.width,
+                    y1 * page.rect.height,
+                )
+                if rect.is_empty:
+                    raise PdfRenderLimitError(
+                        f"PDF visual {visual['objectId']} has an empty render rectangle"
+                    )
+                if budget is not None:
+                    budget.reserve_render(rect.width * 2.5, rect.height * 2.5)
+                safe_id = re.sub(
+                    r"[^a-zA-Z0-9_-]+", "-", visual["objectId"]
+                ).strip("-")
+                asset_name = f"page-{page_number:03d}-{safe_id}.png"
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(2.5, 2.5), clip=rect, alpha=False
+                )
+                asset_path = output_dir / asset_name
+                if is_near_certain_blank_pixmap(pixmap):
+                    asset_path.unlink(missing_ok=True)
+                    diagnostic = {
+                        "objectId": str(visual["objectId"]),
+                        "pageNumber": page_number,
+                        "kind": str(visual.get("kind", "unknown")),
+                        "bboxNormalized": list(visual["bboxNormalized"]),
+                        "reason": "Every rendered RGB sample was near-white (>= 250).",
+                    }
+                    structure.setdefault("renderDiagnostics", {}).setdefault(
+                        "filteredBlankVisuals", []
+                    ).append(diagnostic)
+                    warning = (
+                        f"Filtered near-certain blank visual {visual['objectId']} on page "
+                        f"{page_number}; embedded descendants remain suppressed."
+                    )
+                    warnings = structure.setdefault("warnings", [])
+                    if warning not in warnings:
+                        warnings.append(warning)
+                    continue
+                payload = pixmap.tobytes("png")
+                if budget is not None:
+                    budget.record_output(len(payload))
+                _write_bytes_atomic(asset_path, payload)
+                retained_visuals.append(visual)
+                rendered.append(
+                    {
+                        **visual,
+                        "pageNumber": page_number,
+                        "asset": f"assets/{asset_name}",
+                        "bboxPdf": [
+                            round(rect.x0, 2),
+                            round(rect.y0, 2),
+                            round(rect.x1, 2),
+                            round(rect.y1, 2),
+                        ],
+                    }
+                )
+            page_result["visualObjects"] = retained_visuals
     return rendered
 
 

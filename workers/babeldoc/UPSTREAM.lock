@@ -1,0 +1,30 @@
+schema_version = 1
+
+[upstream]
+name = "pdf2zh-next"
+repository = "https://github.com/PDFMathTranslate-next/PDFMathTranslate-next.git"
+revision = "f8dffcf4c3a33b254391d43514439b975ce8d966"
+git_tree = "622c27cd8eae439d65cce22968263e06c6abf8c2"
+license = "AGPL-3.0-only"
+
+[fork]
+version = "2.9.0+papertrans.1"
+patch = "patches/0001-papertrans-safe-dependencies.patch"
+patch_sha256 = "80b9d80a57356b7eee9fd7d3fb90333a8c70f499d349d60e461f967b2d634f4f"
+
+[dependencies]
+babeldoc = "0.6.4"
+pymupdf = "1.26.7"
+python = "3.12.11"
+
+[source_file_sha256]
+"pyproject.toml" = "e7698716c0003e0c035d3a723a6efc564c8b4ae232443303f201c3d96e04bf80"
+"pdf2zh_next/__init__.py" = "938b88efd01df82acca3e34edb370efbcea5f904465735880952f079385a96da"
+"pdf2zh_next/const.py" = "8b851bab92f6605f91f31a3814c1373ae94069cdd298ff2891d02bc7ffc3fa66"
+"pdf2zh_next/main.py" = "ddc6c600fd511eb2c5880050ec490b9626140429c4a26c05b37626cbd4e78ebc"
+"pdf2zh_next/high_level.py" = "7891095230321c6f2ec868ba5651f2f2889a96c6c12ba3b3b2ca5445cac45a8a"
+
+[container]
+base_image = "python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
+runtime_requirements_sha256 = "0fc3f23dc5fa0b0ebb239acaf1b5c24a14cd29b41fe48cfd3d1915dfb832366f"
+build_requirements_sha256 = "99c8c09e2be15ac0fa0058f6df36a2dfda624a1c239241c4f59406d7599a0243"

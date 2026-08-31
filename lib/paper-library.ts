@@ -1,7 +1,10 @@
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { isArtifactManifestPublishable } from "@/lib/artifact-security";
+import { getPaperTransRuntimeConfig } from "@/lib/runtime-config";
 
 export type PaperStatus =
+  | "preparing"
   | "prepared"
   | "translating"
   | "ready_to_finalize"
@@ -11,6 +14,7 @@ export type PaperStatus =
 
 export type PaperSummary = {
   slug: string;
+  sourceType: string;
   title: string;
   authors: string[];
   publishedAt: string | null;
@@ -27,8 +31,11 @@ export type PaperSummary = {
   updatedAt: string;
   createdAt: string;
   finalizedAt: string | null;
+  errorMessage: string | null;
   artifactUrl: string | null;
   downloadUrl: string | null;
+  markdownUrl: string | null;
+  translatedPdfUrl: string | null;
   qa: {
     status: "passed" | "failed" | "missing";
     figures: number;
@@ -42,9 +49,11 @@ export type PaperSummary = {
 };
 
 type Manifest = {
+  schemaVersion?: string | number;
   jobId?: string;
   status?: string;
   provider?: string;
+  sourceType?: string;
   settings?: {
     targetLanguage?: string;
   };
@@ -57,9 +66,29 @@ type Manifest = {
     publishedAt?: string | null;
   };
   chunks?: Array<{ status?: string }>;
+  artifacts?: {
+    html?: string;
+    markdown?: string;
+    qa?: string;
+    markdownQa?: string;
+    bundle?: string;
+    translatedPdf?: string;
+    indexPath?: string;
+    bundlePath?: string;
+    artifactRoute?: string;
+    rendererVersion?: string;
+  };
   createdAt?: string;
   updatedAt?: string;
   finalizedAt?: string | null;
+  error?: {
+    message?: string;
+  };
+};
+
+type ValidManifest = Manifest & {
+  jobId: string;
+  paper: NonNullable<Manifest["paper"]> & { title: string };
 };
 
 type QaDocument = {
@@ -68,12 +97,16 @@ type QaDocument = {
     figures?: number;
     tables?: number;
     visibleMath?: number;
+    math?: number;
     bibliographyEntries?: number;
   };
   unresolvedInternalLinks?: number;
   missingLocalAssets?: unknown[];
   browserDom?: unknown;
 };
+
+const PDF_MCP_MAX_CHARACTERS = 9000;
+const PDF_TRANSLATABLE_KINDS = new Set(["abstract", "paragraph", "list_item", "footnote"]);
 
 type LibraryMetadata = {
   version: 1;
@@ -93,10 +126,26 @@ export type PaperLibraryPatch = {
 };
 
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
-const REPO_ROOT = process.cwd();
-const OUTPUT_ROOT = path.join(REPO_ROOT, "output");
-const DATA_ROOT = path.join(REPO_ROOT, "data");
-const LIBRARY_METADATA = path.join(DATA_ROOT, "library.json");
+const MANIFEST_FILENAMES = ["papertrans-job.json", "mcp-job.json", "chatgpt-job.json"] as const;
+
+function libraryRoots() {
+  const config = getPaperTransRuntimeConfig();
+  return {
+    dataRoot: config.dataRoot,
+    outputRoot: config.outputRoot,
+    metadataPath: path.join(config.dataRoot, "library.json"),
+  };
+}
+
+type ArtifactKind = "html" | "markdown" | "qa" | "bundle" | "translatedPdf";
+
+const ARTIFACT_EXTENSIONS: Record<ArtifactKind, string> = {
+  html: ".html",
+  markdown: ".md",
+  qa: ".json",
+  bundle: ".zip",
+  translatedPdf: ".pdf",
+};
 
 async function readJson<T>(filename: string): Promise<T | null> {
   try {
@@ -106,8 +155,106 @@ async function readJson<T>(filename: string): Promise<T | null> {
   }
 }
 
-async function loadMetadata(): Promise<LibraryMetadata> {
-  const value = await readJson<LibraryMetadata>(LIBRARY_METADATA);
+async function readManifest(root: string): Promise<ValidManifest | null> {
+  for (const filename of MANIFEST_FILENAMES) {
+    const manifest = await readJson<Manifest>(path.join(root, "work", filename));
+    if (
+      typeof manifest?.jobId === "string"
+      && typeof manifest.paper?.title === "string"
+      && manifest.paper.title.trim()
+    ) return manifest as ValidManifest;
+  }
+  return null;
+}
+
+function defaultArtifact(slug: string, kind: ArtifactKind): string | null {
+  if (kind === "html") return "html/index.html";
+  if (kind === "markdown") return "html/index.md";
+  if (kind === "qa") return "html/qa.json";
+  if (kind === "bundle") return `${slug}-html.zip`;
+  return null;
+}
+
+/** Resolve a manifest-owned artifact without allowing absolute paths, traversal, or symlink escape. */
+export async function resolvePaperArtifact(
+  root: string,
+  candidate: unknown,
+  fallback: string | null,
+  kind: ArtifactKind,
+): Promise<string | null> {
+  const relative = candidate === undefined
+    ? fallback
+    : typeof candidate === "string"
+      ? candidate.trim()
+      : null;
+  if (
+    !relative
+    || path.isAbsolute(relative)
+    || path.extname(relative).toLowerCase() !== ARTIFACT_EXTENSIONS[kind]
+  ) return null;
+
+  const resolvedRoot = path.resolve(root);
+  const resolved = path.resolve(resolvedRoot, relative);
+  if (resolved === resolvedRoot || !resolved.startsWith(`${resolvedRoot}${path.sep}`)) return null;
+  try {
+    const [canonicalRoot, canonicalArtifact, artifactStat] = await Promise.all([
+      realpath(resolvedRoot),
+      realpath(resolved),
+      stat(resolved),
+    ]);
+    if (!artifactStat.isFile()) return null;
+    if (
+      canonicalArtifact === canonicalRoot
+      || !canonicalArtifact.startsWith(`${canonicalRoot}${path.sep}`)
+    ) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+async function artifactPaths(root: string, slug: string, manifest: Manifest) {
+  const entries = await Promise.all(
+    (["html", "markdown", "qa", "bundle", "translatedPdf"] as const).map(async (kind) => [
+      kind,
+      await resolvePaperArtifact(
+        root,
+        manifest.artifacts?.[kind],
+        defaultArtifact(slug, kind),
+        kind,
+      ),
+    ] as const),
+  );
+  return Object.fromEntries(entries) as Record<ArtifactKind, string | null>;
+}
+
+function artifactRoute(slug: string, root: string, htmlArtifact: string | null): string | null {
+  if (!htmlArtifact) return null;
+  const publicationRoot = path.join(root, "html");
+  const relative = path.relative(publicationRoot, htmlArtifact);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+  const encoded = relative.split(path.sep).map(encodeURIComponent).join("/");
+  return `/api/artifacts/${encodeURIComponent(slug)}/${encoded}`;
+}
+
+export async function findPaperArtifact(
+  slug: string,
+  kind: "bundle" | "markdown" | "translatedPdf",
+): Promise<string | null> {
+  if (!JOB_ID.test(slug)) return null;
+  const root = path.join(libraryRoots().outputRoot, slug);
+  const manifest = await readManifest(root);
+  if (!manifest || !manifestArtifactsPublished(manifest)) return null;
+  return resolvePaperArtifact(
+    root,
+    manifest.artifacts?.[kind],
+    defaultArtifact(slug, kind),
+    kind,
+  );
+}
+
+async function loadMetadata(metadataPath: string): Promise<LibraryMetadata> {
+  const value = await readJson<LibraryMetadata>(metadataPath);
   if (!value || value.version !== 1 || typeof value.papers !== "object") {
     return { version: 1, papers: {} };
   }
@@ -147,7 +294,8 @@ export async function savePaperLibraryState(
   patch: PaperLibraryPatch,
 ): Promise<PaperLibraryState> {
   if (!JOB_ID.test(slug)) throw new Error("invalid paper slug");
-  const metadata = await loadMetadata();
+  const { dataRoot, metadataPath } = libraryRoots();
+  const metadata = await loadMetadata(metadataPath);
   const current = currentPaperState(metadata, slug);
   if (patch.tags !== undefined) current.tags = normalizeTags(patch.tags);
   if (patch.isRead !== undefined) {
@@ -159,10 +307,10 @@ export async function savePaperLibraryState(
     current.favorite = patch.favorite;
   }
   metadata.papers[slug] = current;
-  const temporary = path.join(DATA_ROOT, `.library-${process.pid}-${Date.now()}.tmp`);
-  await mkdir(DATA_ROOT, { recursive: true });
+  const temporary = path.join(dataRoot, `.library-${process.pid}-${Date.now()}.tmp`);
+  await mkdir(dataRoot, { recursive: true });
   await writeFile(temporary, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await rename(temporary, LIBRARY_METADATA);
+  await rename(temporary, metadataPath);
   return current;
 }
 
@@ -172,6 +320,7 @@ export async function savePaperTags(slug: string, tags: unknown): Promise<string
 
 function normalizeStatus(status: string | undefined): PaperStatus {
   if (
+    status === "preparing" ||
     status === "prepared" ||
     status === "translating" ||
     status === "ready_to_finalize" ||
@@ -184,6 +333,32 @@ function normalizeStatus(status: string | undefined): PaperStatus {
 
 function normalizeTargetLanguage(targetLanguage: string | undefined): "ja" {
   return targetLanguage === "ja" ? targetLanguage : "ja";
+}
+
+function manifestSourceType(manifest: ValidManifest): string {
+  if (typeof manifest.sourceType === "string" && manifest.sourceType.trim()) {
+    return manifest.sourceType.trim().toLowerCase();
+  }
+  return manifest.paper.resolvedArxivId
+    || manifest.paper.requestedArxivId
+    || /^https?:\/\/(?:[^/]+\.)?arxiv\.org\//i.test(manifest.paper.sourceUrl ?? "")
+    ? "arxiv"
+    : "unknown";
+}
+
+function manifestArtifactsPublished(manifest: ValidManifest): boolean {
+  return isArtifactManifestPublishable({
+    status: manifest.status,
+    sourceType: manifestSourceType(manifest),
+    provider: manifest.provider,
+    rendererVersion: manifest.artifacts?.rendererVersion,
+  });
+}
+
+export async function isPaperArtifactPublished(slug: string): Promise<boolean> {
+  if (!JOB_ID.test(slug)) return false;
+  const manifest = await readManifest(path.join(libraryRoots().outputRoot, slug));
+  return manifest !== null && manifestArtifactsPublished(manifest);
 }
 
 function displayTitle(value: string): string {
@@ -274,11 +449,57 @@ async function readSourceMetadata(root: string): Promise<{ authors: string[]; pu
   }
 }
 
+async function readPdfMcpProgress(
+  root: string,
+): Promise<{ completed: number; total: number } | null> {
+  const document = await readJson<Record<string, unknown>>(path.join(root, "work", "semantic-document.json"));
+  if (!document || !document.title || typeof document.title !== "object" || !Array.isArray(document.sections)) return null;
+  const units: Array<Record<string, unknown>> = [document.title as Record<string, unknown>];
+  for (const sectionValue of document.sections) {
+    if (!sectionValue || typeof sectionValue !== "object") continue;
+    const section = sectionValue as Record<string, unknown>;
+    if (section.title && typeof section.title === "object") {
+      units.push(section.title as Record<string, unknown>);
+    }
+    if (!Array.isArray(section.content)) continue;
+    for (const itemValue of section.content) {
+      if (!itemValue || typeof itemValue !== "object") continue;
+      const item = itemValue as Record<string, unknown>;
+      if (item.type !== "unit" || !item.value || typeof item.value !== "object") continue;
+      const unit = item.value as Record<string, unknown>;
+      if (PDF_TRANSLATABLE_KINDS.has(String(unit.kind ?? ""))) units.push(unit);
+    }
+  }
+  if (!units.length) return { completed: 0, total: 0 };
+
+  const chunks: Array<Array<Record<string, unknown>>> = [];
+  let current: Array<Record<string, unknown>> = [];
+  let currentSize = 0;
+  for (const unit of units) {
+    const size = Array.from(String(unit.original ?? "")).length;
+    if (current.length && currentSize + size > PDF_MCP_MAX_CHARACTERS) {
+      chunks.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(unit);
+    currentSize += size;
+  }
+  if (current.length) chunks.push(current);
+  return {
+    completed: chunks.filter((chunk) => chunk.every(
+      (unit) => String(unit.japanese ?? "").trim().length > 0,
+    )).length,
+    total: chunks.length,
+  };
+}
+
 export async function scanPaperLibrary(): Promise<PaperSummary[]> {
-  const metadata = await loadMetadata();
+  const { metadataPath, outputRoot } = libraryRoots();
+  const metadata = await loadMetadata(metadataPath);
   let entries;
   try {
-    entries = await readdir(OUTPUT_ROOT, { withFileTypes: true });
+    entries = await readdir(outputRoot, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -287,20 +508,37 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
     entries
       .filter((entry) => entry.isDirectory() && JOB_ID.test(entry.name))
       .map(async (entry): Promise<PaperSummary | null> => {
-        const root = path.join(OUTPUT_ROOT, entry.name);
-        const manifest = (
-          await readJson<Manifest>(path.join(root, "work", "mcp-job.json"))
-          ?? await readJson<Manifest>(path.join(root, "work", "chatgpt-job.json"))
-        );
-        if (!manifest?.paper?.title || !manifest.jobId) return null;
-        const qa = await readJson<QaDocument>(path.join(root, "html", "qa.json"));
+        const root = path.join(outputRoot, entry.name);
+        const manifest = await readManifest(root);
+        if (!manifest) return null;
+        const artifacts = await artifactPaths(root, entry.name, manifest);
+        const qa = artifacts.qa ? await readJson<QaDocument>(artifacts.qa) : null;
         const sourceMetadata = await readSourceMetadata(root);
         const libraryState = currentPaperState(metadata, entry.name);
-        const chunks = manifest.chunks ?? [];
+        const chunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
         const completed = chunks.filter((chunk) => chunk.status === "completed").length;
-        const hasArtifact = manifest.status === "completed" && qa !== null;
+        const sourceType = manifestSourceType(manifest);
+        // `semantic-pipeline --skip-translation` historically finishes as
+        // needs_review and renders an untranslated preview. Only QA-passed
+        // legacy output can be handed to the worker; this mirrors its guard.
+        const awaitingMcp = sourceType === "pdf"
+          && manifest.provider === "none"
+          && manifest.status === "needs_review"
+          && qa?.status === "passed";
+        const status = awaitingMcp ? "prepared" : normalizeStatus(manifest.status);
+        const manifestProgress = { completed, total: chunks.length };
+        const progress = sourceType === "pdf"
+          ? await readPdfMcpProgress(root) ?? manifestProgress
+          : manifestProgress;
+        const artifactStatus = manifestArtifactsPublished(manifest);
+        const hasArtifact = artifactStatus && artifacts.html !== null && qa !== null;
+        const htmlRoute = hasArtifact ? artifactRoute(entry.name, root, artifacts.html) : null;
+        const hasDownload = qa !== null
+          && artifactStatus
+          && artifacts.bundle !== null;
         return {
           slug: entry.name,
+          sourceType,
           title: displayTitle(manifest.paper.title),
           authors: manifest.paper.authors?.length ? manifest.paper.authors : sourceMetadata.authors,
           publishedAt: normalizePublishedAt(manifest.paper.publishedAt ?? null) ?? sourceMetadata.publishedAt,
@@ -309,21 +547,30 @@ export async function scanPaperLibrary(): Promise<PaperSummary[]> {
           sourceUrl: manifest.paper.sourceUrl ?? "",
           provider: manifest.provider ?? "unknown",
           targetLanguage: normalizeTargetLanguage(manifest.settings?.targetLanguage),
-          status: normalizeStatus(manifest.status),
-          progress: { completed, total: chunks.length },
+          status,
+          progress,
           tags: libraryState.tags,
           isRead: libraryState.isRead,
           favorite: libraryState.favorite,
           updatedAt: manifest.updatedAt ?? manifest.createdAt ?? new Date(0).toISOString(),
           createdAt: manifest.createdAt ?? manifest.updatedAt ?? new Date(0).toISOString(),
           finalizedAt: manifest.finalizedAt ?? null,
-          artifactUrl: hasArtifact ? `/api/artifacts/${entry.name}/index.html` : null,
-          downloadUrl: hasArtifact ? `/api/papers/${entry.name}/download` : null,
+          errorMessage: typeof manifest.error?.message === "string"
+            ? manifest.error.message
+            : null,
+          artifactUrl: htmlRoute,
+          downloadUrl: hasDownload ? `/api/papers/${entry.name}/download` : null,
+          markdownUrl: artifactStatus && artifacts.markdown
+            ? `/api/papers/${entry.name}/markdown`
+            : null,
+          translatedPdfUrl: artifactStatus && artifacts.translatedPdf
+            ? `/api/papers/${entry.name}/translated-pdf`
+            : null,
           qa: {
             status: qa?.status === "passed" ? "passed" : qa ? "failed" : "missing",
             figures: qa?.output?.figures ?? 0,
             tables: qa?.output?.tables ?? 0,
-            math: qa?.output?.visibleMath ?? 0,
+            math: qa?.output?.visibleMath ?? qa?.output?.math ?? 0,
             bibliographyEntries: qa?.output?.bibliographyEntries ?? 0,
             unresolvedInternalLinks: qa?.unresolvedInternalLinks ?? 0,
             missingLocalAssets: qa?.missingLocalAssets?.length ?? 0,

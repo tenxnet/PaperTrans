@@ -1,0 +1,16 @@
+*
+!Dockerfile
+!UPSTREAM.lock
+!build-manifest.json
+!requirements.lock
+!build-requirements.lock
+!patches/
+!patches/0001-papertrans-safe-dependencies.patch
+!scripts/
+!scripts/validate_source.py
+!scripts/generate_runtime_metadata.py
+!scripts/generate_tree_manifest.py
+!worker/
+!worker/pyproject.toml
+!worker/src/
+!worker/src/**

@@ -1,13 +1,15 @@
 {
   "name": "papertrans-web",
-  "version": "0.1.0",
+  "version": "0.2.0-rc.1",
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:artifact-security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/artifact-security.test.mjs",
+    "test:pdf-import-admission": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/pdf-import-admission.test.mjs"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

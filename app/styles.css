@@ -182,16 +182,29 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .paper-meta a svg { width: 13px; height: 13px; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgba(28, 32, 39, .42); backdrop-filter: blur(3px); }
-.request-modal { position: relative; width: min(460px, 100%); padding: 31px; background: var(--paper); border: 1px solid var(--line); border-radius: 11px; box-shadow: 0 24px 80px rgba(27, 31, 38, .23); }
+.request-modal { position: relative; width: min(460px, 100%); max-height: calc(100vh - 40px); padding: 31px; overflow-y: auto; background: var(--paper); border: 1px solid var(--line); border-radius: 11px; box-shadow: 0 24px 80px rgba(27, 31, 38, .23); }
 .modal-close { position: absolute; top: 14px; right: 14px; width: 30px; height: 30px; }
 .modal-close svg { width: 15px; height: 15px; }
 .modal-icon { width: 44px; height: 44px; display: grid; place-items: center; margin-bottom: 18px; color: var(--blue); background: var(--blue-soft); border: 1px solid #d7e3fa; border-radius: 9px; }
 .modal-icon svg { width: 25px; height: 25px; }
 .request-modal h2 { margin: 0; font: 500 25px/1.25 Georgia, "Yu Mincho", serif; }
 .request-modal > p:not(.eyebrow) { margin: 11px 0 20px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.translation-source-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0 0 16px; padding: 4px; background: #f0f0ed; border-radius: 8px; }
+.translation-source-tabs button { min-height: 34px; color: var(--muted); background: transparent; border: 0; border-radius: 5px; cursor: pointer; font-size: 11px; font-weight: 650; }
+.translation-source-tabs button:hover { color: var(--ink); }
+.translation-source-tabs button.active { color: var(--blue); background: var(--surface); box-shadow: 0 1px 4px rgba(35, 39, 47, .1); }
+.translation-source-tabs button:disabled { opacity: .55; cursor: default; }
 .request-modal label { display: grid; gap: 7px; color: #505965; font-size: 11px; font-weight: 650; }
 .request-modal label input { height: 40px; padding: 0 11px; color: var(--ink); background: white; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; }
 .request-modal label input:focus { border-color: #88a6d9; box-shadow: 0 0 0 3px rgba(45, 95, 183, .09); }
+.request-modal label > small { color: var(--faint); font-size: 9px; font-weight: 400; line-height: 1.5; }
+.request-modal .pdf-file-field input { height: auto; min-height: 42px; padding: 7px; cursor: pointer; font-size: 10px; }
+.request-modal .pdf-file-field input::file-selector-button { margin-right: 9px; padding: 6px 9px; color: var(--blue); background: var(--blue-soft); border: 0; border-radius: 4px; cursor: pointer; font-size: 10px; font-weight: 650; }
+.selected-pdf { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 9px; margin-top: 9px; padding: 9px 10px; background: #f8f8f5; border: 1px solid var(--line); border-radius: 6px; }
+.selected-pdf > svg { width: 21px; height: 21px; color: var(--blue); }
+.selected-pdf > span { min-width: 0; display: grid; gap: 2px; }
+.selected-pdf strong { overflow: hidden; color: #3c4550; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.selected-pdf small { color: var(--faint); font-size: 9px; }
 .field-error { margin: 6px 0 0 !important; color: var(--red) !important; font-size: 10px !important; }
 .provider-choice, .provider-setting-card { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; margin-top: 13px; padding: 11px; background: #f8f8f5; border: 1px solid var(--line); border-radius: 7px; }
 .provider-choice-icon { width: 32px; height: 32px; display: grid; place-items: center; color: var(--blue); background: var(--blue-soft); border-radius: 6px; }
@@ -200,7 +213,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .provider-choice strong, .provider-setting-card strong { color: #3c4550; font-size: 11px; }
 .provider-choice small, .provider-setting-card small { color: var(--muted); font-size: 9px; }
 .provider-badge { padding: 3px 6px; color: var(--blue); background: var(--blue-soft); border-radius: 99px; font-size: 8px; font-weight: 650; }
-.prompt-preview { margin: 11px 0 16px; padding: 11px; color: #596574; background: #f2f3f5; border: 1px solid #e3e5e8; border-radius: 6px; font-size: 10px; line-height: 1.55; }
+.prompt-preview { width: 100%; min-height: 76px; margin: 0 0 13px; padding: 11px; resize: vertical; color: #596574; background: #f2f3f5; border: 1px solid #e3e5e8; border-radius: 6px; outline: none; font-size: 10px; line-height: 1.55; }
+.prompt-preview:focus { border-color: #88a6d9; box-shadow: 0 0 0 3px rgba(45, 95, 183, .09); }
 .copy-success { display: flex; align-items: flex-start; gap: 8px; margin: -4px 0 14px; padding: 10px; color: var(--green); background: var(--green-soft); border: 1px solid #cfe5da; border-radius: 6px; }
 .copy-success > svg { width: 16px; height: 16px; flex: 0 0 auto; }
 .copy-success > span { display: grid; gap: 2px; }
@@ -263,8 +277,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .row-actions { display: none; }
   .reader-layout { height: calc(100vh - 119px); grid-template-columns: minmax(0, 1fr); }
   .inspector { display: none; }
-  .reader-header { grid-template-columns: auto minmax(0, 1fr); }
-  .reader-actions { display: none; }
+  .reader-header { grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; }
+  .reader-actions { display: flex; gap: 4px; }
+  .reader-actions .reader-library-action { display: none; }
+  .reader-actions .reader-essential-action { width: 34px; min-height: 34px; padding: 0; overflow: hidden; font-size: 0; }
+  .reader-actions .reader-essential-action svg { width: 16px; height: 16px; }
 }
 @media (max-width: 520px) {
   .sidebar { grid-template-columns: 1fr; }
@@ -277,4 +294,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .reader-layout { height: calc(100vh - 101px); }
   .back-button { padding-left: 0; }
   .reader-title h1 { font-size: 13px; }
+  .request-modal { padding: 25px 20px; }
+  .modal-actions { align-items: stretch; flex-direction: column-reverse; }
+  .modal-actions .primary-button, .modal-actions .secondary-button { width: 100%; }
 }

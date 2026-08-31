@@ -31,6 +31,7 @@ import {
 
 type Filter = "all" | "active" | "review" | "unread" | "favorites";
 type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
+type TranslationSource = "arxiv" | "pdf";
 type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
 type TocEntry = { id: string; label: string; level: 2 | 3 };
 type ConnectorHealth = "checking" | "online" | "offline";
@@ -43,13 +44,35 @@ type CreatedJob = {
   status: string;
   chunks: { completed: number; total: number; remaining: number };
   paper: { title: string; requestedArxivId: string; resolvedArxivId: string };
+  sourceType?: TranslationSource;
 };
 
+type PdfImportResponse = {
+  code?: string;
+  existingJobId?: string;
+  jobId?: string;
+  slug?: string;
+  status?: string;
+  sourceType?: "pdf";
+  error?: string;
+};
+
+const MAX_PDF_BYTES = 50 * 1024 * 1024;
+
 function arxivIdFromInput(value: string) {
-  return value.trim().match(/(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.[1] ?? "";
+  return (
+    value
+      .trim()
+      .match(/(?:arxiv:\s*)?((?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*\/\d{7})(?:v\d+)?)/i)?.[1]
+      ?.toLowerCase() ?? ""
+  );
 }
 
 function isActive(paper: PaperSummary) {
+  return ["preparing", "prepared", "translating", "ready_to_finalize"].includes(paper.status);
+}
+
+function canCopyWorkerRequest(paper: PaperSummary) {
   return ["prepared", "translating", "ready_to_finalize"].includes(paper.status);
 }
 
@@ -82,9 +105,20 @@ function authorLabel(paper: PaperSummary, locale: AppLocale) {
   return paper.authors.length > 1 ? text.otherAuthors(paper.authors[0]) : paper.authors[0];
 }
 
+function sourceLabel(paper: PaperSummary) {
+  if (paper.resolvedArxivId) return `arXiv:${paper.resolvedArxivId}`;
+  if (paper.sourceType === "pdf") return "PDF";
+  return paper.sourceType === "unknown" ? "DOCUMENT" : paper.sourceType.toUpperCase();
+}
+
 function progressPercent(paper: PaperSummary) {
   if (!paper.progress.total) return paper.status === "completed" ? 100 : 0;
   return Math.round((paper.progress.completed / paper.progress.total) * 100);
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function StatusIcon({ paper }: { paper: PaperSummary }) {
@@ -108,7 +142,10 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [notice, setNotice] = useState("");
   const [showRequest, setShowRequest] = useState(false);
   const [showMcpStatus, setShowMcpStatus] = useState(false);
+  const [requestSource, setRequestSource] = useState<TranslationSource>("arxiv");
   const [arxivDraft, setArxivDraft] = useState("");
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [requestCopied, setRequestCopied] = useState(false);
   const [jobCreating, setJobCreating] = useState(false);
   const [createdJob, setCreatedJob] = useState<CreatedJob | null>(null);
@@ -120,7 +157,8 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const searchRef = useRef<HTMLInputElement>(null);
   const paperFrameRef = useRef<HTMLIFrameElement>(null);
   const tocListRef = useRef<HTMLElement>(null);
-  const tocCleanupRef = useRef<(() => void) | null>(null);
+  const paperFrameCleanupRef = useRef<(() => void) | null>(null);
+  const jobRequestIdRef = useRef(0);
   const text = UI_TEXT[locale];
   const requestedArxivId = arxivIdFromInput(arxivDraft);
 
@@ -193,13 +231,13 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   }, []);
 
   useEffect(() => {
-    tocCleanupRef.current?.();
-    tocCleanupRef.current = null;
+    paperFrameCleanupRef.current?.();
+    paperFrameCleanupRef.current = null;
     setTocEntries([]);
     setActiveTocId(null);
     return () => {
-      tocCleanupRef.current?.();
-      tocCleanupRef.current = null;
+      paperFrameCleanupRef.current?.();
+      paperFrameCleanupRef.current = null;
     };
   }, [selectedSlug]);
 
@@ -215,12 +253,20 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     window.localStorage.setItem(APP_LOCALE_STORAGE_KEY, nextLocale);
   }
 
+  async function fetchLibraryPapers() {
+    const response = await fetch("/api/library", { cache: "no-store" });
+    if (!response.ok) throw new Error("refresh failed");
+    const body = (await response.json()) as { papers: PaperSummary[] };
+    return body.papers;
+  }
+
   async function refresh(silent = false) {
     try {
-      const response = await fetch("/api/library", { cache: "no-store" });
-      if (!response.ok) throw new Error("refresh failed");
-      const body = (await response.json()) as { papers: PaperSummary[] };
-      setPapers(body.papers);
+      const nextPapers = await fetchLibraryPapers();
+      setPapers(nextPapers);
+      setTrackedJobIds((current) => current.filter(
+        (jobId) => !nextPapers.some((paper) => paper.slug === jobId),
+      ));
       if (!silent) setNotice(text.refreshSuccess);
     } catch {
       if (!silent) setNotice(text.refreshFailed);
@@ -228,10 +274,10 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   }
 
   useEffect(() => {
-    if (!papers.some(isActive)) return;
-    const timer = window.setInterval(() => void refresh(true), 8000);
+    if (!papers.some(isActive) && trackedJobIds.length === 0) return;
+    const timer = window.setInterval(() => void refresh(true), 4_000);
     return () => window.clearInterval(timer);
-  }, [papers]);
+  }, [papers, trackedJobIds]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -241,7 +287,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       }
       if (event.key === "Escape") {
         if (showMcpStatus) setShowMcpStatus(false);
-        else if (showRequest) setShowRequest(false);
+        else if (showRequest) closeTranslationRequest();
         else if (selectedSlug) setSelectedSlug(null);
       }
     }
@@ -325,10 +371,120 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     }
   }
 
-  async function copyWorkerRequest() {
-    if (!createdJob) return;
+  async function waitForPdfPreparation(jobId: string, requestId: number) {
+    const deadline = Date.now() + 10 * 60_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+      if (jobRequestIdRef.current !== requestId) return null;
+      let nextPapers: PaperSummary[];
+      try {
+        nextPapers = await fetchLibraryPapers();
+      } catch {
+        continue;
+      }
+      setPapers(nextPapers);
+      const paper = nextPapers.find((candidate) => candidate.slug === jobId);
+      if (!paper) continue;
+      if (paper.status === "failed") {
+        throw new Error(paper.errorMessage || text.pdfPrepareFailed);
+      }
+      if (paper.status !== "prepared") continue;
+      if (!paper.progress.total) throw new Error(text.pdfNoText);
+      return paper;
+    }
+    throw new Error(text.pdfPrepareTimeout(jobId));
+  }
+
+  async function uploadPdfJob() {
+    if (!pdfFile || jobCreating) return;
+    if (pdfFile.size > MAX_PDF_BYTES) {
+      setJobError(text.pdfTooLarge);
+      return;
+    }
+    const requestId = ++jobRequestIdRef.current;
+    setJobCreating(true);
+    setCreatedJob(null);
+    setJobError("");
+    setRequestCopied(false);
     try {
-      await navigator.clipboard.writeText(text.workerPrompt(createdJob.jobId));
+      const form = new FormData();
+      form.set("paper", pdfFile);
+      const response = await fetch("/api/papers/import", { method: "POST", body: form });
+      let body: PdfImportResponse;
+      try {
+        body = (await response.json()) as PdfImportResponse;
+      } catch {
+        throw new Error(text.pdfUploadFailed);
+      }
+      if (response.status === 409 && body.jobId) {
+        const nextPapers = await fetchLibraryPapers();
+        setPapers(nextPapers);
+        const existing = nextPapers.find((paper) => paper.slug === body.jobId);
+        if (!existing || isActive(existing)) {
+          setTrackedJobIds((current) => current.includes(body.jobId!) ? current : [...current, body.jobId!]);
+        }
+        if (jobRequestIdRef.current !== requestId) return;
+        if (existing && ["completed", "needs_review"].includes(existing.status)) {
+          setSelectedSlug(existing.slug);
+          setNotice(text.pdfAlreadyImported(existing.slug));
+          closeTranslationRequest();
+          return;
+        }
+        if (existing && canCopyWorkerRequest(existing) && existing.progress.total > 0) {
+          setCreatedJob({
+            jobId: existing.slug,
+            status: existing.status,
+            chunks: {
+              completed: existing.progress.completed,
+              total: existing.progress.total,
+              remaining: Math.max(0, existing.progress.total - existing.progress.completed),
+            },
+            paper: { title: existing.title, requestedArxivId: "", resolvedArxivId: "" },
+            sourceType: "pdf",
+          });
+          setNotice(text.jobCreated(existing.slug));
+          return;
+        }
+      }
+      if (!body.jobId || (!response.ok && response.status !== 409)) {
+        throw new Error(body.error ?? text.pdfUploadFailed);
+      }
+      // Parsing belongs to the library, not to the modal. Keep tracking a job
+      // even when the user closes the dialog while the upload request is in flight.
+      setTrackedJobIds((current) => current.includes(body.jobId!) ? current : [...current, body.jobId!]);
+      if (jobRequestIdRef.current !== requestId) return;
+      setNotice(text.pdfJobStarted(body.jobId));
+      const paper = await waitForPdfPreparation(body.jobId, requestId);
+      if (!paper || jobRequestIdRef.current !== requestId) return;
+      setCreatedJob({
+        jobId: body.jobId,
+        status: "prepared",
+        chunks: {
+          completed: paper.progress.completed,
+          total: paper.progress.total,
+          remaining: Math.max(0, paper.progress.total - paper.progress.completed),
+        },
+        paper: {
+          title: paper.title,
+          requestedArxivId: "",
+          resolvedArxivId: "",
+        },
+        sourceType: "pdf",
+      });
+      setTrackedJobIds((current) => current.filter((jobId) => jobId !== body.jobId));
+      setNotice(text.jobCreated(body.jobId));
+    } catch (error) {
+      if (jobRequestIdRef.current === requestId) {
+        setJobError(error instanceof Error ? error.message : text.pdfUploadFailed);
+      }
+    } finally {
+      if (jobRequestIdRef.current === requestId) setJobCreating(false);
+    }
+  }
+
+  async function copyWorkerRequestForJob(jobId: string) {
+    try {
+      await navigator.clipboard.writeText(text.workerPrompt(jobId));
       setRequestCopied(true);
       setNotice(text.workerRequestCopied);
     } catch {
@@ -336,13 +492,34 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     }
   }
 
+  async function copyWorkerRequest() {
+    if (createdJob) await copyWorkerRequestForJob(createdJob.jobId);
+  }
+
   function openTranslationRequest() {
+    jobRequestIdRef.current += 1;
+    setRequestSource("arxiv");
     setArxivDraft("");
+    setPdfFile(null);
+    setJobCreating(false);
     setRequestCopied(false);
     setCreatedJob(null);
     setJobError("");
     setShowMcpStatus(false);
     setShowRequest(true);
+  }
+
+  function closeTranslationRequest() {
+    jobRequestIdRef.current += 1;
+    setJobCreating(false);
+    setShowRequest(false);
+  }
+
+  function changeRequestSource(next: TranslationSource) {
+    setRequestSource(next);
+    setCreatedJob(null);
+    setJobError("");
+    setRequestCopied(false);
   }
 
   function setNavigation(next: Filter) {
@@ -359,25 +536,76 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     }
   }
 
-  function resetEmbeddedPaper(iframe: HTMLIFrameElement) {
-    try {
-      iframe.contentWindow?.scrollTo({ top: 0, left: 0 });
-    } catch {
-      // The local artifact is same-origin; fail safely if deployment changes that assumption.
-    }
-  }
-
   function initializeEmbeddedPaper(iframe: HTMLIFrameElement) {
-    resetEmbeddedPaper(iframe);
-    tocCleanupRef.current?.();
-    tocCleanupRef.current = null;
+    paperFrameCleanupRef.current?.();
+    paperFrameCleanupRef.current = null;
 
     try {
       const frameWindow = iframe.contentWindow;
       const frameDocument = iframe.contentDocument;
       if (!frameWindow || !frameDocument) return;
 
-      const headings = Array.from(frameDocument.querySelectorAll<HTMLElement>("article h2, article h3"));
+      let disposed = false;
+      let scrollResetFrame = 0;
+      let tocAnimationFrame = 0;
+      let updateActiveSection: (() => void) | null = null;
+
+      const cancelFrame = (animationFrame: number) => {
+        if (!animationFrame) return;
+        try {
+          frameWindow.cancelAnimationFrame(animationFrame);
+        } catch {
+          // A navigation can revoke same-origin access before React runs cleanup.
+        }
+      };
+
+      const resetScrollPosition = () => {
+        if (disposed) return;
+        try {
+          frameWindow.history.scrollRestoration = "manual";
+        } catch {
+          // Some embedded contexts can deny history access even when the document is readable.
+        }
+        try {
+          frameWindow.cancelAnimationFrame(scrollResetFrame);
+          frameWindow.scrollTo({ top: 0, left: 0 });
+          scrollResetFrame = frameWindow.requestAnimationFrame(() => {
+            scrollResetFrame = 0;
+            if (disposed) return;
+            try {
+              frameWindow.scrollTo({ top: 0, left: 0 });
+            } catch {
+              // Ignore a navigation between scheduling and running the reset.
+            }
+          });
+        } catch {
+          // The artifact is expected to be same-origin; fail safely if deployment changes that.
+        }
+      };
+
+      const handlePageShow = () => resetScrollPosition();
+      frameWindow.addEventListener("pageshow", handlePageShow);
+      window.addEventListener("pageshow", handlePageShow);
+      paperFrameCleanupRef.current = () => {
+        disposed = true;
+        cancelFrame(scrollResetFrame);
+        cancelFrame(tocAnimationFrame);
+        window.removeEventListener("pageshow", handlePageShow);
+        try {
+          frameWindow.removeEventListener("pageshow", handlePageShow);
+          if (updateActiveSection) {
+            frameWindow.removeEventListener("scroll", updateActiveSection);
+            frameWindow.removeEventListener("resize", updateActiveSection);
+          }
+        } catch {
+          // The frame may have navigated before cleanup; disposed callbacks remain inert.
+        }
+      };
+      resetScrollPosition();
+
+      const headings = Array.from(frameDocument.querySelectorAll<HTMLElement>(
+        "article h2, article h3, .paper-section > .section-heading",
+      ));
       const entries = headings.flatMap<TocEntry>((heading, index) => {
         const labelNode = heading.querySelector<HTMLElement>(".ptx-heading-ja");
         const label = (labelNode?.textContent ?? heading.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -394,10 +622,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       setActiveTocId(entries[0]?.id ?? null);
       if (!entries.length) return;
 
-      let animationFrame = 0;
-      const updateActiveSection = () => {
-        frameWindow.cancelAnimationFrame(animationFrame);
-        animationFrame = frameWindow.requestAnimationFrame(() => {
+      updateActiveSection = () => {
+        frameWindow.cancelAnimationFrame(tocAnimationFrame);
+        tocAnimationFrame = frameWindow.requestAnimationFrame(() => {
           let currentId = entries[0].id;
           for (const entry of entries) {
             const heading = frameDocument.getElementById(entry.id);
@@ -411,12 +638,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       frameWindow.addEventListener("scroll", updateActiveSection, { passive: true });
       frameWindow.addEventListener("resize", updateActiveSection);
       updateActiveSection();
-      tocCleanupRef.current = () => {
-        frameWindow.cancelAnimationFrame(animationFrame);
-        frameWindow.removeEventListener("scroll", updateActiveSection);
-        frameWindow.removeEventListener("resize", updateActiveSection);
-      };
     } catch {
+      paperFrameCleanupRef.current?.();
+      paperFrameCleanupRef.current = null;
       setTocEntries([]);
       setActiveTocId(null);
     }
@@ -546,12 +770,21 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <ArrowLeft aria-hidden="true" />{text.backToLibrary}
                 </button>
                 <div className="reader-title">
-                  <small>arXiv:{selected.resolvedArxivId}</small>
+                  <small>{sourceLabel(selected)}</small>
                   <h1>{selected.title}</h1>
                 </div>
                 <div className="reader-actions">
+                  {canCopyWorkerRequest(selected) && (
+                    <button
+                      className="secondary-button reader-essential-action"
+                      type="button"
+                      onClick={() => void copyWorkerRequestForJob(selected.slug)}
+                    >
+                      <ChatCircleDots aria-hidden="true" />{text.copyWorkerRequest}
+                    </button>
+                  )}
                   <button
-                    className={selected.favorite ? "secondary-button active" : "secondary-button"}
+                    className={selected.favorite ? "secondary-button reader-library-action active" : "secondary-button reader-library-action"}
                     type="button"
                     disabled={librarySaving}
                     aria-pressed={selected.favorite}
@@ -561,13 +794,33 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     {selected.favorite ? text.favorites : text.addFavorite}
                   </button>
                   <button
-                    className="secondary-button"
+                    className="secondary-button reader-library-action"
                     type="button"
                     disabled={librarySaving}
                     onClick={() => void persistLibraryState(selected.slug, { isRead: !selected.isRead }, selected.isRead ? text.markedUnread : text.markedRead)}
                   >
                     <BookOpenText aria-hidden="true" />{selected.isRead ? text.markUnread : text.markRead}
                   </button>
+                  {selected.translatedPdfUrl && (
+                    <a
+                      className="secondary-button reader-essential-action"
+                      href={selected.translatedPdfUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <FileText aria-hidden="true" />{text.openTranslatedPdf}
+                    </a>
+                  )}
+                  {selected.markdownUrl && (
+                    <a className="secondary-button reader-essential-action" href={selected.markdownUrl} download>
+                      <FileText aria-hidden="true" />{text.downloadMarkdown}
+                    </a>
+                  )}
+                  {selected.downloadUrl && (
+                    <a className="secondary-button reader-essential-action" href={selected.downloadUrl} download>
+                      <ArrowSquareOut aria-hidden="true" />{text.downloadOfflineBundle}
+                    </a>
+                  )}
                 </div>
               </div>
               {selected.artifactUrl ? (
@@ -580,7 +833,16 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   onLoad={(event) => initializeEmbeddedPaper(event.currentTarget)}
                 />
               ) : (
-                <div className="reader-empty"><SpinnerGap className="spin" /><p>{text.waitingForHtml}</p></div>
+                <div className="reader-empty">
+                  {selected.status === "failed"
+                    ? <WarningCircle weight="fill" aria-hidden="true" />
+                    : <SpinnerGap className="spin" aria-hidden="true" />}
+                  <p>{selected.status === "failed"
+                    ? selected.errorMessage || text.preparationFailed
+                    : selected.status === "prepared"
+                      ? text.waitingForMcp
+                      : text.waitingForHtml}</p>
+                </div>
               )}
             </div>
 
@@ -629,7 +891,10 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                   <div><dt>{text.addedAt}</dt><dd>{formatPaperDate(selected.createdAt, locale)}</dd></div>
                   <div><dt>{text.updatedAt}</dt><dd>{formatDate(selected.updatedAt, locale)}</dd></div>
                 </dl>
-                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{text.openArxivSource}<ArrowSquareOut /></a>}
+                {selected.translatedPdfUrl && <a href={selected.translatedPdfUrl} target="_blank" rel="noreferrer">{text.openTranslatedPdf}<FileText /></a>}
+                {selected.markdownUrl && <a href={selected.markdownUrl} download>{text.downloadMarkdown}<FileText /></a>}
+                {selected.downloadUrl && <a href={selected.downloadUrl} download>{text.downloadOfflineBundle}<FileText /></a>}
+                {selected.sourceUrl && <a href={selected.sourceUrl} target="_blank" rel="noreferrer">{selected.sourceType === "arxiv" ? text.openArxivSource : text.openSource}<ArrowSquareOut /></a>}
               </section>
             </aside>
           </section>
@@ -660,7 +925,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     <span className="paper-type"><FileText weight="duotone" aria-hidden="true" /></span>
                     <span className="paper-copy">
                       <span className="paper-kicker">
-                        <span>arXiv:{paper.resolvedArxivId}</span>
+                        <span>{sourceLabel(paper)}</span>
                         <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{text.status[paper.status]}</span>
                       </span>
                       <strong>{paper.title}</strong>
@@ -676,6 +941,14 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     <span className="row-progress"><span style={{ width: `${progressPercent(paper)}%` }} /></span>
                   </button>
                   <div className="row-actions">
+                    {canCopyWorkerRequest(paper) && (
+                      <button
+                        type="button"
+                        aria-label={text.copyWorkerRequest}
+                        title={text.copyWorkerRequest}
+                        onClick={() => void copyWorkerRequestForJob(paper.slug)}
+                      ><ChatCircleDots aria-hidden="true" /></button>
+                    )}
                     <button
                       type="button"
                       aria-label={text.editTags}
@@ -714,29 +987,87 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       </section>
 
       {showRequest && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowRequest(false)}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={closeTranslationRequest}>
           <section className="request-modal" role="dialog" aria-modal="true" aria-labelledby="request-title" onMouseDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" type="button" onClick={() => setShowRequest(false)} title={text.close}><X aria-hidden="true" /></button>
+            <button className="modal-close" type="button" onClick={closeTranslationRequest} title={text.close}><X aria-hidden="true" /></button>
             <span className="modal-icon"><Plus aria-hidden="true" /></span>
             <p className="eyebrow">{text.mcpTranslationJob}</p>
             <h2 id="request-title">{text.requestTranslation}</h2>
-            <p>{text.requestHelp}</p>
-            <label>
-              <span>{text.arxivIdOrUrl}</span>
-              <input
-                autoFocus
-                value={arxivDraft}
-                onChange={(event) => {
-                  setArxivDraft(event.target.value);
-                  setCreatedJob(null);
-                  setJobError("");
-                  setRequestCopied(false);
-                }}
-                placeholder={text.arxivExample}
+            <p>{requestSource === "pdf" ? text.pdfRequestHelp : text.requestHelp}</p>
+            <div className="translation-source-tabs" role="tablist" aria-label={text.sourceType}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={requestSource === "arxiv"}
+                className={requestSource === "arxiv" ? "active" : ""}
                 disabled={jobCreating}
-              />
-            </label>
-            {arxivDraft && !requestedArxivId && <p className="field-error">{text.invalidArxiv}</p>}
+                onClick={() => changeRequestSource("arxiv")}
+              >{text.arxivSource}</button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={requestSource === "pdf"}
+                className={requestSource === "pdf" ? "active" : ""}
+                disabled={jobCreating}
+                onClick={() => changeRequestSource("pdf")}
+              >{text.pdfSource}</button>
+            </div>
+            {requestSource === "arxiv" ? (
+              <>
+                <label>
+                  <span>{text.arxivIdOrUrl}</span>
+                  <input
+                    key="arxiv-input"
+                    autoFocus
+                    value={arxivDraft}
+                    onChange={(event) => {
+                      setArxivDraft(event.target.value);
+                      setCreatedJob(null);
+                      setJobError("");
+                      setRequestCopied(false);
+                    }}
+                    placeholder={text.arxivExample}
+                    disabled={jobCreating}
+                  />
+                </label>
+                {arxivDraft && !requestedArxivId && <p className="field-error">{text.invalidArxiv}</p>}
+              </>
+            ) : (
+              <>
+                <label className="pdf-file-field">
+                  <span>{text.pdfFile}</span>
+                  <input
+                    key="pdf-input"
+                    autoFocus
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    disabled={jobCreating}
+                    onChange={(event) => {
+                      const nextFile = event.target.files?.[0] ?? null;
+                      if (nextFile && nextFile.size > MAX_PDF_BYTES) {
+                        setPdfFile(null);
+                        setJobError(text.pdfTooLarge);
+                        event.currentTarget.value = "";
+                        setCreatedJob(null);
+                        setRequestCopied(false);
+                        return;
+                      }
+                      setPdfFile(nextFile);
+                      setCreatedJob(null);
+                      setJobError("");
+                      setRequestCopied(false);
+                    }}
+                  />
+                  <small>{text.pdfFileHint}</small>
+                </label>
+                {pdfFile && (
+                  <div className="selected-pdf">
+                    <FileText weight="duotone" aria-hidden="true" />
+                    <span><strong>{pdfFile.name}</strong><small>{formatFileSize(pdfFile.size)}</small></span>
+                  </div>
+                )}
+              </>
+            )}
             <div className="provider-choice">
               <span className="provider-choice-icon"><ChatCircleDots weight="duotone" aria-hidden="true" /></span>
               <span><strong>{text.mcpServer}</strong><small>{text.connectorStatus[connectorHealth]}</small></span>
@@ -745,7 +1076,10 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             {jobCreating && (
               <div className="job-preparing" role="status">
                 <SpinnerGap className="spin" aria-hidden="true" />
-                <span><strong>{text.preparingJob}</strong><small>{text.preparingJobHelp}</small></span>
+                <span>
+                  <strong>{requestSource === "pdf" ? text.pdfPreparingJob : text.preparingJob}</strong>
+                  <small>{requestSource === "pdf" ? text.pdfPreparingJobHelp : text.preparingJobHelp}</small>
+                </span>
               </div>
             )}
             {jobError && <p className="job-error" role="alert">{jobError}</p>}
@@ -758,19 +1092,28 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 </span>
               </div>
             )}
+            {createdJob && (
+              <textarea
+                className="prompt-preview"
+                readOnly
+                value={text.workerPrompt(createdJob.jobId)}
+                aria-label={text.copyWorkerRequest}
+                onFocus={(event) => event.currentTarget.select()}
+              />
+            )}
             {createdJob && requestCopied && <p className="worker-request-copied">{text.workerRequestCopied}</p>}
             <div className="modal-actions">
-              <button className="secondary-button" type="button" onClick={() => { setShowRequest(false); setShowMcpStatus(true); }}>
+              <button className="secondary-button" type="button" onClick={() => { closeTranslationRequest(); setShowMcpStatus(true); }}>
                 <Gear aria-hidden="true" />{text.mcpConnection}
               </button>
               <button
                 className="primary-button"
                 type="button"
-                disabled={!requestedArxivId || jobCreating}
-                onClick={() => void (createdJob ? copyWorkerRequest() : createTranslationJob())}
+                disabled={jobCreating || (!createdJob && (requestSource === "arxiv" ? !requestedArxivId : !pdfFile))}
+                onClick={() => void (createdJob ? copyWorkerRequest() : requestSource === "pdf" ? uploadPdfJob() : createTranslationJob())}
               >
-                {jobCreating ? <SpinnerGap className="spin" aria-hidden="true" /> : createdJob ? <ChatCircleDots aria-hidden="true" /> : <Plus aria-hidden="true" />}
-                {jobCreating ? text.preparing : createdJob ? text.copyWorkerRequest : text.createJob}
+                {jobCreating ? <SpinnerGap className="spin" aria-hidden="true" /> : createdJob ? <ChatCircleDots aria-hidden="true" /> : requestSource === "pdf" ? <FileText aria-hidden="true" /> : <Plus aria-hidden="true" />}
+                {jobCreating ? text.preparing : createdJob ? text.copyWorkerRequest : requestSource === "pdf" ? text.uploadPdf : text.createJob}
               </button>
             </div>
           </section>

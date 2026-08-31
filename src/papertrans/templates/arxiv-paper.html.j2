@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="papertrans-artifact-version" content="{{ artifact_version }}">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action 'none'; frame-src 'none'; img-src 'self' data:; manifest-src 'none'; media-src 'self'; object-src 'none'; script-src 'none'; style-src 'self' 'unsafe-inline'; worker-src 'none'">
   <link rel="icon" href="data:,">
-  {% if document.validation %}<link rel="stylesheet" href="assets/arxiv-paper.css">{% endif %}
   <title>{{ title }} - PaperTrans</title>
-  <style>
+  <style data-papertrans-browser-compat>
     :root{color-scheme:light;--ptx-bg:#f2f0eb;--ptx-paper:#fffefb;--ptx-ink:#20242b;--ptx-muted:#68707b;--ptx-line:#d9dce0;--ptx-blue:#2457a6;--ptx-soft:#f5f7fa;--ptx-warn:#8b5a00}
-    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:74px;width:100%;max-width:100%;overflow-x:hidden;overflow-x:clip}body{margin:0;width:100%;max-width:100%;overflow-x:hidden;overflow-x:clip;background:var(--ptx-bg);color:var(--ptx-ink);font-family:"Hiragino Sans","Noto Sans JP",sans-serif;line-height:1.8}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:74px;width:100%;max-width:100%;overflow-x:hidden;overflow-x:clip}body{display:block!important;margin:0;width:100%;max-width:100%;overflow-x:hidden;overflow-x:clip;background:var(--ptx-bg);color:var(--ptx-ink);font-family:"Hiragino Sans","Noto Sans JP",sans-serif;line-height:1.8}
     .ptx-topbar{position:sticky;top:0;z-index:30;min-height:58px;padding:10px 24px;border-bottom:1px solid var(--ptx-line);background:rgba(255,254,251,.97);display:flex;align-items:center;justify-content:space-between;gap:20px;backdrop-filter:blur(10px)}
     .ptx-brand{font:600 17px Georgia,"Yu Mincho",serif}.ptx-topbar nav{display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:12px}.ptx-topbar a{color:var(--ptx-blue);text-decoration:none}.ptx-status{border:1px solid var(--ptx-line);border-radius:999px;padding:2px 9px;color:var(--ptx-muted)}
     .ptx-shell{width:100%;min-width:0;max-width:1460px;margin:auto;display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,270px);gap:34px;padding:30px 28px 90px;align-items:start}.ptx-main{width:100%;min-width:0;overflow:hidden;background:var(--ptx-paper);border:1px solid #e3e0da;padding:50px 68px 82px}
@@ -30,6 +31,7 @@
       <span>{{ document.model.translation or "未翻訳" }}</span>
       <a href="{{ document.source.url }}">arXiv HTML</a>
       <a href="https://arxiv.org/pdf/{{ document.source.resolvedArxivId }}">原文PDF</a>
+      <a href="index.md">Markdown</a>
       <a href="document.json">構造JSON</a>
       <a href="qa.json">QA</a>
     </nav>

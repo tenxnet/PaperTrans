@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from zipfile import ZipFile
 
 import anyio
+import pymupdf
 import pytest
 
 from papertrans import chatgpt_worker
 from papertrans.chatgpt_worker import ChatGPTTranslationStore, TranslationJobError
 from papertrans.mcp_server import server
+from papertrans.pdf_artifacts import write_pdf_job_manifest
+from papertrans.render import arxiv_html_artifact_version
 
 
 ARTICLE = f"""
@@ -81,6 +85,112 @@ def _translations(chunk: dict) -> list[dict]:
     ]
 
 
+def _pdf_unit(
+    block_id: str,
+    kind: str,
+    original: str,
+    *,
+    section_id: str | None = None,
+) -> dict:
+    return {
+        "id": block_id,
+        "kind": kind,
+        "sectionId": section_id,
+        "original": original,
+        "japanese": "",
+        "sourceBlockIds": [f"source-{block_id}"],
+        "pages": [1],
+        "citations": ["[1]"] if "[1]" in original else [],
+        "objectReferences": [],
+        "externalLinks": [],
+        "referenceLabel": None,
+        "preservedTerms": [],
+        "warnings": [],
+    }
+
+
+def _prepare_pdf_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ChatGPTTranslationStore:
+    job_id = "pdf-mcp"
+    source = tmp_path / "data" / "papers" / job_id / "source.pdf"
+    source.parent.mkdir(parents=True)
+    pdf = pymupdf.open()
+    page = pdf.new_page()
+    page.insert_text((72, 72), "LASA PDF MCP fixture")
+    pdf.save(source)
+    pdf.close()
+
+    title = _pdf_unit("paper-title", "title", "LASA PDF MCP Test")
+    heading = _pdf_unit("heading-sec-1", "heading", "1 Introduction", section_id="sec-1")
+    paragraph = _pdf_unit(
+        "para-1",
+        "paragraph",
+        "LASA preserves multilingual safety behavior [1].",
+        section_id="sec-1",
+    )
+    document = {
+        "version": 3,
+        "sourceFile": "source.pdf",
+        "pageCount": 1,
+        "sourcePageCount": 1,
+        "partial": False,
+        "status": "structured",
+        "model": {"translation": None, "translationReasoningEffort": None},
+        "title": title,
+        "frontMatter": {"authors": [], "affiliations": [], "metadata": []},
+        "sections": [
+            {
+                "id": "sec-1",
+                "number": "1",
+                "level": 1,
+                "parentSectionId": None,
+                "pageStart": 1,
+                "title": heading,
+                "content": [{"type": "unit", "position": 2, "value": paragraph}],
+            }
+        ],
+        "visualObjects": [],
+        "warnings": [],
+        "glossary": [],
+    }
+    work = tmp_path / "output" / job_id / "work"
+    work.mkdir(parents=True)
+    (work / "semantic-document.json").write_text(
+        json.dumps(document), encoding="utf-8"
+    )
+    (work / "layout-evidence.json").write_text("{}", encoding="utf-8")
+    (work / "structure.json").write_text("{}", encoding="utf-8")
+    write_pdf_job_manifest(
+        work / "papertrans-job.json",
+        slug=job_id,
+        source=source,
+        status="prepared",
+        pdf_parser="docling",
+        structure_mode="docling",
+        document=document,
+    )
+
+    def fake_pdf_qa(
+        _document: dict,
+        publication_dir: Path,
+        **_kwargs,
+    ) -> dict:
+        qa = {
+            "status": "passed",
+            "output": {"figures": 0, "tables": 0, "visibleMath": 0},
+            "unresolvedInternalLinks": 0,
+            "missingLocalAssets": [],
+        }
+        (publication_dir / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+        return qa
+
+    monkeypatch.setattr(chatgpt_worker, "write_semantic_pdf_qa", fake_pdf_qa)
+    return ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+
+
+def test_default_job_id_is_safe_for_legacy_arxiv_identifiers():
+    assert chatgpt_worker._default_job_id("math/0211159") == "arxiv-math-0211159-mcp"
+
+
 def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -131,9 +241,193 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     assert finalized["usage"]["available"] is False
     assert Path(finalized["indexPath"]).exists()
     assert '<html lang="ja">' in Path(finalized["indexPath"]).read_text(encoding="utf-8")
+    assert Path(finalized["markdownPath"]).exists()
+    assert "日本語訳" in Path(finalized["markdownPath"]).read_text(encoding="utf-8")
     assert Path(finalized["bundlePath"]).exists()
     assert json.loads(Path(finalized["qaPath"]).read_text(encoding="utf-8"))["status"] == "passed"
+    assert json.loads(Path(finalized["markdownQaPath"]).read_text(encoding="utf-8"))["status"] == "passed"
+    finalized_html = Path(finalized["indexPath"]).read_bytes()
+    assert b"data-papertrans-browser-compat" in finalized_html
+    assert b"papertrans-artifact-version" in finalized_html
+    assert b"body{display:block!important" in finalized_html
+    assert b"assets/arxiv-paper.css" not in finalized_html
+    with ZipFile(finalized["bundlePath"]) as archive:
+        assert archive.read("index.html") == finalized_html
+        assert archive.read("index.md") == Path(finalized["markdownPath"]).read_bytes()
+        assert "qa.json" in archive.namelist()
+    finalized_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert finalized_manifest["artifacts"]["rendererVersion"] == arxiv_html_artifact_version()
+    assert finalized_manifest["artifacts"]["markdownPath"] == finalized["markdownPath"]
     assert restarted.finalize("paper-chatgpt") == finalized
+    assert restarted.status("paper-chatgpt")["status"] == "completed"
+
+    Path(finalized["indexPath"]).write_text("stale artifact", encoding="utf-8")
+    finalized_manifest["artifacts"]["rendererVersion"] = "1-stale"
+    manifest_path.write_text(json.dumps(finalized_manifest), encoding="utf-8")
+    assert restarted.status("paper-chatgpt")["status"] == "ready_to_finalize"
+
+    refreshed = restarted.finalize("paper-chatgpt")
+    refreshed_html = Path(refreshed["indexPath"]).read_bytes()
+    assert b"stale artifact" not in refreshed_html
+    assert b"data-papertrans-browser-compat" in refreshed_html
+    with ZipFile(refreshed["bundlePath"]) as archive:
+        assert archive.read("index.html") == refreshed_html
+    refreshed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert refreshed_manifest["artifacts"]["rendererVersion"] == arxiv_html_artifact_version()
+
+
+def test_mcp_worker_translates_prepared_docling_pdf_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+
+    status = store.status("pdf-mcp")
+    assert status["status"] == "prepared"
+    assert status["chunks"] == {"completed": 0, "total": 1, "remaining": 1}
+    assert store.list_jobs()[0]["jobId"] == "pdf-mcp"
+
+    chunk = store.next_chunk("pdf-mcp")
+    assert chunk["chunkId"] == "chunk-001"
+    assert [block["blockId"] for block in chunk["blocks"]] == [
+        "paper-title",
+        "heading-sec-1",
+        "para-1",
+    ]
+    assert "PDF paper text" in chunk["translationInstructions"]
+
+    saved = store.save_chunk("pdf-mcp", "chunk-001", _translations(chunk))
+    assert saved["status"] == "ready_to_finalize"
+    assert saved["chunks"]["remaining"] == 0
+    mcp_manifest = json.loads(
+        (tmp_path / "output/pdf-mcp/work/mcp-job.json").read_text(encoding="utf-8")
+    )
+    assert mcp_manifest["sourceType"] == "pdf"
+    common_manifest = json.loads(
+        (tmp_path / "output/pdf-mcp/work/papertrans-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert common_manifest["provider"] == "mcp"
+    assert common_manifest["status"] == "ready_to_finalize"
+
+    finalized = store.finalize("pdf-mcp")
+    assert finalized["status"] == "completed"
+    assert Path(finalized["indexPath"]).is_file()
+    assert Path(finalized["markdownPath"]).is_file()
+    assert Path(finalized["bundlePath"]).is_file()
+    assert json.loads(Path(finalized["markdownQaPath"]).read_text(encoding="utf-8"))[
+        "status"
+    ] == "passed"
+    with ZipFile(finalized["bundlePath"]) as archive:
+        assert "index.html" in archive.namelist()
+        assert "index.md" in archive.namelist()
+        assert "source.pdf" in archive.namelist()
+    finalized_common = json.loads(
+        (tmp_path / "output/pdf-mcp/work/papertrans-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert finalized_common["provider"] == "mcp"
+    assert finalized_common["status"] == "completed"
+    completed_updated_at = finalized_common["updatedAt"]
+    completed_finalized_at = finalized_common["finalizedAt"]
+    finalized_common["status"] = "preparing"
+    (tmp_path / "output/pdf-mcp/work/papertrans-job.json").write_text(
+        json.dumps(finalized_common), encoding="utf-8"
+    )
+    assert store.finalize("pdf-mcp") == finalized
+    repaired_common = json.loads(
+        (tmp_path / "output/pdf-mcp/work/papertrans-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert repaired_common["status"] == "completed"
+    assert repaired_common["updatedAt"] == completed_updated_at
+    assert repaired_common["finalizedAt"] == completed_finalized_at
+
+
+def test_mcp_pdf_finalize_marks_empty_text_pages_for_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    chunk = store.next_chunk("pdf-mcp")
+    store.save_chunk("pdf-mcp", chunk["chunkId"], _translations(chunk))
+
+    def qa_with_blank_page(_document: dict, publication_dir: Path, **_kwargs) -> dict:
+        qa = {
+            "status": "passed",
+            "emptyTextPages": [2],
+            "output": {"figures": 0, "tables": 0, "visibleMath": 0},
+            "unresolvedInternalLinks": 0,
+            "missingLocalAssets": [],
+        }
+        (publication_dir / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+        return qa
+
+    monkeypatch.setattr(chatgpt_worker, "write_semantic_pdf_qa", qa_with_blank_page)
+
+    finalized = store.finalize("pdf-mcp")
+
+    assert finalized["status"] == "needs_review"
+    document = json.loads(
+        (tmp_path / "output/pdf-mcp/work/semantic-document.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert document["status"] == "needs_review"
+    common = json.loads(
+        (tmp_path / "output/pdf-mcp/work/papertrans-job.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert common["status"] == "needs_review"
+
+
+@pytest.mark.parametrize("status", ["preparing", "translating", "failed"])
+def test_mcp_worker_rejects_pdf_job_before_prepared_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    manifest_path = tmp_path / "output/pdf-mcp/work/papertrans-job.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = status
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(TranslationJobError, match="not ready for MCP translation"):
+        store.status("pdf-mcp")
+    assert store.list_jobs() == []
+    assert not (tmp_path / "output/pdf-mcp/work/mcp-job.json").exists()
+
+
+def test_mcp_worker_accepts_legacy_review_job_after_artifact_qa(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    manifest_path = tmp_path / "output/pdf-mcp/work/papertrans-job.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "needs_review"
+    manifest["provider"] = "none"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    qa_path = tmp_path / "output/pdf-mcp/html/qa.json"
+    qa_path.parent.mkdir(parents=True)
+    qa_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+
+    status = store.status("pdf-mcp")
+
+    assert status["status"] == "prepared"
+    assert status["chunks"]["remaining"] == 1
+
+
+def test_mcp_worker_rejects_pdf_source_hash_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    source = tmp_path / "data/papers/pdf-mcp/source.pdf"
+    source.write_bytes(b"%PDF-1.7\nchanged")
+
+    with pytest.raises(TranslationJobError, match="source hash"):
+        store.next_chunk("pdf-mcp")
+    assert not (tmp_path / "output/pdf-mcp/work/mcp-job.json").exists()
 
 
 def test_chatgpt_worker_rejects_unsupported_target_language(tmp_path: Path):

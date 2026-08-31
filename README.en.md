@@ -6,7 +6,7 @@
 
 [日本語](README.md) | English
 
-> **Pre-release preview (v0.1)** — The supported v1 path prepares official arXiv HTML through the local MCP server and uses a connected MCP client to translate it into Japanese. PDF processing and the Codex CLI path remain experimental.
+> **Release candidate (v0.2.0-rc.1)** — Official arXiv HTML remains the stable input path, with digital-PDF import through Docling added as an experimental path. Both use a connected MCP client to translate into Japanese.
 
 PaperTrans is a local-first academic paper translation workspace. It translates prose into Japanese while preserving document structure, MathML equations, figures, tables, citations, cross-references, identifiers, and bibliography entries.
 
@@ -16,7 +16,9 @@ PaperTrans is a local-first academic paper translation workspace. It translates 
 - Split only translatable prose into stable semantic units.
 - Preserve equations, figures, tables, citation links, DOIs, and protected terms.
 - Use a connected MCP client as the translation worker.
-- Validate block identity and protected tokens before rendering.
+- Import a digital PDF in the web UI, parse it with Docling, and send it through the same translation flow.
+- Validate block identity and protected tokens, then persist the normalized DocumentIR as the artifact source of truth.
+- Generate sibling HTML and Markdown from that same DocumentIR and include both format-specific QA results in the ZIP.
 - Manage search, tags, unread state, and favorites in a local library.
 - Read papers inside the app with a navigable section outline.
 
@@ -27,31 +29,35 @@ Papers, translations, and library state stay on the local machine and are exclud
 ### Requirements
 
 - macOS or Linux
-- Python 3.10+ and [uv](https://docs.astral.sh/uv/)
-- Node.js 22+ and pnpm 11
+- Git and [uv](https://docs.astral.sh/uv/)
+- Node.js 22+ with Corepack or pnpm 11 available
 
 ```bash
 git clone https://github.com/tenxnet/PaperTrans.git
 cd PaperTrans
-uv sync --extra mcp
-pnpm install --frozen-lockfile
+./papertrans start
 ```
 
-Start the local MCP server:
+On the first run, the launcher prepares the locked Python and Node dependencies, downloads and hash-verifies the Docling layout and table models, and builds the web app. It then starts MCP and Web on `127.0.0.1` and opens `http://127.0.0.1:3000`. The first run needs an internet connection, several minutes or more, and several GB of free space. Later runs reuse the verified setup.
+
+Running `./papertrans` without a subcommand is equivalent to `start`. Keep the terminal open while using PaperTrans; press `Ctrl-C` to stop both Web and MCP. This is a source-checkout release for macOS and Linux, not a desktop app or installer.
+
+Common management commands are:
 
 ```bash
-.venv/bin/papertrans-mcp --host 127.0.0.1 --port 8000
+./papertrans setup                 # Prepare dependencies, models, and the Web build
+./papertrans doctor                # Check setup readiness
+./papertrans start --no-browser    # Start without opening a browser
+./papertrans status                # Probe the running Web and MCP services
 ```
 
-Start the web app in another terminal:
+Use `./papertrans start --offline` when all dependencies are cached and the models have already been verified. To change ports, for example, run `./papertrans start --web-port 3100 --mcp-port 8100`.
 
-```bash
-pnpm dev --hostname 127.0.0.1
-```
+Before creating the first translation job, connect a client with the [MCP client setup guide](docs/mcp-client-setup.md). A local MCP client can connect directly to `http://127.0.0.1:8000/mcp`. Using ChatGPT requires separate creation and authorization of OpenAI Secure MCP Tunnel; `./papertrans` does not automate that external setup.
 
-Before creating the first job, connect a client with the [MCP client setup guide](docs/mcp-client-setup.md). A local MCP client can use the URL above directly; ChatGPT uses Secure MCP Tunnel.
+Under **New translation**, register an arXiv ID or a digital PDF up to 50 MB. Send the displayed **Worker request** to the connected client; PaperTrans then persists progress and artifacts.
 
-Open `http://127.0.0.1:3000` and register an arXiv ID under **New translation**. Copy the displayed **Worker request** into the connected client; PaperTrans then persists progress and artifacts. Add `--port 3100` to the web command if you need a different port.
+A completed job stores `html/index.html` and `html/index.md` as sibling artifacts, with format-specific checks in `html/qa.json` and `html/markdown-qa.json`. From the web library, you can read the HTML, download the Markdown, or download a ZIP containing both formats and their local assets.
 
 ## Choose an MCP client
 
@@ -65,7 +71,8 @@ The Web UI manages job preparation, progress, and artifacts. Model selection and
 ## Scope
 
 - Official arXiv HTML is the supported v1 input.
-- ar5iv, LaTeXML, general PDF parsing, and PDF OCR are future or experimental paths.
+- Digital-PDF import through Docling is experimental in v0.2.0-rc.1. Reading order, equations, and tables can still be reconstructed incorrectly in complex layouts.
+- Scanned-PDF OCR, translated-PDF generation, and ar5iv or LaTeXML fallback are unavailable or still under evaluation.
 - Japanese is the only v1 translation target. The web UI itself supports Japanese and English.
 - The web app and MCP server are local, single-user tools.
 - Public artifact hosting and collaboration are out of scope.
@@ -75,12 +82,14 @@ The Web UI manages job preparation, progress, and artifacts. Model selection and
 Priorities and specifications may change as experiments and issues provide new evidence.
 
 - [ ] Fall back to ar5iv or LaTeXML when official arXiv HTML is unavailable.
-- [ ] Preserve structure, equations, figures, tables, and citations in general PDFs such as IEEE papers.
+- [ ] Strengthen layout, equation, table, and citation QA for Docling PDF imports, and evaluate OCR support.
+- [ ] Evaluate translated-PDF generation through an isolated backend.
 - [ ] Add glossary editing, per-paper rules, and section-level retranslation.
 - [ ] Add navigable links between prose, citations, references, figures, and tables.
 - [ ] Add translation parallelism, caching, and processing-time or usage metrics.
 - [ ] Improve library management with folders, full-text search, and batch actions.
 - [ ] Support translation targets beyond Japanese and optional external translation providers.
+- [ ] Distribute a signed, auto-updating desktop application.
 
 ## Local data and safety
 
@@ -94,16 +103,20 @@ Priorities and specifications may change as experiments and issues provide new e
 ## Documentation
 
 - [MCP client setup](docs/mcp-client-setup.md)
+- [Updates, backups, and uninstalling](docs/local-data-lifecycle.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Documentation index](docs/README.md)
+- [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [Maintainer release runbook](RELEASING.md)
 
 ## Development and validation
 
 ```bash
-.venv/bin/pytest -q
+uv run --frozen --extra test pytest -q
 pnpm typecheck
+pnpm test:pdf-import-admission
 pnpm build
 ```
 

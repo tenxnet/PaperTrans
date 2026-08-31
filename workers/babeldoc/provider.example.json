@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "profileId": "evaluation-ja-v1",
+  "providerId": "openai-compatible-local",
+  "modelId": "replace-with-recorded-model-id",
+  "baseUrl": "http://translation-gateway:8080/v1",
+  "apiKey": "replace-at-runtime",
+  "qps": 1
+}
