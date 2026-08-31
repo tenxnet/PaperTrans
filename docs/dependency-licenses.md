@@ -4,7 +4,7 @@ This is an engineering inventory, not legal advice. PaperTrans's Apache-2.0 lice
 
 ## Audit baseline
 
-- Audited on: 2026-08-30
+- Audited on: 2026-08-31
 - Node source: `pnpm-lock.yaml` and 31 installed package manifests under `node_modules/.pnpm`
 - Python source: `uv.lock`, `pyproject.toml`, and 42 installed third-party distribution metadata records in `.venv`
 - History check: every Git ref, path, and blob in `git rev-list --all`
@@ -20,7 +20,7 @@ The installed Node packages report MIT, Apache-2.0, BSD-3-Clause, ISC, 0BSD, LGP
 
 The installed Python environment is primarily MIT, BSD, Apache-2.0, PSF-2.0, and MIT-0. The material exception is:
 
-- `PyMuPDF 1.28.2`: dual licensed under AGPL-3.0 or an Artifex commercial license. It is used by the experimental PDF pipeline and by conversion of PDF-formatted figure assets. Distributors and hosted-service operators must evaluate the applicable PyMuPDF license obligations. The first tagged release should either retain it with an explicit compliance decision, replace it, or isolate it further as an optional feature.
+- `PyMuPDF 1.28.2`: dual licensed under AGPL-3.0 or an Artifex commercial license. It is used by the experimental PDF pipeline and by the isolated worker that normalizes untrusted arXiv SVG/raster assets to PNG. Distributors and hosted-service operators must evaluate the applicable PyMuPDF license obligations. The first tagged release should either retain it with an explicit compliance decision, replace it, or isolate it further as an optional feature.
 
 The locked optional `Docling 2.123.0` package reports MIT for its code. Individual models and model packages used through Docling can have separate licenses and must be checked when that experimental extra is enabled.
 

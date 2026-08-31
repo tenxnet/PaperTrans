@@ -44,6 +44,8 @@ Open **System Settings → Privacy & Security → Full Disk Access** and allow t
 
 The library scans persisted output manifests. Confirm that the job has a valid manifest below `output/<job-id>/work/`, that `index.html`, `index.md`, `qa.json`, and `markdown-qa.json` exist below `output/<job-id>/html/`, and that the ZIP exists below `output/<job-id>/`. Call `finalize_translation_html` again to rebuild missing or stale artifacts, then refresh the library.
 
+PaperTrans also hides arXiv artifacts made by an older security generation. Call `finalize_translation_html` to rebuild jobs that already contain the current safe localized-asset manifest. If finalization asks for reacquisition, prepare the arXiv paper again; legacy SVG or other unverified files are intentionally not copied into a new offline bundle.
+
 ## `index.md` or `markdown-qa.json` is missing
 
 Call `finalize_translation_html` again after every translation chunk is saved. A successful finalization regenerates HTML and Markdown from the persisted DocumentIR, runs both QA paths, and rebuilds the existing ZIP. If finalization reports that the job predates complete DocumentIR content, prepare the paper again before exporting Markdown.

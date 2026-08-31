@@ -21,6 +21,7 @@ metadata uses the PEP 440 equivalent `0.2.0rc1` for this release candidate.
 
 - PDF results now use the common artifact manifest and QA contract before the web library exposes them.
 - Official arXiv HTML remains the stable input path; Docling PDF import is explicitly release-candidate functionality.
+- arXiv media is decoded in a bounded worker, normalized to PNG, and published only when covered by the acquisition manifest. Artifacts from older renderer generations must be finalized or acquired again before the Web UI exposes their HTML, Markdown, or ZIP.
 
 ### Known limitations
 
