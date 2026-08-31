@@ -50,6 +50,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test:artifact-security
       - run: pnpm test:pdf-import-admission
       - run: pnpm build
 

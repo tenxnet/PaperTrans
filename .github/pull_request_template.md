@@ -12,6 +12,7 @@ Describe the user-visible result.
 
 - [ ] `uv run --frozen --extra test pytest -q`
 - [ ] `pnpm typecheck`
+- [ ] `pnpm test:artifact-security`
 - [ ] `pnpm test:pdf-import-admission`
 - [ ] `pnpm build`
 - [ ] Experimental-worker checks are not applicable or passed as documented in `CONTRIBUTING.md`.

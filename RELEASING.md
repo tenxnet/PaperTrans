@@ -49,14 +49,21 @@ lock merely to make CI pass.
 Run these commands from the repository root on a clean release checkout:
 
 ```bash
-git diff --check
+git diff --check main
 uv sync --frozen --extra test
 uv run --frozen --extra test pytest -q
+uv build
 pnpm install --frozen-lockfile
 pnpm typecheck
+pnpm test:artifact-security
 pnpm test:pdf-import-admission
 pnpm build
 PYTHONPATH=workers/babeldoc/worker/src uv run --frozen --extra test pytest -p no:cacheprovider workers/babeldoc/worker/tests -q
+uv run --frozen python -m py_compile \
+  workers/babeldoc/scripts/generate_runtime_metadata.py \
+  workers/babeldoc/scripts/generate_tree_manifest.py \
+  workers/babeldoc/scripts/validate_source.py \
+  workers/deterministic-gateway/gateway.py
 docker buildx build --check workers/babeldoc
 docker buildx build --check workers/harumi
 cargo +1.88.0 test --locked --manifest-path workers/harumi/Cargo.toml
