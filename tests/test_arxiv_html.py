@@ -1,20 +1,35 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import sys
 from pathlib import Path
 
+import pytest
 from bs4 import BeautifulSoup
 
 from papertrans.arxiv_html import (
+    ARXIV_ASSET_MANIFEST_FILENAME,
+    ArxivAcquisitionLimitError,
+    _ArxivRedirectHandler,
     _asset_url_candidates,
     _citation_metadata,
     _decode_local_images,
     _download_assets,
+    _normalize_passive_image,
     _parse_codex_jsonl,
+    _publish_local_assets,
     _repair_section_hierarchy,
+    _request_bytes,
+    _require_arxiv_https_url,
+    _run_image_worker,
+    _sanitize_tree,
     _section_chunks,
     _tokenize_node,
+    _validate_passive_svg,
     _validate_rendered_html,
+    _write_asset_manifest,
     normalize_arxiv_id,
     normalize_article_document,
     render_arxiv_html_document,
@@ -43,6 +58,11 @@ FIXTURE = """
   <section id="bib" class="ltx_bibliography"><h2 class="ltx_title ltx_title_bibliography">References</h2><ul><li id="bib.b1" class="ltx_bibitem">[1] Source.</li></ul></section>
 </article>
 """
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAA7EAAAOxAGVKw4b"
+    "AAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
+)
 
 
 def test_normalizes_arxiv_urls_and_versions():
@@ -83,6 +103,105 @@ def test_arxiv_asset_urls_support_native_and_document_directory_forms():
     assert _asset_url_candidates(base, "2405.20947v5/x1.png") == [
         "https://arxiv.org/html/2405.20947v5/x1.png"
     ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "http://arxiv.org/html/2405.20947v5/x1.png",
+        "https://media.example/x1.png",
+        "https://arxiv.org.evil.example/x1.png",
+        "https://user@arxiv.org/x1.png",
+        "https://arxiv.org:444/x1.png",
+    ],
+)
+def test_arxiv_acquisition_rejects_non_official_origins(url: str):
+    with pytest.raises(ValueError, match="official HTTPS origin"):
+        _require_arxiv_https_url(url)
+
+
+def test_arxiv_redirect_is_rejected_before_following_non_official_origin():
+    handler = _ArxivRedirectHandler()
+
+    with pytest.raises(ValueError, match="official HTTPS origin"):
+        handler.redirect_request(
+            None,
+            None,
+            302,
+            "Found",
+            {},
+            "https://metadata.internal/latest",
+        )
+
+
+def test_arxiv_response_limit_checks_headers_and_streamed_bytes(monkeypatch):
+    class FakeResponse:
+        def __init__(self, payload: bytes, content_length: str | None = None):
+            self.payload = payload
+            self.headers = {"Content-Type": "application/octet-stream"}
+            if content_length is not None:
+                self.headers["Content-Length"] = content_length
+            self.read_sizes: list[int] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return "https://arxiv.org/html/2405.20947"
+
+        def read(self, size: int):
+            self.read_sizes.append(size)
+            return self.payload[:size]
+
+    class FakeOpener:
+        def __init__(self, response: FakeResponse):
+            self.response = response
+
+        def open(self, _request, timeout: int):
+            assert timeout == 60
+            return self.response
+
+    declared = FakeResponse(b"unused", content_length="5")
+    monkeypatch.setattr(
+        "papertrans.arxiv_html.urllib.request.build_opener",
+        lambda *_handlers: FakeOpener(declared),
+    )
+    with pytest.raises(ArxivAcquisitionLimitError, match="exceeds 4 bytes"):
+        _request_bytes("https://arxiv.org/html/2405.20947", max_bytes=4)
+    assert declared.read_sizes == []
+
+    streamed = FakeResponse(b"12345")
+    monkeypatch.setattr(
+        "papertrans.arxiv_html.urllib.request.build_opener",
+        lambda *_handlers: FakeOpener(streamed),
+    )
+    with pytest.raises(ArxivAcquisitionLimitError, match="exceeds 4 bytes"):
+        _request_bytes("https://arxiv.org/html/2405.20947", max_bytes=4)
+    assert streamed.read_sizes == [5]
+
+    exact = FakeResponse(b"1234")
+    monkeypatch.setattr(
+        "papertrans.arxiv_html.urllib.request.build_opener",
+        lambda *_handlers: FakeOpener(exact),
+    )
+    payload, _, _ = _request_bytes(
+        "https://arxiv.org/html/2405.20947",
+        max_bytes=4,
+    )
+    assert payload == b"1234"
+    assert exact.read_sizes == [5]
+
+
+def test_arxiv_asset_candidates_reject_local_and_remote_references():
+    base = "https://arxiv.org/html/2405.20947v5"
+
+    for raw_url in ("file:///etc/passwd", "//media.example/x1.png"):
+        with pytest.raises(ValueError, match="official HTTPS origin"):
+            _asset_url_candidates(base, raw_url)
     assert _asset_url_candidates(base, "x1.png") == [
         "https://arxiv.org/html/x1.png",
         "https://arxiv.org/html/2405.20947v5/x1.png",
@@ -92,11 +211,11 @@ def test_arxiv_asset_urls_support_native_and_document_directory_forms():
 def test_asset_download_falls_back_to_arxiv_document_directory(monkeypatch, tmp_path: Path):
     requested: list[str] = []
 
-    def fake_request(url: str, timeout: int = 60):
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
         requested.append(url)
         if url == "https://arxiv.org/html/x1.png":
             raise OSError("404")
-        return b"png", url, "image/png"
+        return PNG_BYTES, url, "image/png"
 
     monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
     soup = BeautifulSoup('<article><img src="x1.png"></article>', "html.parser")
@@ -116,6 +235,294 @@ def test_asset_download_falls_back_to_arxiv_document_directory(monkeypatch, tmp_
     assert result["downloaded"][0]["url"] == "https://arxiv.org/html/2405.20947v5/x1.png"
     assert article.img is not None
     assert str(article.img["src"]).startswith("assets/")
+
+
+def test_downloaded_media_uses_magic_and_forces_a_passive_extension(
+    monkeypatch,
+    tmp_path: Path,
+):
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
+        assert timeout == 60
+        assert max_bytes > 0
+        if url.endswith("active.html"):
+            return b"<script>alert(1)</script>", url, "text/html"
+        if url.endswith("vector.png"):
+            return b"<svg><script>alert(1)</script></svg>", url, "image/svg+xml"
+        if url.endswith("document.png"):
+            return b"%PDF-1.7\n", url, "application/pdf"
+        return PNG_BYTES, url, "text/html"
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    soup = BeautifulSoup(
+        (
+            '<article><img src="active.html"><img src="vector.png">'
+            '<img src="document.png"><img src="figure.html"></article>'
+        ),
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    images = article.find_all("img")
+    assert all(image.get("src") is None for image in images[:3])
+    localized = str(images[3].get("src"))
+    assert localized.endswith(".png")
+    assert not any(path.suffix == ".html" for path in (tmp_path / "assets").iterdir())
+    assert result["downloaded"][0]["contentType"] == "image/png"
+    assert len(result["failures"]) == 3
+
+
+def test_passive_svg_is_rasterized_to_a_bounded_png():
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">'
+        b'<defs><pattern id="p" width="2" height="2" patternUnits="userSpaceOnUse">'
+        b'<rect width="2" height="2" fill="blue"/></pattern></defs>'
+        b'<rect width="20" height="10" fill="url(#p)"/></svg>'
+    )
+
+    normalized, suffix, content_type = _normalize_passive_image(svg)
+
+    assert normalized.startswith(PNG_MAGIC)
+    assert suffix == ".png"
+    assert content_type == "image/png"
+
+
+def test_standalone_raster_is_decoded_and_reencoded_as_png():
+    normalized, suffix, content_type = _normalize_passive_image(PNG_BYTES)
+
+    assert normalized.startswith(PNG_MAGIC)
+    assert suffix == ".png"
+    assert content_type == "image/png"
+
+
+def test_raster_pixel_bomb_is_rejected_before_native_decode():
+    oversized = bytearray(PNG_BYTES)
+    oversized[16:20] = (0xFFFFFFFF).to_bytes(4, "big")
+    oversized[20:24] = (0xFFFFFFFF).to_bytes(4, "big")
+
+    with pytest.raises(ArxivAcquisitionLimitError, match="resource limit"):
+        _normalize_passive_image(bytes(oversized))
+
+
+def test_image_worker_parent_rejects_reported_memory_overage(tmp_path: Path):
+    script = (
+        "import os,time;"
+        "fd=int(os.environ['PAPERTRANS_IMAGE_HEARTBEAT_FD']);"
+        "os.write(fd,b'536870913\\n');"
+        "time.sleep(5)"
+    )
+
+    with pytest.raises(ArxivAcquisitionLimitError, match="memory limit"):
+        _run_image_worker([sys.executable, "-I", "-c", script], tmp_path)
+
+
+def test_image_worker_parent_rejects_stalled_memory_watchdog(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(
+        "papertrans.arxiv_html.ARXIV_IMAGE_WORKER_HEARTBEAT_STALE_SECONDS",
+        0.05,
+    )
+    script = (
+        "import os,time;"
+        "fd=int(os.environ['PAPERTRANS_IMAGE_HEARTBEAT_FD']);"
+        "os.write(fd,b'1024\\n');"
+        "time.sleep(5)"
+    )
+
+    with pytest.raises(ArxivAcquisitionLimitError, match="unresponsive"):
+        _run_image_worker([sys.executable, "-I", "-c", script], tmp_path)
+
+
+@pytest.mark.parametrize(
+    "svg",
+    [
+        b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+        b'<svg xmlns="http://www.w3.org/2000/svg"><image href="https://media.example/x.png"/></svg>',
+        b'<svg xmlns="http://www.w3.org/2000/svg"><style>rect{fill:u/**/rl(//media.example/x.svg)}</style><rect/></svg>',
+        b'<!DOCTYPE svg [<!ENTITY x "boom">]><svg xmlns="http://www.w3.org/2000/svg"><text>&x;</text></svg>',
+        b'<?xml version="1.0"?><?xml-stylesheet href="https://media.example/x.css"?><svg xmlns="http://www.w3.org/2000/svg"/>',
+        b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="https://example.org/foreign"><x:path/></svg>',
+        b'<svg xmlns="http://www.w3.org/2000/svg" xml:base="https://media.example/"><use href="#glyph"/></svg>',
+        b'<svg xmlns="http://www.w3.org/2000/svg"><filter id="f"><feTurbulence/></filter></svg>',
+    ],
+)
+def test_active_or_externally_referencing_svg_is_rejected(svg: bytes):
+    with pytest.raises(ValueError):
+        _normalize_passive_image(svg)
+
+
+def test_safe_svg_serialization_preserves_xlink_prefix_for_use_elements():
+    safe = _validate_passive_svg(
+        b'<svg xmlns="http://www.w3.org/2000/svg" '
+        b'xmlns:xlink="http://www.w3.org/1999/xlink">'
+        b'<defs><path id="glyph" d="M0 0L1 1"/></defs>'
+        b'<use xlink:href="#glyph"/></svg>'
+    )
+
+    assert b'xlink:href="#glyph"' in safe
+    assert b"ns1:href" not in safe
+
+
+def test_asset_download_enforces_request_and_aggregate_budgets(monkeypatch, tmp_path: Path):
+    requested: list[str] = []
+
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
+        requested.append(url)
+        assert len(PNG_BYTES) <= max_bytes
+        return PNG_BYTES, url, "image/png"
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    monkeypatch.setattr("papertrans.arxiv_html.ARXIV_MAX_ASSET_REQUESTS", 2)
+    monkeypatch.setattr(
+        "papertrans.arxiv_html.ARXIV_MAX_TOTAL_ASSET_BYTES",
+        len(PNG_BYTES),
+    )
+    soup = BeautifulSoup(
+        '<article><img src="one.png"><img src="two.png"></article>',
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    assert requested == ["https://arxiv.org/html/one.png"]
+    assert article.find("img", src=True) is not None
+    assert len(article.find_all("img", src=True)) == 1
+    assert len(result["downloaded"]) == 1
+    assert "aggregate asset limit" in result["failures"][0]["error"]
+
+
+def test_asset_download_counts_fallback_attempts_and_stops_after_limit(
+    monkeypatch,
+    tmp_path: Path,
+):
+    requested: list[str] = []
+
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
+        requested.append(url)
+        raise OSError("missing")
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    monkeypatch.setattr("papertrans.arxiv_html.ARXIV_MAX_ASSET_REQUESTS", 1)
+    soup = BeautifulSoup(
+        '<article><img src="one.png"><img src="two.png"></article>',
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    assert requested == ["https://arxiv.org/html/one.png"]
+    assert article.find("img", src=True) is None
+    assert len(result["failures"]) == 1
+    assert "asset request limit" in result["failures"][0]["error"]
+
+
+def test_asset_download_deduplicates_resolved_media_urls(monkeypatch, tmp_path: Path):
+    requested: list[str] = []
+
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
+        requested.append(url)
+        return PNG_BYTES, url, "image/png"
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    soup = BeautifulSoup(
+        '<article><img src="same.png"><img src="same.png"></article>',
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    assert requested == ["https://arxiv.org/html/same.png"]
+    sources = [str(image["src"]) for image in article.find_all("img")]
+    assert len(set(sources)) == 1
+    assert len(result["downloaded"]) == 1
+
+
+def test_asset_download_deduplicates_overlapping_candidate_urls(
+    monkeypatch,
+    tmp_path: Path,
+):
+    requested: list[str] = []
+
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
+        requested.append(url)
+        return PNG_BYTES, url, "image/png"
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    soup = BeautifulSoup(
+        '<article><img src="x.png"><img src="/html/x.png"></article>',
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    assert requested == ["https://arxiv.org/html/x.png"]
+    sources = [str(image["src"]) for image in article.find_all("img")]
+    assert len(set(sources)) == 1
+    assert len(result["downloaded"]) == 1
+
+
+def test_remote_paper_css_is_not_acquired(monkeypatch, tmp_path: Path):
+    requested: list[str] = []
+
+    def fake_request(url: str, timeout: int = 60, *, max_bytes: int):
+        requested.append(url)
+        raise AssertionError("remote paper CSS must not be requested")
+
+    monkeypatch.setattr("papertrans.arxiv_html._request_bytes", fake_request)
+    soup = BeautifulSoup(
+        '<link rel="stylesheet" href="arxiv-html-papers.css"><article></article>',
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    result = _download_assets(
+        soup,
+        article,
+        "https://arxiv.org/html/2405.20947v5",
+        tmp_path / "assets",
+    )
+
+    assert requested == []
+    assert not (tmp_path / "assets" / "arxiv-paper.css").exists()
+    assert result == {"downloaded": [], "failures": []}
 
 
 def test_failed_asset_download_neutralizes_active_media_attributes(monkeypatch, tmp_path: Path):
@@ -153,12 +560,7 @@ def test_failed_asset_download_neutralizes_active_media_attributes(monkeypatch, 
         tmp_path / "assets",
     )
 
-    assert requested == [
-        "https://media.example/missing.png",
-        "https://media.example/missing.pdf",
-        "https://media.example/missing.svg",
-        "https://media.example/missing-xlink.svg",
-    ]
+    assert requested == []
     assert len(result["failures"]) == 5
     assert article.find("img", alt="Missing image") is not None
     assert article.find("img", alt="Missing image").get("src") is None
@@ -174,17 +576,176 @@ def test_failed_asset_download_neutralizes_active_media_attributes(monkeypatch, 
     assert svg_images[2].get("href") == "#local-symbol"
 
 
+def test_article_sanitizer_removes_active_svg_and_obfuscated_urls():
+    soup = BeautifulSoup(
+        """
+        <article>
+          <a id="unsafe" href="java&#10;script:alert(1)">unsafe</a>
+          <a id="safe" href="https://arxiv.org/abs/2405.20947" ping="https://tracker.example/ping">safe</a>
+          <img id="responsive" src="figure.png" srcset="https://tracker.example/a.png 2x" imagesrcset="https://tracker.example/b.png 3x">
+          <embed src="https://arxiv.org/active.html">
+          <style>@import "https://media.example/style.css";</style>
+          <svg id="based-svg" xml:base="https://media.example/">
+            <foreignObject><iframe srcdoc="bad"></iframe></foreignObject>
+            <use id="external-use" href="https://media.example/symbol.svg#x"></use>
+            <use id="local-use" href="#symbol"></use>
+            <textPath id="external-text-path" href="//tracker.example/text">text</textPath>
+            <path id="external-fill" fill="url(https://media.example/pattern.svg)"></path>
+            <path id="local-fill" fill="url(#pattern)"></path>
+            <animate attributeName="href" to="javascript:alert(1)"></animate>
+          </svg>
+          <div id="external-style" style="background:url(//media.example/pixel.png)"></div>
+          <div id="same-origin-style" style="background:image-set('/api/private' 1x)"></div>
+          <div id="safe-style" style="width:100%;color:red"></div>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    _sanitize_tree(article)
+
+    assert article.find(id="unsafe").get("href") is None
+    assert article.find(id="safe").get("href") == "https://arxiv.org/abs/2405.20947"
+    assert article.find(id="safe").get("ping") is None
+    assert article.find(id="responsive").get("srcset") is None
+    assert article.find(id="responsive").get("imagesrcset") is None
+    assert article.find("embed") is None
+    assert article.find("style") is None
+    assert article.find("foreignobject") is None
+    assert article.find("animate") is None
+    assert article.find(id="based-svg").get("xml:base") is None
+    assert article.find(id="external-use").get("href") is None
+    assert article.find(id="local-use").get("href") == "#symbol"
+    assert article.find(id="external-text-path").get("href") is None
+    assert article.find(id="external-fill").get("fill") is None
+    assert article.find(id="local-fill").get("fill") == "url(#pattern)"
+    assert article.find(id="external-style").get("style") is None
+    assert article.find(id="same-origin-style").get("style") is None
+    assert article.find(id="safe-style").get("style") == "width:100%;color:red"
+
+
+def test_article_sanitizer_preserves_visible_foreign_object_content():
+    soup = BeautifulSoup(
+        """
+        <article><svg><foreignObject class="layout">
+          <div><code>print(&quot;kept&quot;)</code><script>alert(1)</script></div>
+        </foreignObject></svg></article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    _sanitize_tree(article)
+
+    preserved = article.find("div", class_="papertrans-foreign-object")
+    assert preserved is not None
+    assert 'print("kept")' in preserved.get_text()
+    assert preserved.find("script") is None
+
+
+def test_render_boundary_keeps_only_manifest_addressable_media():
+    soup = BeautifulSoup(
+        """
+        <article>
+          <img id="local" src="assets/figure.png">
+          <img id="remote" src="https://media.example/figure.png">
+          <img id="relative" src="figure.png">
+          <object id="traversal" data="assets/../secret.html"></object>
+          <svg><image id="svg-local" href="assets/vector.png"></image></svg>
+        </article>
+        """,
+        "html.parser",
+    )
+    article = soup.article
+    assert article is not None
+
+    _sanitize_tree(article, local_resources_only=True)
+
+    assert article.find(id="local").get("src") == "assets/figure.png"
+    assert article.find(id="svg-local").get("href") == "assets/vector.png"
+    assert article.find(id="remote").get("src") is None
+    assert article.find(id="relative").get("src") is None
+    assert article.find(id="traversal").get("data") is None
+
+
+def test_publish_local_assets_copies_only_referenced_manifested_png(tmp_path: Path):
+    work = tmp_path / "work"
+    source_assets = work / "assets"
+    source_assets.mkdir(parents=True)
+    safe_path = source_assets / "safe.png"
+    safe_path.write_bytes(PNG_BYTES)
+    (source_assets / "legacy.html").write_text("<script>alert(1)</script>")
+    _write_asset_manifest(
+        source_assets,
+        [
+            {
+                "path": "assets/safe.png",
+                "bytes": len(PNG_BYTES),
+                "sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
+                "contentType": "image/png",
+            }
+        ],
+    )
+    soup = BeautifulSoup(
+        '<article><img src="assets/safe.png"></article>',
+        "html.parser",
+    )
+    assert soup.article is not None
+    output = tmp_path / "output"
+    output.mkdir()
+
+    published = _publish_local_assets(soup.article, work, output)
+
+    assert published == ["assets/safe.png"]
+    assert (output / "assets" / "safe.png").read_bytes() == PNG_BYTES
+    assert not (output / "assets" / "legacy.html").exists()
+    assert not (output / "assets" / ARXIV_ASSET_MANIFEST_FILENAME).exists()
+
+
+def test_publish_local_assets_rejects_legacy_assets_without_manifest(tmp_path: Path):
+    work = tmp_path / "work"
+    (work / "assets").mkdir(parents=True)
+    (work / "assets" / "legacy.png").write_bytes(PNG_BYTES)
+    soup = BeautifulSoup(
+        '<article><img src="assets/legacy.png"></article>',
+        "html.parser",
+    )
+    assert soup.article is not None
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(RuntimeError, match="reacquire"):
+        _publish_local_assets(soup.article, work, output)
+
+
+def test_rendered_html_qa_includes_svg_image_assets():
+    source = BeautifulSoup(
+        '<article class="ltx_document"><svg><image href="assets/a.png">'
+        '<image xlink:href="assets/b.png"><image href="#symbol"></svg></article>',
+        "html.parser",
+    )
+    output = BeautifulSoup(f"<html><body>{source.article}</body></html>", "html.parser")
+    assert source.article is not None
+
+    qa = _validate_rendered_html(source.article, output)
+
+    assert qa["localAssets"] == ["assets/a.png", "assets/b.png"]
+
+
 def test_local_image_decode_qa_rejects_corrupt_images(tmp_path: Path):
     assets = tmp_path / "assets"
     assets.mkdir()
     (assets / "broken.png").write_bytes(b"not an image")
     result = _decode_local_images(tmp_path, ["assets/broken.png"])
-    assert result["engine"] == "PyMuPDF"
+    assert result["engine"] == "bounded PNG header"
     assert result["checked"] == 0
     assert result["failures"][0]["asset"] == "assets/broken.png"
 
 
-def test_local_image_decode_qa_accepts_renderable_svg(tmp_path: Path):
+def test_local_image_decode_qa_rejects_non_normalized_svg(tmp_path: Path):
     assets = tmp_path / "assets"
     assets.mkdir()
     (assets / "figure.svg").write_text(
@@ -193,7 +754,23 @@ def test_local_image_decode_qa_accepts_renderable_svg(tmp_path: Path):
         encoding="utf-8",
     )
     result = _decode_local_images(tmp_path, ["assets/figure.svg"])
-    assert result == {"engine": "PyMuPDF", "checked": 1, "failures": []}
+    assert result["engine"] == "bounded PNG header"
+    assert result["checked"] == 0
+    assert result["failures"][0]["asset"] == "assets/figure.svg"
+
+
+def test_local_image_decode_qa_accepts_bounded_png(tmp_path: Path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "figure.png").write_bytes(PNG_BYTES)
+
+    result = _decode_local_images(tmp_path, ["assets/figure.png"])
+
+    assert result == {
+        "engine": "bounded PNG header",
+        "checked": 1,
+        "failures": [],
+    }
 
 
 def test_tokenizer_protects_math_citations_and_cross_references():
@@ -1064,6 +1641,12 @@ def test_renderer_preserves_visible_math_figures_and_links(tmp_path: Path):
     artifact_meta = rendered.find("meta", attrs={"name": "papertrans-artifact-version"})
     assert artifact_meta is not None
     assert artifact_meta.get("content") == arxiv_html_artifact_version()
+    csp_meta = rendered.find(
+        "meta",
+        attrs={"http-equiv": "Content-Security-Policy"},
+    )
+    assert csp_meta is not None
+    assert "script-src 'none'" in str(csp_meta.get("content"))
     assert rendered.find("link", href="assets/arxiv-paper.css") is None
     qa_document = json.loads((output / "qa.json").read_text())
     assert qa_document["status"] == "passed"

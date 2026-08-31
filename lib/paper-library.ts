@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { isArtifactManifestPublishable } from "@/lib/artifact-security";
 import { getPaperTransRuntimeConfig } from "@/lib/runtime-config";
 
 export type PaperStatus =
@@ -75,6 +76,7 @@ type Manifest = {
     indexPath?: string;
     bundlePath?: string;
     artifactRoute?: string;
+    rendererVersion?: string;
   };
   createdAt?: string;
   updatedAt?: string;
@@ -345,12 +347,12 @@ function manifestSourceType(manifest: ValidManifest): string {
 }
 
 function manifestArtifactsPublished(manifest: ValidManifest): boolean {
-  if (!["completed", "needs_review"].includes(manifest.status ?? "")) return false;
-  return !(
-    manifestSourceType(manifest) === "pdf"
-    && manifest.provider === "none"
-    && manifest.status === "needs_review"
-  );
+  return isArtifactManifestPublishable({
+    status: manifest.status,
+    sourceType: manifestSourceType(manifest),
+    provider: manifest.provider,
+    rendererVersion: manifest.artifacts?.rendererVersion,
+  });
 }
 
 export async function isPaperArtifactPublished(slug: string): Promise<boolean> {

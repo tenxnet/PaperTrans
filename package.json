@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "test:artifact-security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/artifact-security.test.mjs",
     "test:pdf-import-admission": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/pdf-import-admission.test.mjs"
   },
   "dependencies": {

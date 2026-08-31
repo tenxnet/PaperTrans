@@ -29,4 +29,3 @@ def test_adapter_reexports_shared_docling_resource_envelope() -> None:
         adapter.DOCLING_MAX_WORKER_TIMEOUT_SECONDS
         == contract.DOCLING_MAX_WORKER_TIMEOUT_SECONDS
     )
-

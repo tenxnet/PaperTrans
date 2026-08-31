@@ -94,8 +94,7 @@ def load_psutil_module() -> Any:
         return importlib.import_module("psutil")
     except (ImportError, ModuleNotFoundError) as error:
         raise DoclingUnavailableError(
-            "Docling process supervision requires psutil; reinstall the "
-            "PaperTrans `docling` extra."
+            "PaperTrans process supervision requires psutil; reinstall PaperTrans."
         ) from error
 
 
@@ -147,6 +146,7 @@ def run_supervised_command(
     memory_poll_seconds: float,
     psutil_module: Any,
     terminate_tree: Callable[..., None],
+    worker_label: str = "Docling",
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
     """Run one worker attempt with wall-clock and aggregate-RSS supervision."""
@@ -182,7 +182,7 @@ def run_supervised_command(
                         continue
                 if resident_bytes > max_memory_bytes:
                     memory_failure.append(
-                        "Docling worker resident memory exceeds the job limit "
+                        f"{worker_label} worker resident memory exceeds the job limit "
                         f"({resident_bytes} > {max_memory_bytes})"
                     )
                     for candidate in reversed(candidates):
@@ -194,15 +194,24 @@ def run_supervised_command(
             except psutil.NoSuchProcess:
                 return
             except (psutil.AccessDenied, PermissionError):
+                # A short-lived child can exit between Process(pid) and the
+                # platform-specific RSS query. Reap it before treating access
+                # denial as a supervision failure; a still-running worker must
+                # continue to fail closed.
+                if process.poll() is not None:
+                    return
+                monitor_stop.wait(memory_poll_seconds)
+                if process.poll() is not None:
+                    return
                 memory_failure.append(
-                    "PaperTrans could not inspect Docling worker memory"
+                    f"PaperTrans could not inspect {worker_label} worker memory"
                 )
                 with suppress(OSError):
                     process.kill()
                 return
             except Exception as error:
                 memory_failure.append(
-                    "PaperTrans Docling memory supervision failed "
+                    f"PaperTrans {worker_label} memory supervision failed "
                     f"({type(error).__name__})"
                 )
                 with suppress(OSError):
@@ -236,4 +245,3 @@ def run_supervised_command(
     if check and returncode:
         raise subprocess.CalledProcessError(returncode, command)
     return subprocess.CompletedProcess(command, returncode)
-

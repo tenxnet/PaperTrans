@@ -157,7 +157,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const searchRef = useRef<HTMLInputElement>(null);
   const paperFrameRef = useRef<HTMLIFrameElement>(null);
   const tocListRef = useRef<HTMLElement>(null);
-  const tocCleanupRef = useRef<(() => void) | null>(null);
+  const paperFrameCleanupRef = useRef<(() => void) | null>(null);
   const jobRequestIdRef = useRef(0);
   const text = UI_TEXT[locale];
   const requestedArxivId = arxivIdFromInput(arxivDraft);
@@ -231,13 +231,13 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   }, []);
 
   useEffect(() => {
-    tocCleanupRef.current?.();
-    tocCleanupRef.current = null;
+    paperFrameCleanupRef.current?.();
+    paperFrameCleanupRef.current = null;
     setTocEntries([]);
     setActiveTocId(null);
     return () => {
-      tocCleanupRef.current?.();
-      tocCleanupRef.current = null;
+      paperFrameCleanupRef.current?.();
+      paperFrameCleanupRef.current = null;
     };
   }, [selectedSlug]);
 
@@ -536,23 +536,72 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     }
   }
 
-  function resetEmbeddedPaper(iframe: HTMLIFrameElement) {
-    try {
-      iframe.contentWindow?.scrollTo({ top: 0, left: 0 });
-    } catch {
-      // The local artifact is same-origin; fail safely if deployment changes that assumption.
-    }
-  }
-
   function initializeEmbeddedPaper(iframe: HTMLIFrameElement) {
-    resetEmbeddedPaper(iframe);
-    tocCleanupRef.current?.();
-    tocCleanupRef.current = null;
+    paperFrameCleanupRef.current?.();
+    paperFrameCleanupRef.current = null;
 
     try {
       const frameWindow = iframe.contentWindow;
       const frameDocument = iframe.contentDocument;
       if (!frameWindow || !frameDocument) return;
+
+      let disposed = false;
+      let scrollResetFrame = 0;
+      let tocAnimationFrame = 0;
+      let updateActiveSection: (() => void) | null = null;
+
+      const cancelFrame = (animationFrame: number) => {
+        if (!animationFrame) return;
+        try {
+          frameWindow.cancelAnimationFrame(animationFrame);
+        } catch {
+          // A navigation can revoke same-origin access before React runs cleanup.
+        }
+      };
+
+      const resetScrollPosition = () => {
+        if (disposed) return;
+        try {
+          frameWindow.history.scrollRestoration = "manual";
+        } catch {
+          // Some embedded contexts can deny history access even when the document is readable.
+        }
+        try {
+          frameWindow.cancelAnimationFrame(scrollResetFrame);
+          frameWindow.scrollTo({ top: 0, left: 0 });
+          scrollResetFrame = frameWindow.requestAnimationFrame(() => {
+            scrollResetFrame = 0;
+            if (disposed) return;
+            try {
+              frameWindow.scrollTo({ top: 0, left: 0 });
+            } catch {
+              // Ignore a navigation between scheduling and running the reset.
+            }
+          });
+        } catch {
+          // The artifact is expected to be same-origin; fail safely if deployment changes that.
+        }
+      };
+
+      const handlePageShow = () => resetScrollPosition();
+      frameWindow.addEventListener("pageshow", handlePageShow);
+      window.addEventListener("pageshow", handlePageShow);
+      paperFrameCleanupRef.current = () => {
+        disposed = true;
+        cancelFrame(scrollResetFrame);
+        cancelFrame(tocAnimationFrame);
+        window.removeEventListener("pageshow", handlePageShow);
+        try {
+          frameWindow.removeEventListener("pageshow", handlePageShow);
+          if (updateActiveSection) {
+            frameWindow.removeEventListener("scroll", updateActiveSection);
+            frameWindow.removeEventListener("resize", updateActiveSection);
+          }
+        } catch {
+          // The frame may have navigated before cleanup; disposed callbacks remain inert.
+        }
+      };
+      resetScrollPosition();
 
       const headings = Array.from(frameDocument.querySelectorAll<HTMLElement>(
         "article h2, article h3, .paper-section > .section-heading",
@@ -573,10 +622,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       setActiveTocId(entries[0]?.id ?? null);
       if (!entries.length) return;
 
-      let animationFrame = 0;
-      const updateActiveSection = () => {
-        frameWindow.cancelAnimationFrame(animationFrame);
-        animationFrame = frameWindow.requestAnimationFrame(() => {
+      updateActiveSection = () => {
+        frameWindow.cancelAnimationFrame(tocAnimationFrame);
+        tocAnimationFrame = frameWindow.requestAnimationFrame(() => {
           let currentId = entries[0].id;
           for (const entry of entries) {
             const heading = frameDocument.getElementById(entry.id);
@@ -590,12 +638,9 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       frameWindow.addEventListener("scroll", updateActiveSection, { passive: true });
       frameWindow.addEventListener("resize", updateActiveSection);
       updateActiveSection();
-      tocCleanupRef.current = () => {
-        frameWindow.cancelAnimationFrame(animationFrame);
-        frameWindow.removeEventListener("scroll", updateActiveSection);
-        frameWindow.removeEventListener("resize", updateActiveSection);
-      };
     } catch {
+      paperFrameCleanupRef.current?.();
+      paperFrameCleanupRef.current = null;
       setTocEntries([]);
       setActiveTocId(null);
     }

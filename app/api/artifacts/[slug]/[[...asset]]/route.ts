@@ -25,6 +25,22 @@ const TYPES: Record<string, string> = {
   ".ttf": "font/ttf",
   ".otf": "font/otf",
 };
+const ARTIFACT_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "base-uri 'none'",
+  "connect-src 'none'",
+  "font-src 'self'",
+  "form-action 'none'",
+  "frame-ancestors 'self'",
+  "frame-src 'none'",
+  "img-src 'self' data:",
+  "manifest-src 'none'",
+  "media-src 'self'",
+  "object-src 'none'",
+  "script-src 'none'",
+  "style-src 'self' 'unsafe-inline'",
+  "worker-src 'none'",
+].join("; ");
 
 export async function GET(
   request: Request,
@@ -65,19 +81,20 @@ export async function GET(
     const embedCss = isEmbeddedHtml
       ? "<style data-papertrans-embed>.ptx-topbar,.ptx-toc,body>.topbar,body>.shell>aside{display:none!important}html,body{display:block!important;width:100%!important;min-width:0!important;max-width:none!important;margin:0!important}html{scroll-padding-top:20px!important}.ptx-shell,body>.shell{box-sizing:border-box!important;display:block!important;grid-column:auto!important;grid-template-columns:none!important;width:100%!important;min-width:0!important;max-width:none!important;margin:0!important;padding:20px!important}.ptx-main,body>.shell>main{box-sizing:border-box!important;display:block!important;width:100%!important;min-width:0!important;max-width:none!important;margin:0!important}</style>"
       : "";
-    const embedScrollReset = isEmbeddedHtml
-      ? "<script data-papertrans-scroll-reset>(()=>{try{history.scrollRestoration='manual';const reset=()=>{scrollTo(0,0);requestAnimationFrame(()=>scrollTo(0,0))};reset();addEventListener('load',reset,{once:true});addEventListener('pageshow',reset,{once:true})}catch{}})()</script>"
-      : "";
     const responseBody = isHtml
       ? html.replace(
         "</head>",
-        `${compatibilityCss}${embedCss}${embedScrollReset}</head>`,
+        `${compatibilityCss}${embedCss}</head>`,
       )
       : body;
     return new NextResponse(responseBody, {
       headers: {
         "content-type": TYPES[path.extname(requested).toLowerCase()] ?? "application/octet-stream",
         "cache-control": "no-store",
+        "content-security-policy": ARTIFACT_CONTENT_SECURITY_POLICY,
+        "permissions-policy": "camera=(), geolocation=(), microphone=()",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
       },
     });
   } catch {

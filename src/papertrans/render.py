@@ -15,7 +15,7 @@ from .models import DocumentIR
 
 ARXIV_HTML_TEMPLATE = "arxiv-paper.html.j2"
 # Bump this when renderer behavior outside the template changes the offline artifact.
-ARXIV_HTML_RENDERER_VERSION = "2"
+ARXIV_HTML_RENDERER_VERSION = "3"
 
 
 def arxiv_html_artifact_version() -> str:

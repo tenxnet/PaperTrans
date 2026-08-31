@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from papertrans import __release__, __version__
+from papertrans.render import ARXIV_HTML_RENDERER_VERSION
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -51,3 +52,16 @@ def test_release_tag_matches_public_metadata_when_provided() -> None:
     if release_tag is None:
         return
     assert release_tag == f"v{__release__}"
+
+
+def test_arxiv_renderer_security_generation_matches_web_gate() -> None:
+    web_security = (
+        REPOSITORY_ROOT / "lib/artifact-security.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r'^export const SAFE_ARXIV_RENDERER_GENERATION = "([0-9]+)";$',
+        web_security,
+        re.MULTILINE,
+    )
+    assert match is not None
+    assert match.group(1) == ARXIV_HTML_RENDERER_VERSION
