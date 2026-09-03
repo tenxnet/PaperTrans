@@ -1,18 +1,18 @@
 # Contributing to PaperTrans
 
-Thank you for helping improve PaperTrans. The project is currently a v0.2.0-rc.1 release candidate. Official arXiv HTML is the stable input path; Docling PDF import is experimental.
+Thank you for helping improve PaperTrans. The project is currently developing the unpublished v0.2.0-rc.2 release candidate. Official arXiv HTML is the stable input path; Docling PDF import is experimental.
 
 ## Before opening an issue
 
 - Search existing issues first.
 - Remove paper text, unpublished material, credentials, private paths, and personal data from logs and screenshots.
 - Do not upload source PDFs or generated translations unless you have the right to redistribute them.
-- Do not publish actionable vulnerability details until the repository has a configured private reporting channel. The release checklist tracks this requirement.
+- Report vulnerabilities through the private channel described in `SECURITY.md`; do not publish actionable vulnerability details in an issue or pull request.
 
 ## Development setup
 
 ```bash
-uv sync --extra test
+uv sync --extra test --group docling
 pnpm install --frozen-lockfile
 ```
 
@@ -34,9 +34,10 @@ To exercise the complete release-candidate runtime, including the Docling models
 Run the relevant checks before opening a pull request:
 
 ```bash
-uv run --frozen --extra test pytest -q
+uv lock --check
+uv run --frozen --extra test --group docling pytest -q
 pnpm typecheck
-pnpm test:pdf-import-admission
+pnpm test
 pnpm build
 ```
 

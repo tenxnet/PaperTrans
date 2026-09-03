@@ -382,6 +382,8 @@ class LocalSupervisor:
             str(self.options.mcp_port),
             "--repo-root",
             str(self.paths.repo_root),
+            "--data-root",
+            str(self.paths.data_root),
             "--output-root",
             str(self.paths.output_root),
         )

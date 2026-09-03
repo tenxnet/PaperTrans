@@ -297,14 +297,14 @@ def convert_pdf_with_docling(source: Path) -> dict[str, Any]:
     except (ImportError, ModuleNotFoundError) as error:
         raise DoclingUnavailableError(
             "Docling is not installed; install the optional dependency with "
-            "`uv sync --extra docling`."
+            "`uv sync --group docling`."
         ) from error
     try:
         importlib.import_module("onnxruntime")
     except (ImportError, ModuleNotFoundError) as error:
         raise DoclingUnavailableError(
             "Docling's ONNX layout backend is unavailable; install the "
-            "PaperTrans `docling` extra with `uv sync --extra docling`."
+            "PaperTrans source-checkout `docling` group with `uv sync --group docling`."
         ) from error
     converter_class = getattr(converter_module, "DocumentConverter", None)
     pdf_format_option_class = getattr(converter_module, "PdfFormatOption", None)

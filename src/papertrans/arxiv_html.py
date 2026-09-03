@@ -59,7 +59,17 @@ ARXIV_ASSET_MANIFEST_FILENAME = ".papertrans-assets-v2.json"
 ARXIV_ASSET_MANIFEST_SCHEMA = "papertrans.localized-assets"
 ARXIV_ASSET_MANIFEST_VERSION = 2
 ARXIV_ID_RE = re.compile(
-    r"(?P<id>(?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7}))(?P<version>v\d+)?",
+    r"(?P<id>(?:[0-9]{2}(?:0[1-9]|1[0-2])\.[0-9]{4,5}|[a-z][a-z0-9.-]{0,31}/[0-9]{7}))"
+    r"(?P<version>v[1-9][0-9]{0,4})?",
+    re.IGNORECASE,
+)
+ARXIV_ID_INPUT_RE = re.compile(
+    rf"(?:arxiv:\s*)?(?P<identifier>{ARXIV_ID_RE.pattern})",
+    re.IGNORECASE,
+)
+ARXIV_ID_TEXT_RE = re.compile(
+    rf"(?<![A-Za-z0-9./-])(?:arxiv:\s*)?"
+    rf"(?P<identifier>{ARXIV_ID_RE.pattern})(?![A-Za-z0-9./-])",
     re.IGNORECASE,
 )
 PLACEHOLDER_RE = re.compile(r"\[\[PTX_\d{4}\]\]")
@@ -254,7 +264,32 @@ class _ArxivRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def normalize_arxiv_id(value: str) -> str:
-    match = ARXIV_ID_RE.search(value.strip())
+    raw_value = value.strip()
+    parsed = urllib.parse.urlsplit(raw_value)
+    if "://" in raw_value or parsed.netloc:
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError(f"invalid arXiv identifier: {value}") from error
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname is None
+            or parsed.hostname.lower() != "arxiv.org"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+        ):
+            raise ValueError(f"invalid arXiv identifier: {value}")
+        path_match = re.fullmatch(
+            r"/(?:abs|html|pdf)/(?P<identifier>.+?)(?:\.pdf)?/?",
+            parsed.path,
+            flags=re.IGNORECASE,
+        )
+        if path_match is None:
+            raise ValueError(f"invalid arXiv identifier: {value}")
+        raw_value = path_match.group("identifier")
+
+    match = ARXIV_ID_INPUT_RE.fullmatch(raw_value)
     if not match:
         raise ValueError(f"invalid arXiv identifier: {value}")
     identifier = match.group("id")
@@ -1326,13 +1361,24 @@ def _decode_local_images(output_dir: Path, assets: list[str]) -> dict[str, Any]:
     }
 
 
-def _find_resolved_id(soup: BeautifulSoup, requested: str) -> str:
+def _find_resolved_id(soup: BeautifulSoup) -> str | None:
     watermark = soup.find(id="watermark-tr")
     if watermark:
-        match = ARXIV_ID_RE.search(watermark.get_text(" ", strip=True))
+        match = ARXIV_ID_TEXT_RE.search(watermark.get_text(" ", strip=True))
         if match:
-            return normalize_arxiv_id(match.group(0))
-    return requested
+            return normalize_arxiv_id(match.group("identifier"))
+    return None
+
+
+def _arxiv_identity_matches(requested: str, resolved: str) -> bool:
+    requested_match = ARXIV_ID_RE.fullmatch(requested)
+    resolved_match = ARXIV_ID_RE.fullmatch(resolved)
+    if requested_match is None or resolved_match is None:
+        return False
+    if requested_match.group("id").lower() != resolved_match.group("id").lower():
+        return False
+    requested_version = requested_match.group("version")
+    return requested_version is None or requested.lower() == resolved.lower()
 
 
 def _internal_link_metrics(article: Tag) -> tuple[int, list[str]]:
@@ -1472,7 +1518,8 @@ def acquire_official_arxiv_html(
         raise ValueError("official arXiv response does not contain a LaTeXML article")
     hierarchy_repair = _repair_section_hierarchy(article)
     _sanitize_tree(article)
-    resolved = _find_resolved_id(soup, requested)
+    detected_resolved = _find_resolved_id(soup)
+    resolved = detected_resolved or requested
     title = article.find("h1", class_="ltx_title_document")
     citation_metadata = _citation_metadata(soup)
     section_count = len(article.find_all("section"))
@@ -1501,8 +1548,14 @@ def acquire_official_arxiv_html(
     elif assets["failures"] or missing_link_count or conversion_errors:
         validation = "degraded"
 
-    requested_has_version = bool(re.search(r"v\d+$", requested, re.IGNORECASE))
-    identity_match = "exact" if (not requested_has_version or requested == resolved) else "mismatch"
+    requested_has_version = ARXIV_ID_RE.fullmatch(requested).group("version") is not None
+    identity_match = (
+        "unknown"
+        if detected_resolved is None
+        else "exact"
+        if _arxiv_identity_matches(requested, resolved)
+        else "mismatch"
+    )
     manifest = {
         "schemaVersion": "1.0",
         "paper": {

@@ -19,8 +19,11 @@
 
 `--data-root`、`--output-root`、`--model-root`を指定した場合は、その指定先が
 正本です。同じデータで起動するときは毎回同じ指定を使用してください。
+同じデータルートを複数のPaperTransプロセス、コンテナ、ホストから共有しないで
+ください。ライブラリ更新のロックは単一ホスト上のローカルファイルシステムを
+前提とし、共有ボリュームやネットワークファイルシステムには対応していません。
 
-v0.2.0-rc.1は論文や成果物を自動削除しません。保持期間とバックアップ先は
+PaperTransは論文や成果物を自動削除しません。保持期間とバックアップ先は
 利用者が決めます。原本PDF、翻訳、ログ、バックアップには機密情報や著作物が
 含まれる可能性があります。端末の暗号化、アクセス権、バックアップ先、廃棄
 方法をその内容に合わせて選んでください。
@@ -58,6 +61,15 @@ v0.2.0-rc.1は論文や成果物を自動削除しません。保持期間とバ
 ディレクトリ、`running`、`starting`、`unknown`のいずれかなら移動せず、ログを
 秘匿化してissueへ報告してください。カスタム成果物ルートではその直下が対象です。
 
+#### ライブラリ更新がbusyのままになる場合
+
+ライブラリ更新は通常数秒以内に完了します。更新が繰り返しbusyになる場合は、
+まずPaperTrans全体を停止してから再起動してください。強制終了された内部スレッドが
+残した`data/.library.lock`も、プロセスの再起動後に安全に回収されます。停止中に
+ロックを手動で変更する必要は通常ありません。再起動後も解消しない場合は、指定した
+データルート、ログ、`./papertrans status`の秘匿化した結果を添えてissueへ報告して
+ください。PaperTransプロセスが生存中の`.library.lock`を移動・削除しないでください。
+
 ### ソース版の更新
 
 作業ツリーへ変更がないこととバックアップを確認してから更新します。
@@ -65,13 +77,18 @@ v0.2.0-rc.1は論文や成果物を自動削除しません。保持期間とバ
 ```bash
 git status --short --branch
 git fetch origin --tags
-git switch --detach v0.2.0-rc.1
+git tag --list 'v*'
+git switch --detach vX.Y.Z
 ./papertrans setup
 ./papertrans doctor
 ```
 
 `git status`に変更がある場合は、その内容を確認せずに切り替えないでください。
-タグを指定すると公開済みの同じソースを再現できます。初回の`setup`にはネット
+`vX.Y.Z`はGitHubの[Releases](https://github.com/tenxnet/PaperTrans/releases)
+または[Tags](https://github.com/tenxnet/PaperTrans/tags)から選んだ公開済みタグに
+置き換えてください。リンク先でタグが指すcommitを確認し、そのcommit/tagのCIが
+成功していることも確認してください。タグを指定すると公開済みの同じソースを
+再現できます。初回の`setup`にはネット
 接続が必要です。準備完了後に、ネットワークを切断した状態で
 `./papertrans start --offline --no-browser`が起動することを確認できます。
 
@@ -126,8 +143,11 @@ The source-checkout release stores data in these locations by default:
 When `--data-root`, `--output-root`, or `--model-root` is used, that selected
 location is authoritative. Reuse the same arguments whenever starting with the
 same data.
+Do not share one data root between PaperTrans processes, containers, or hosts.
+Library-update locking assumes one local host and a local filesystem; shared
+volumes and network filesystems are not supported.
 
-v0.2.0-rc.1 does not automatically expire papers or artifacts. You choose the
+PaperTrans does not automatically expire papers or artifacts. You choose the
 retention period and backup destination. Source PDFs, translations, logs, and
 backups may contain confidential or copyrighted material; use suitable disk
 encryption, permissions, backup access controls, and disposal procedures.
@@ -170,6 +190,16 @@ lock reported as `running`, `starting`, or `unknown`; redact the logs and report
 an issue instead. With a custom artifact root, inspect the lock directly under
 that root.
 
+#### Library updates remain busy
+
+Library updates normally finish within a few seconds. If updates repeatedly
+remain busy, stop the entire PaperTrans process and restart it. Restarting
+safely makes a `data/.library.lock` left by a forcibly terminated internal
+thread reclaimable. You should not normally modify the lock while the process
+is stopped. If a clean restart does not recover, report an issue with redacted
+logs, the selected data root, and `./papertrans status` output. Never move or
+delete `.library.lock` while a PaperTrans process is alive.
+
 ### Update a source checkout
 
 After confirming the backup and a clean worktree:
@@ -177,12 +207,17 @@ After confirming the backup and a clean worktree:
 ```bash
 git status --short --branch
 git fetch origin --tags
-git switch --detach v0.2.0-rc.1
+git tag --list 'v*'
+git switch --detach vX.Y.Z
 ./papertrans setup
 ./papertrans doctor
 ```
 
 Do not switch versions without understanding any changes shown by `git status`.
+Replace `vX.Y.Z` with a published tag selected from GitHub
+[Releases](https://github.com/tenxnet/PaperTrans/releases) or
+[Tags](https://github.com/tenxnet/PaperTrans/tags). Follow its link to verify
+the tag's target commit and confirm that CI passed for that commit/tag.
 Checking out a tag reproduces the published source. The first `setup` requires
 network access. Once it succeeds, you can disconnect the network and verify
 `./papertrans start --offline --no-browser`.

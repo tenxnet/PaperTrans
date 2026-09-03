@@ -19,6 +19,8 @@ import {
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
+import { normalizeArxivId } from "@/lib/arxiv-id";
+import { paperNeedsReview } from "@/lib/paper-review";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { PaperStatus, PaperSummary } from "@/lib/paper-library";
 import {
@@ -32,13 +34,21 @@ import {
 type Filter = "all" | "active" | "review" | "unread" | "favorites";
 type Sort = "updated" | "added" | "published" | "author" | "title" | "tag";
 type TranslationSource = "arxiv" | "pdf";
-type LibraryPatch = { tags?: string[]; isRead?: boolean; favorite?: boolean };
+type LibraryPatch = {
+  tags?: string[];
+  addTags?: string[];
+  removeTags?: string[];
+  isRead?: boolean;
+  favorite?: boolean;
+};
 type TocEntry = { id: string; label: string; level: 2 | 3 };
 type ConnectorHealth = "checking" | "online" | "offline";
 type McpStatusResponse = {
   status: Exclude<ConnectorHealth, "checking">;
   url: string;
 };
+
+class LibraryMetadataClientError extends Error {}
 type CreatedJob = {
   jobId: string;
   status: string;
@@ -60,12 +70,7 @@ type PdfImportResponse = {
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 
 function arxivIdFromInput(value: string) {
-  return (
-    value
-      .trim()
-      .match(/(?:arxiv:\s*)?((?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*\/\d{7})(?:v\d+)?)/i)?.[1]
-      ?.toLowerCase() ?? ""
-  );
+  return normalizeArxivId(value) ?? "";
 }
 
 function isActive(paper: PaperSummary) {
@@ -77,7 +82,7 @@ function canCopyWorkerRequest(paper: PaperSummary) {
 }
 
 function needsReview(paper: PaperSummary) {
-  return paper.status === "needs_review" || paper.status === "failed" || paper.qa.status === "failed";
+  return paperNeedsReview(paper);
 }
 
 function formatDate(value: string, locale: AppLocale) {
@@ -129,7 +134,13 @@ function StatusIcon({ paper }: { paper: PaperSummary }) {
   return <SpinnerGap className="spin" aria-hidden="true" />;
 }
 
-export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] }) {
+export function PaperLibrary({
+  initialPapers,
+  initialLibraryMetadataError = false,
+}: {
+  initialPapers: PaperSummary[];
+  initialLibraryMetadataError?: boolean;
+}) {
   const [locale, setLocale] = useState<AppLocale>(DEFAULT_APP_LOCALE);
   const [papers, setPapers] = useState(initialPapers);
   const [query, setQuery] = useState("");
@@ -140,6 +151,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const [tagDraft, setTagDraft] = useState("");
   const [librarySaving, setLibrarySaving] = useState(false);
   const [notice, setNotice] = useState("");
+  const [libraryMetadataError, setLibraryMetadataError] = useState(initialLibraryMetadataError);
   const [showRequest, setShowRequest] = useState(false);
   const [showMcpStatus, setShowMcpStatus] = useState(false);
   const [requestSource, setRequestSource] = useState<TranslationSource>("arxiv");
@@ -157,12 +169,20 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   const searchRef = useRef<HTMLInputElement>(null);
   const paperFrameRef = useRef<HTMLIFrameElement>(null);
   const tocListRef = useRef<HTMLElement>(null);
+  const requestModalRef = useRef<HTMLElement>(null);
+  const mcpModalRef = useRef<HTMLElement>(null);
+  const modalReturnFocusRef = useRef<HTMLElement | null>(null);
   const paperFrameCleanupRef = useRef<(() => void) | null>(null);
   const jobRequestIdRef = useRef(0);
   const text = UI_TEXT[locale];
   const requestedArxivId = arxivIdFromInput(arxivDraft);
 
   const selected = papers.find((paper) => paper.slug === selectedSlug) ?? null;
+  const isInitialLibraryEmpty = papers.length === 0
+    && !libraryMetadataError
+    && !query.trim()
+    && filter === "all"
+    && tagFilter === null;
   const counts = useMemo(() => ({
     all: papers.length,
     active: papers.filter(isActive).length,
@@ -201,6 +221,31 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
         return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
       });
   }, [papers, query, filter, tagFilter, sort, locale]);
+
+  const selectedQaIssues = useMemo(() => {
+    if (
+      !selected
+      || (
+        selected.status !== "needs_review"
+        && selected.qa.status !== "failed"
+        && !(selected.status === "completed" && selected.qa.status === "missing")
+      )
+    ) {
+      return [];
+    }
+    const issues: string[] = [];
+    if (selected.qa.status === "failed") issues.push(text.qaStatusFailed);
+    if (selected.qa.status === "missing") issues.push(text.qaStatusMissing);
+    if (selected.qa.unresolvedInternalLinks > 0) {
+      issues.push(text.qaUnresolvedInternalLinks(selected.qa.unresolvedInternalLinks));
+    }
+    if (selected.qa.missingLocalAssets > 0) {
+      issues.push(text.qaMissingLocalAssets(selected.qa.missingLocalAssets));
+    }
+    if (!selected.qa.browserChecked) issues.push(text.qaBrowserCheckMissing);
+    if (!issues.length) issues.push(text.qaReviewGeneric);
+    return issues;
+  }, [selected, text]);
 
   useEffect(() => {
     const savedLocale = window.localStorage.getItem(APP_LOCALE_STORAGE_KEY);
@@ -254,22 +299,39 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   }
 
   async function fetchLibraryPapers() {
-    const response = await fetch("/api/library", { cache: "no-store" });
-    if (!response.ok) throw new Error("refresh failed");
-    const body = (await response.json()) as { papers: PaperSummary[] };
-    return body.papers;
+    try {
+      const response = await fetch("/api/library", { cache: "no-store" });
+      const body = (await response.json()) as {
+        papers?: PaperSummary[];
+        code?: string;
+      };
+      if (!response.ok || !body.papers) {
+        if (body.code === "LIBRARY_METADATA_INVALID") {
+          setLibraryMetadataError(true);
+          throw new LibraryMetadataClientError(text.libraryMetadataRecovery);
+        }
+        throw new Error("invalid library response");
+      }
+      return body.papers;
+    } catch (error) {
+      if (error instanceof LibraryMetadataClientError) throw error;
+      throw new Error(text.refreshFailed, { cause: error });
+    }
   }
 
   async function refresh(silent = false) {
     try {
       const nextPapers = await fetchLibraryPapers();
       setPapers(nextPapers);
+      setLibraryMetadataError(false);
       setTrackedJobIds((current) => current.filter(
         (jobId) => !nextPapers.some((paper) => paper.slug === jobId),
       ));
       if (!silent) setNotice(text.refreshSuccess);
-    } catch {
-      if (!silent) setNotice(text.refreshFailed);
+    } catch (error) {
+      if (!silent) {
+        setNotice(error instanceof Error ? error.message : text.refreshFailed);
+      }
     }
   }
 
@@ -280,8 +342,76 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
   }, [papers, trackedJobIds]);
 
   useEffect(() => {
+    const activeModal = showRequest
+      ? requestModalRef.current
+      : showMcpStatus
+        ? mcpModalRef.current
+        : null;
+    if (!activeModal) {
+      if (!showRequest && !showMcpStatus) {
+        const returnFocus = modalReturnFocusRef.current;
+        if (returnFocus) {
+          if (returnFocus.isConnected) returnFocus.focus();
+          else searchRef.current?.focus();
+          modalReturnFocusRef.current = null;
+        }
+      }
+      return;
+    }
+
+    if (
+      !modalReturnFocusRef.current
+      && document.activeElement instanceof HTMLElement
+      && !activeModal.contains(document.activeElement)
+    ) {
+      modalReturnFocusRef.current = document.activeElement;
+    }
+    const focusableSelector = [
+      "button:not([disabled])",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "a[href]",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+    const focusableElements = () => Array.from(
+      activeModal.querySelectorAll<HTMLElement>(focusableSelector),
+    ).filter((element) => element.getClientRects().length > 0);
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (!activeModal.contains(document.activeElement)) focusableElements()[0]?.focus();
+    });
+    function trapFocus(event: KeyboardEvent) {
+      if (event.key !== "Tab") return;
+      const elements = focusableElements();
+      if (!elements.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", trapFocus);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", trapFocus);
+    };
+  }, [showRequest, showMcpStatus]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      if (
+        !showRequest
+        && !showMcpStatus
+        && (event.metaKey || event.ctrlKey)
+        && event.key.toLowerCase() === "k"
+      ) {
         event.preventDefault();
         searchRef.current?.focus();
       }
@@ -331,10 +461,6 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     }
   }
 
-  function persistTags(slug: string, nextTags: string[]) {
-    return persistLibraryState(slug, { tags: nextTags }, text.tagSaved);
-  }
-
   function addTag(event: FormEvent) {
     event.preventDefault();
     if (!selected) return;
@@ -344,7 +470,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
       return;
     }
     setTagDraft("");
-    void persistTags(selected.slug, [...selected.tags, next]);
+    void persistLibraryState(selected.slug, { addTags: [next] }, text.tagSaved);
   }
 
   async function createTranslationJob() {
@@ -496,7 +622,18 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     if (createdJob) await copyWorkerRequestForJob(createdJob.jobId);
   }
 
+  function rememberModalTrigger() {
+    if (
+      !showRequest
+      && !showMcpStatus
+      && document.activeElement instanceof HTMLElement
+    ) {
+      modalReturnFocusRef.current = document.activeElement;
+    }
+  }
+
   function openTranslationRequest() {
+    rememberModalTrigger();
     jobRequestIdRef.current += 1;
     setRequestSource("arxiv");
     setArxivDraft("");
@@ -507,6 +644,11 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
     setJobError("");
     setShowMcpStatus(false);
     setShowRequest(true);
+  }
+
+  function openMcpStatus() {
+    rememberModalTrigger();
+    setShowMcpStatus(true);
   }
 
   function closeTranslationRequest() {
@@ -720,7 +862,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
               <small>{text.connectorStatus[connectorHealth]}</small>
             </span>
           </div>
-          <button type="button" onClick={() => setShowMcpStatus(true)}>
+          <button type="button" onClick={openMcpStatus}>
             <Gear aria-hidden="true" />{text.mcpConnection}
           </button>
         </section>
@@ -761,6 +903,19 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             </button>
           </div>
         </header>
+
+        {libraryMetadataError && papers.length > 0 && (
+          <section className="metadata-warning-banner" role="alert">
+            <WarningCircle weight="fill" aria-hidden="true" />
+            <span>
+              <strong>{text.libraryMetadataProblem}</strong>
+              <small>{text.libraryMetadataRecovery}</small>
+            </span>
+            <button className="secondary-button" type="button" onClick={() => void refresh()}>
+              <ClockCounterClockwise aria-hidden="true" />{text.refresh}
+            </button>
+          </section>
+        )}
 
         {selected ? (
           <section className="reader-layout">
@@ -834,11 +989,13 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 />
               ) : (
                 <div className="reader-empty">
-                  {selected.status === "failed"
+                  {needsReview(selected)
                     ? <WarningCircle weight="fill" aria-hidden="true" />
                     : <SpinnerGap className="spin" aria-hidden="true" />}
                   <p>{selected.status === "failed"
                     ? selected.errorMessage || text.preparationFailed
+                    : needsReview(selected)
+                      ? selectedQaIssues[0] ?? text.qaReviewGeneric
                     : selected.status === "prepared"
                       ? text.waitingForMcp
                       : text.waitingForHtml}</p>
@@ -847,6 +1004,17 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             </div>
 
             <aside className="inspector">
+              {selectedQaIssues.length > 0 && (
+                <section className="qa-panel" aria-labelledby="qa-review-title">
+                  <p id="qa-review-title" className="inspector-label">
+                    <WarningCircle weight="fill" aria-hidden="true" />
+                    {text.qaReviewTitle}
+                  </p>
+                  <ul>
+                    {selectedQaIssues.map((issue) => <li key={issue}>{issue}</li>)}
+                  </ul>
+                </section>
+              )}
               <section className="inspector-toc">
                 <p className="inspector-label"><ListBullets aria-hidden="true" />{text.tableOfContents}</p>
                 {tocEntries.length ? (
@@ -871,7 +1039,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 <p className="inspector-label">{text.tags}</p>
                 <div className="paper-tags">
                   {selected.tags.map((tag) => (
-                    <button key={tag} className="tag-chip removable" disabled={librarySaving} onClick={() => void persistTags(selected.slug, selected.tags.filter((item) => item !== tag))}>
+                    <button key={tag} className="tag-chip removable" disabled={librarySaving} onClick={() => void persistLibraryState(selected.slug, { removeTags: [tag] }, text.tagSaved)}>
                       {tag}<X aria-hidden="true" />
                     </button>
                   ))}
@@ -907,7 +1075,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                 <p>{text.visibleCount(visiblePapers.length)}</p>
               </div>
               <label className="sort-control"><FunnelSimple aria-hidden="true" /><span>{text.sort}</span>
-                <select value={sort} onChange={(event) => setSort(event.target.value as Sort)}>
+                <select value={sort} onChange={(event) => setSort(event.target.value as Sort)} aria-label={text.sort}>
                   <option value="updated">{text.sortUpdated}</option>
                   <option value="added">{text.sortAdded}</option>
                   <option value="published">{text.sortPublished}</option>
@@ -926,7 +1094,12 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
                     <span className="paper-copy">
                       <span className="paper-kicker">
                         <span>{sourceLabel(paper)}</span>
-                        <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}><StatusIcon paper={paper} />{text.status[paper.status]}</span>
+                        <span className={`status-inline ${needsReview(paper) ? "review" : paper.status}`}>
+                          <StatusIcon paper={paper} />
+                          {paper.status === "completed" && paper.qa.status !== "passed"
+                            ? text.status.needs_review
+                            : text.status[paper.status]}
+                        </span>
                       </span>
                       <strong>{paper.title}</strong>
                       <span className="paper-authors">{authorLabel(paper, locale)}</span>
@@ -975,10 +1148,32 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
               ))}
               {!visiblePapers.length && (
                 <div className="empty-state">
-                  <MagnifyingGlass aria-hidden="true" />
-                  <h2>{text.noMatches}</h2>
-                  <p>{text.noMatchesHint}</p>
-                  <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setTagFilter(null); }}>{text.clearConditions}</button>
+                  {libraryMetadataError ? (
+                    <>
+                      <WarningCircle weight="fill" aria-hidden="true" />
+                      <h2>{text.libraryMetadataProblem}</h2>
+                      <p>{text.libraryMetadataRecovery}</p>
+                      <button className="secondary-button" type="button" onClick={() => void refresh()}>
+                        <ClockCounterClockwise aria-hidden="true" />{text.refresh}
+                      </button>
+                    </>
+                  ) : isInitialLibraryEmpty ? (
+                    <>
+                      <BookOpenText aria-hidden="true" />
+                      <h2>{text.emptyLibrary}</h2>
+                      <p>{text.emptyLibraryHint}</p>
+                      <button className="primary-button" type="button" onClick={openTranslationRequest}>
+                        <Plus aria-hidden="true" />{text.newTranslation}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <MagnifyingGlass aria-hidden="true" />
+                      <h2>{text.noMatches}</h2>
+                      <p>{text.noMatchesHint}</p>
+                      <button className="secondary-button" type="button" onClick={() => { setQuery(""); setFilter("all"); setTagFilter(null); }}>{text.clearConditions}</button>
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -988,8 +1183,8 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
 
       {showRequest && (
         <div className="modal-backdrop" role="presentation" onMouseDown={closeTranslationRequest}>
-          <section className="request-modal" role="dialog" aria-modal="true" aria-labelledby="request-title" onMouseDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" type="button" onClick={closeTranslationRequest} title={text.close}><X aria-hidden="true" /></button>
+          <section ref={requestModalRef} className="request-modal" role="dialog" aria-modal="true" aria-labelledby="request-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="modal-close" type="button" onClick={closeTranslationRequest} aria-label={text.close} title={text.close}><X aria-hidden="true" /></button>
             <span className="modal-icon"><Plus aria-hidden="true" /></span>
             <p className="eyebrow">{text.mcpTranslationJob}</p>
             <h2 id="request-title">{text.requestTranslation}</h2>
@@ -1103,7 +1298,7 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
             )}
             {createdJob && requestCopied && <p className="worker-request-copied">{text.workerRequestCopied}</p>}
             <div className="modal-actions">
-              <button className="secondary-button" type="button" onClick={() => { closeTranslationRequest(); setShowMcpStatus(true); }}>
+              <button className="secondary-button" type="button" onClick={() => { closeTranslationRequest(); openMcpStatus(); }}>
                 <Gear aria-hidden="true" />{text.mcpConnection}
               </button>
               <button
@@ -1122,8 +1317,8 @@ export function PaperLibrary({ initialPapers }: { initialPapers: PaperSummary[] 
 
       {showMcpStatus && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowMcpStatus(false)}>
-          <section className="request-modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="mcp-title" onMouseDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" type="button" onClick={() => setShowMcpStatus(false)} title={text.close}><X aria-hidden="true" /></button>
+          <section ref={mcpModalRef} className="request-modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="mcp-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="modal-close" type="button" onClick={() => setShowMcpStatus(false)} aria-label={text.close} title={text.close}><X aria-hidden="true" /></button>
             <span className="modal-icon"><ChatCircleDots weight="duotone" aria-hidden="true" /></span>
             <p className="eyebrow">{text.settings}</p>
             <h2 id="mcp-title">{text.mcpConnection}</h2>

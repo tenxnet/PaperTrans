@@ -6,7 +6,7 @@ PaperTrans is a pre-release local application. Security fixes are applied to the
 
 ## Reporting a vulnerability
 
-After this repository becomes public, report vulnerabilities privately through **Security → Report a vulnerability** on the [PaperTrans GitHub repository](https://github.com/tenxnet/PaperTrans/security/advisories/new). Do not include credentials, private paper text, unpublished material, personal paths, or working exploit details in a public Issue or Pull Request.
+Report vulnerabilities privately through **Security → Report a vulnerability** on the [PaperTrans GitHub repository](https://github.com/tenxnet/PaperTrans/security/advisories/new). Do not include credentials, private paper text, unpublished material, personal paths, or working exploit details in a public Issue or Pull Request.
 
 If private vulnerability reporting is not available, open a public Issue containing only a request for a private contact channel. Do not disclose the vulnerability details there. Maintainers should acknowledge a private report within 7 days and provide an initial assessment or request for more information within 14 days.
 
@@ -26,6 +26,7 @@ This policy covers the Web UI and API, MCP tools, arXiv acquisition and HTML nor
 ## Security invariants
 
 - Default Web and MCP listeners remain bound to loopback and are not exposed directly to the public internet without an external security layer.
+- The Web server accepts only literal loopback Host authorities. Browser mutations require same-origin request metadata and route-specific non-safelisted media types; Forwarded headers do not establish trust.
 - User-controlled identifiers and asset paths cannot escape configured repository, work, or output roots.
 - Remote HTML and generated translations cannot introduce executable script, unsafe embedded content, or unescaped markup into the PaperTrans UI or rendered artifact.
 - Paper content cannot be treated as MCP instructions, and translations must preserve expected block identifiers and protected structural tokens before persistence or finalization.
@@ -44,6 +45,7 @@ Severity depends on reachability and impact in the documented local single-user 
 - arXiv availability, source licensing decisions, and malicious content already present in a source paper are outside PaperTrans's control; unsafe handling of that content by PaperTrans remains in scope.
 - Attacks requiring an adversary who already has equivalent access to the local user account and PaperTrans output directory are normally out of scope unless they gain additional privileges or persistence.
 - The loopback-only v1 server has no application-level authentication, and MCP access is not isolated per job. This is accepted only for the documented local single-user model.
+- Local non-browser Web API clients may omit browser `Origin` and Fetch Metadata headers, but must connect through a literal loopback Host and send the media type required by the mutation route.
 
 ## Known limitations and compensating controls
 

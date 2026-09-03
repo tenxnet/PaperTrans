@@ -8,13 +8,16 @@ PDF stores visual placement rather than a reliable semantic reading order. Multi
 
 ## Install the Docling parser
 
-Docling is an optional dependency. PaperTrans installs the CPU ONNX runtime
-directly rather than Docling's cross-platform runtime extra, which resolves to a
-GPU package on Linux. Layout inference stays on CPU and the Transformers layout
-runtime is not loaded in the web process.
+Docling is an application dependency group for GitHub source checkouts; it is
+deliberately not exposed as a wheel extra. PaperTrans installs the CPU ONNX
+runtime directly rather than Docling's cross-platform runtime extra, which
+resolves to a GPU package on Linux. Layout inference stays on CPU and
+Transformers is loaded only in the isolated Docling worker, not the web process.
+The group pins the security-fixed `transformers 5.10.4` and uses a tested uv
+override for Docling's temporarily narrower macOS package metadata.
 
 ```bash
-uv sync --extra docling --extra test --extra mcp
+uv sync --group docling --extra test --extra mcp
 .venv/bin/docling-tools models download layout tableformer \
   --output-dir data/models/docling
 export PAPERTRANS_DOCLING_ARTIFACTS_PATH="$PWD/data/models/docling"

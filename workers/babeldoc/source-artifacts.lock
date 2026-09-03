@@ -1,0 +1,60 @@
+schema_version = 1
+
+# These immutable upstream archives are the preferred-form source inputs for
+# the AGPL components installed in the BabelDOC evaluation image.  The PyPI
+# sdist hashes are also present in requirements.lock.  runtime_artifact_sha256
+# maps the Linux wheels that the multi-platform image can install back to this
+# source set.
+
+[[artifacts]]
+id = "babeldoc"
+name = "BabelDOC"
+version = "0.6.4"
+kind = "python-sdist"
+filename = "babeldoc-0.6.4.tar.gz"
+url = "https://files.pythonhosted.org/packages/a8/6b/96925501ac8d8b22bcbddd3a8baebe53575e37cd1f82ba634b95000d0bfe/babeldoc-0.6.4.tar.gz"
+sha256 = "dbd2a69ccaf6678c34089f8c422a38a0fa170f5fa88ee1313b4235103421a875"
+bytes = 16415074
+top_level = "babeldoc-0.6.4"
+license_declaration = "AGPL-3.0 (upstream project metadata)"
+license_path = "LICENSE"
+license_sha256 = "afca41723b45e26069f68d485bf906a202f892f90c801d3052f8e6296bb41454"
+runtime_artifact_sha256 = [
+  "e7dcdd5b8213f657af1df68e329f92d0534c9b94c53fcd82e9e04c52060cb7d0",
+]
+
+[[artifacts]]
+id = "pymupdf"
+name = "PyMuPDF"
+version = "1.26.7"
+kind = "python-sdist"
+filename = "pymupdf-1.26.7.tar.gz"
+url = "https://files.pythonhosted.org/packages/48/d6/09b28f027b510838559f7748807192149c419b30cb90e6d5f0cf916dc9dc/pymupdf-1.26.7.tar.gz"
+sha256 = "71add8bdc8eb1aaa207c69a13400693f06ad9b927bea976f5d5ab9df0bb489c3"
+bytes = 84327033
+top_level = "pymupdf-1.26.7"
+license_declaration = "Dual Licensed - GNU AFFERO GPL 3.0 or Artifex Commercial License (upstream package metadata)"
+license_path = "COPYING"
+license_sha256 = "57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6"
+runtime_artifact_sha256 = [
+  # cp310-abi3-manylinux_2_28_x86_64
+  "69dfc78f206a96e5b3ac22741263ebab945fdf51f0dbe7c5757c3511b23d9d72",
+  # cp310-abi3-manylinux_2_28_aarch64
+  "e419b609996434a14a80fa060adec72c434a1cca6a511ec54db9841bc5d51b3c",
+]
+
+[[artifacts]]
+id = "mupdf"
+name = "MuPDF"
+version = "1.26.12"
+kind = "native-source"
+filename = "mupdf-1.26.12-source.tar.gz"
+url = "https://mupdf.com/downloads/archive/mupdf-1.26.12-source.tar.gz"
+sha256 = "6baf910928f404167ba49be6340195dec340795724722b331f5a2143f5aa0d01"
+bytes = 64536473
+top_level = "mupdf-1.26.12-source"
+license_declaration = "AGPL version 3 or later, or Artifex commercial terms (upstream source headers)"
+license_path = "COPYING"
+license_sha256 = "57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6"
+runtime_artifact_sha256 = []
+builds_for = "PyMuPDF==1.26.7"

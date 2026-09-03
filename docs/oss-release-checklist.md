@@ -1,18 +1,27 @@
 # OSS release checklist
 
-This checklist tracks the PaperTrans v0.2.0-rc.1 **source release**. Evidence is
+This checklist tracks the unpublished PaperTrans v0.2.0-rc.2 **source release**. Evidence is
 valid only for the exact commit named by the tag. An older successful CI run or
 a test from a dirty checkout does not satisfy a current gate. The command order
 and evidence to retain are defined in [`RELEASING.md`](../RELEASING.md).
+
+The public `v0.2.0-rc.1` tag remains fixed at its original commit and its tag CI
+passed, but no GitHub Release was published. It did not complete the clean-OS,
+license, and release-governance gates below, so it is not reused or silently
+moved; corrections are being prepared under the new rc.2 identity.
 
 ## Repository and public-reporting baseline
 
 - [x] Select and add the Apache License 2.0 project license.
 - [x] Add the root `SECURITY.md` policy.
-- [ ] Enable and test GitHub Private Vulnerability Reporting. If the repository
+- [x] Enable and test GitHub Private Vulnerability Reporting. If the repository
   is already visible, complete this before announcing the RC.
-- [ ] Configure a `main` ruleset that blocks force pushes/deletion and requires
-  pull-request review plus all four CI jobs before merge.
+- [x] Enable GitHub secret scanning, push protection, and dependency
+  vulnerability alerts.
+- [x] Activate `main` ruleset `22182639`, blocking force pushes/deletion and
+  requiring pull requests plus all four CI jobs before merge. The current
+  solo-maintainer policy uses zero required approvals; raise it to one when a
+  second trusted write-capable maintainer is available.
 - [x] Keep `.env*`, `data/`, `output/`, browser traces, caches, local databases,
   and generated paper artifacts out of Git.
 - [x] Define reproducible root Python, release-metadata, Web typecheck/build,
@@ -31,12 +40,13 @@ and evidence to retain are defined in [`RELEASING.md`](../RELEASING.md).
   committed papers, archives, and unusually large blobs at the final release
   commit.
 
-## Required for v0.2.0-rc.1
+## Required for v0.2.0-rc.2
 
 - [x] Establish `main` as the public release branch and GitHub default branch.
 - [x] Add an executable release-metadata synchronization test for npm, Python,
   `papertrans.__release__`/`__version__`, the Docling model lock, and the
-  changelog heading.
+  dated changelog heading; run the documented tag-environment check before the
+  public tag is created.
 - [x] Add the maintainer release runbook covering a clean tree, ordered tests,
   clean-OS checks, tagging, a GitHub pre-release, and rollback.
 - [x] Bound experimental Docling PDF imports and reject non-local Markdown
@@ -51,17 +61,47 @@ and evidence to retain are defined in [`RELEASING.md`](../RELEASING.md).
 - [ ] On both systems, verify the real first Docling model download and hash
   check, then disconnect/deny network access and complete a subsequent
   `./papertrans start --offline --no-browser` restart.
-- [ ] Confirm the distribution decision and required notices for the
-  AGPL/commercial PyMuPDF dependency. Do not infer a legal conclusion from the
-  dependency inventory.
-- [ ] Review the exact locked Docling model licenses and record any
-  redistribution restrictions separately from the Python package license.
+- [x] Record the rc.2 distribution boundary: it is source checkout only and
+  contains no PyMuPDF/Docling dependency wheel, Docling model weight, or worker
+  image. The application nevertheless declares PyMuPDF as a required runtime
+  dependency and `uv` acquires it during source setup, so retain the documented
+  AGPL/commercial notice. This scope decision is not approval for a future
+  binary, hosted service, or image distribution, and rc.2 is not published to
+  PyPI.
+- [x] Pin and fail-closed validate the official BabelDOC 0.6.4 and PyMuPDF
+  1.26.7 sdists plus MuPDF 1.26.12 source, and configure evaluation-image
+  builds to embed them with the patched pdf2zh-next tree and build inputs.
+- [x] Review the exact locked Docling model licenses and record their immutable
+  model-card evidence and redistribution conditions separately from the
+  Python package license in `dependency-licenses.md`.
 - [ ] Re-run the locked dependency-license audit on the final release commit.
+- [x] Move Docling into the source-only dependency group, pin
+  `transformers 5.10.4`, and verify every fully provisioned lock branch with
+  `pip-audit`: 131 dependencies on Python 3.10 and 125 on each of Python 3.11
+  and 3.12, with zero known vulnerabilities at this checkpoint.
 - [ ] Review the `CHANGELOG.md` RC section and copy all known limitations into
   the GitHub release notes.
-- [ ] Create an annotated `v0.2.0-rc.1` tag pointing to the verified commit and
+- [ ] Create an annotated `v0.2.0-rc.2` tag pointing to the verified commit and
   pass the tag-triggered CI run, then publish a GitHub **pre-release** and verify
   the source archive and tag target.
+
+## Future artifact promotion gates (not rc.2 source-release blockers)
+
+- [ ] Before publishing the BabelDOC evaluation image, extract its embedded
+  source bundle and verify it against `source-artifacts.lock` and
+  `runtime-source-map.json`; independently rebuild/review the native
+  PyMuPDF/MuPDF path or approve documented commercial terms, resolve the
+  upstream license-declaration inconsistency, publish/retain matching source as
+  no-additional-charge release assets, and verify the immutable PaperTrans
+  revision in its OCI labels.
+- [ ] Pin the 182 BabelDOC build-time assets to immutable origin revisions,
+  resolve the GoNoto binaries' OFL-1.1 declarations versus the asset README's
+  Unlicense label, and embed/verify the applicable font, CMap, DocLayout model,
+  and tiktoken license evidence and notices before publishing the evaluation
+  image.
+- [ ] If a future binary/archive bundles TableFormer, include the
+  CDLA-Permissive-2.0 agreement text. If it bundles either Heron form, include
+  Apache-2.0 and retain the exact locked model-card evidence.
 
 ## Recommended before the first stable tagged release
 

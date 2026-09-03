@@ -124,9 +124,13 @@ class FinalizeResult(JobSummary):
 _store_instance: MCPTranslationStore | None = None
 
 
-def configure_store(repo_root: Path, output_root: Path) -> MCPTranslationStore:
+def configure_store(
+    repo_root: Path,
+    output_root: Path,
+    data_root: Path | None = None,
+) -> MCPTranslationStore:
     global _store_instance
-    _store_instance = MCPTranslationStore(repo_root, output_root)
+    _store_instance = MCPTranslationStore(repo_root, output_root, data_root)
     return _store_instance
 
 
@@ -134,7 +138,8 @@ def _store() -> MCPTranslationStore:
     if _store_instance is None:
         repo_root = Path(os.environ.get("PAPERTRANS_REPO_ROOT", Path.cwd()))
         output_root = Path(os.environ.get("PAPERTRANS_OUTPUT_ROOT", repo_root / "output"))
-        return configure_store(repo_root, output_root)
+        data_root = Path(os.environ.get("PAPERTRANS_DATA_ROOT", repo_root / "data"))
+        return configure_store(repo_root, output_root, data_root)
     return _store_instance
 
 
@@ -298,6 +303,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Defaults to <repo-root>/output or PAPERTRANS_OUTPUT_ROOT.",
     )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=None,
+        help="Defaults to <repo-root>/data or PAPERTRANS_DATA_ROOT.",
+    )
     return parser
 
 
@@ -306,7 +317,10 @@ def main() -> None:
     output_root = args.output_root or Path(
         os.environ.get("PAPERTRANS_OUTPUT_ROOT", args.repo_root / "output")
     )
-    configure_store(args.repo_root, output_root)
+    data_root = args.data_root or Path(
+        os.environ.get("PAPERTRANS_DATA_ROOT", args.repo_root / "data")
+    )
+    configure_store(args.repo_root, output_root, data_root)
     try:
         if args.transport == "stdio":
             server.run(transport="stdio")

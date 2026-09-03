@@ -2122,13 +2122,13 @@ def test_accepts_mapping_json_and_docling_document_protocol() -> None:
         docling_document_to_dict(object())
 
 
-def test_docling_import_is_lazy_and_reports_optional_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_docling_import_is_lazy_and_reports_source_group(monkeypatch: pytest.MonkeyPatch) -> None:
     def unavailable(name: str):
         assert name == "docling.document_converter"
         raise ModuleNotFoundError("No module named 'docling'", name="docling")
 
     monkeypatch.setattr(adapter.importlib, "import_module", unavailable)
-    with pytest.raises(DoclingUnavailableError, match="uv sync --extra docling"):
+    with pytest.raises(DoclingUnavailableError, match="uv sync --group docling"):
         adapter.convert_pdf_with_docling(Path("paper.pdf"))
 
 
@@ -2304,7 +2304,7 @@ def test_converter_fails_closed_without_onnx_runtime(
         return SimpleNamespace()
 
     monkeypatch.setattr(adapter.importlib, "import_module", modules)
-    with pytest.raises(DoclingUnavailableError, match=r"uv sync --extra docling"):
+    with pytest.raises(DoclingUnavailableError, match=r"uv sync --group docling"):
         adapter.convert_pdf_with_docling(Path("paper.pdf"))
 
 
