@@ -1,7 +1,18 @@
-import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { isArtifactManifestPublishable } from "@/lib/artifact-security";
+import {
+  currentPaperState,
+  loadPaperLibraryStates,
+  normalizeTags,
+  savePaperLibraryStateAt,
+  type PaperLibraryPatch,
+  type PaperLibraryState,
+} from "@/lib/library-state";
 import { getPaperTransRuntimeConfig } from "@/lib/runtime-config";
+
+export { normalizeTags } from "@/lib/library-state";
+export type { PaperLibraryPatch, PaperLibraryState } from "@/lib/library-state";
 
 export type PaperStatus =
   | "preparing"
@@ -108,23 +119,6 @@ type QaDocument = {
 const PDF_MCP_MAX_CHARACTERS = 9000;
 const PDF_TRANSLATABLE_KINDS = new Set(["abstract", "paragraph", "list_item", "footnote"]);
 
-type LibraryMetadata = {
-  version: 1;
-  papers: Record<string, PaperLibraryState>;
-};
-
-export type PaperLibraryState = {
-  tags: string[];
-  isRead: boolean;
-  favorite: boolean;
-};
-
-export type PaperLibraryPatch = {
-  tags?: unknown;
-  isRead?: unknown;
-  favorite?: unknown;
-};
-
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const MANIFEST_FILENAMES = ["papertrans-job.json", "mcp-job.json", "chatgpt-job.json"] as const;
 
@@ -133,7 +127,6 @@ function libraryRoots() {
   return {
     dataRoot: config.dataRoot,
     outputRoot: config.outputRoot,
-    metadataPath: path.join(config.dataRoot, "library.json"),
   };
 }
 
@@ -253,69 +246,11 @@ export async function findPaperArtifact(
   );
 }
 
-async function loadMetadata(metadataPath: string): Promise<LibraryMetadata> {
-  const value = await readJson<LibraryMetadata>(metadataPath);
-  if (!value || value.version !== 1 || typeof value.papers !== "object") {
-    return { version: 1, papers: {} };
-  }
-  return value;
-}
-
-export function normalizeTags(tags: unknown): string[] {
-  if (!Array.isArray(tags)) throw new Error("tags must be an array");
-  const normalized: string[] = [];
-  const seen = new Set<string>();
-  for (const value of tags) {
-    if (typeof value !== "string") throw new Error("every tag must be a string");
-    const tag = value.trim().replace(/\s+/g, " ");
-    if (!tag) continue;
-    if (tag.length > 32) throw new Error("tags must be 32 characters or fewer");
-    const key = tag.toLocaleLowerCase("ja");
-    if (!seen.has(key)) {
-      normalized.push(tag);
-      seen.add(key);
-    }
-  }
-  if (normalized.length > 12) throw new Error("a paper can have at most 12 tags");
-  return normalized;
-}
-
-function currentPaperState(metadata: LibraryMetadata, slug: string): PaperLibraryState {
-  const current = metadata.papers[slug];
-  return {
-    tags: normalizeTags(current?.tags ?? []),
-    isRead: current?.isRead === true,
-    favorite: current?.favorite === true,
-  };
-}
-
 export async function savePaperLibraryState(
   slug: string,
   patch: PaperLibraryPatch,
 ): Promise<PaperLibraryState> {
-  if (!JOB_ID.test(slug)) throw new Error("invalid paper slug");
-  const { dataRoot, metadataPath } = libraryRoots();
-  const metadata = await loadMetadata(metadataPath);
-  const current = currentPaperState(metadata, slug);
-  if (patch.tags !== undefined) current.tags = normalizeTags(patch.tags);
-  if (patch.isRead !== undefined) {
-    if (typeof patch.isRead !== "boolean") throw new Error("isRead must be a boolean");
-    current.isRead = patch.isRead;
-  }
-  if (patch.favorite !== undefined) {
-    if (typeof patch.favorite !== "boolean") throw new Error("favorite must be a boolean");
-    current.favorite = patch.favorite;
-  }
-  metadata.papers[slug] = current;
-  const temporary = path.join(dataRoot, `.library-${process.pid}-${Date.now()}.tmp`);
-  await mkdir(dataRoot, { recursive: true });
-  await writeFile(temporary, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await rename(temporary, metadataPath);
-  return current;
-}
-
-export async function savePaperTags(slug: string, tags: unknown): Promise<string[]> {
-  return (await savePaperLibraryState(slug, { tags })).tags;
+  return savePaperLibraryStateAt(libraryRoots().dataRoot, slug, patch);
 }
 
 function normalizeStatus(status: string | undefined): PaperStatus {
@@ -495,8 +430,8 @@ async function readPdfMcpProgress(
 }
 
 export async function scanPaperLibrary(): Promise<PaperSummary[]> {
-  const { metadataPath, outputRoot } = libraryRoots();
-  const metadata = await loadMetadata(metadataPath);
+  const { dataRoot, outputRoot } = libraryRoots();
+  const metadata = await loadPaperLibraryStates(dataRoot);
   let entries;
   try {
     entries = await readdir(outputRoot, { withFileTypes: true });

@@ -1,7 +1,9 @@
 From: PaperTrans maintainers <security@papertrans.invalid>
+Date: Thu, 3 Sep 2026 00:00:00 +0900
 Subject: [PATCH] pin patched BabelDOC/PyMuPDF and mark the PaperTrans fork
 
 Applies only to upstream commit f8dffcf4c3a33b254391d43514439b975ce8d966.
+PaperTrans modifications were made on 2026-09-03.
 It removes the unsafe/unsatisfiable dependency combination that could resolve
 to BabelDOC 0.6.2, then assigns a distinct PEP 440 local fork version.
 

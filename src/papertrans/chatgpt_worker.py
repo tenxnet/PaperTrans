@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
+from contextlib import contextmanager
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .arxiv_html import (
     _section_chunks,
@@ -46,9 +51,24 @@ def _now() -> str:
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f"{path.suffix}.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _default_job_id(arxiv_id: str) -> str:
@@ -123,9 +143,15 @@ def _validate_pdf_translations(
 class MCPTranslationStore:
     """Persist arXiv HTML translation jobs while an MCP client supplies translations."""
 
-    def __init__(self, repo_root: Path, output_root: Path) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        output_root: Path,
+        data_root: Path | None = None,
+    ) -> None:
         self.repo_root = repo_root.resolve()
         self.output_root = output_root.resolve()
+        self.data_root = (data_root or self.repo_root / "data").resolve()
 
     def _validate_job_id(self, job_id: str) -> str:
         if not JOB_ID_RE.fullmatch(job_id):
@@ -134,9 +160,7 @@ class MCPTranslationStore:
             )
         return job_id
 
-    def _paths(self, job_id: str) -> dict[str, Path]:
-        safe_id = self._validate_job_id(job_id)
-        root = self.output_root / safe_id
+    def _paths_for_root(self, safe_id: str, root: Path) -> dict[str, Path]:
         return {
             "root": root,
             "work": root / "work",
@@ -147,12 +171,36 @@ class MCPTranslationStore:
             "pdf_manifest": root / "work" / "papertrans-job.json",
             "results": root / "work" / "chatgpt-translations",
             "semantic_document": root / "work" / "semantic-document.json",
-            "source_pdf": self.repo_root / "data" / "papers" / safe_id / "source.pdf",
+            "source_pdf": self.data_root / "papers" / safe_id / "source.pdf",
             "metrics": root / "run-metrics.json",
             "bundle": root / f"{safe_id}-html.zip",
             "markdown": root / "html" / "index.md",
             "markdown_qa": root / "html" / "markdown-qa.json",
         }
+
+    def _paths(self, job_id: str) -> dict[str, Path]:
+        safe_id = self._validate_job_id(job_id)
+        return self._paths_for_root(safe_id, self.output_root / safe_id)
+
+    @staticmethod
+    def _job_root_is_occupied(root: Path) -> bool:
+        return root.is_symlink() or (
+            root.exists() and (not root.is_dir() or any(root.iterdir()))
+        )
+
+    @contextmanager
+    def _job_lock(self, job_id: str) -> Iterator[None]:
+        """Serialize every mutation of one job without touching its directory."""
+
+        safe_id = self._validate_job_id(job_id)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.output_root / f".{safe_id}.mcp-job.lock"
+        with lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load_manifest(self, job_id: str) -> tuple[dict[str, Any], dict[str, Path]]:
         paths = self._paths(job_id)
@@ -280,86 +328,129 @@ class MCPTranslationStore:
             )
         requested_arxiv_id = normalize_arxiv_id(arxiv_id)
         selected_job_id = self._validate_job_id(job_id or _default_job_id(requested_arxiv_id))
-        paths = self._paths(selected_job_id)
-        if paths["manifest"].exists() or paths["legacy_manifest"].exists():
-            manifest, _ = self._load_manifest(selected_job_id)
-            if manifest["paper"]["requestedArxivId"] != requested_arxiv_id:
-                raise TranslationJobError(
-                    f"job {selected_job_id} already belongs to {manifest['paper']['requestedArxivId']}"
+        with self._job_lock(selected_job_id):
+            paths = self._paths(selected_job_id)
+            if paths["manifest"].exists() or paths["legacy_manifest"].exists():
+                manifest, _ = self._load_manifest(selected_job_id)
+                if manifest["paper"]["requestedArxivId"] != requested_arxiv_id:
+                    raise TranslationJobError(
+                        f"job {selected_job_id} already belongs to "
+                        f"{manifest['paper']['requestedArxivId']}"
+                    )
+                existing_target = manifest.get("settings", {}).get(
+                    "targetLanguage", DEFAULT_TARGET_LANGUAGE
                 )
-            existing_target = manifest.get("settings", {}).get(
-                "targetLanguage", DEFAULT_TARGET_LANGUAGE
-            )
-            if existing_target != target_language:
+                if existing_target != target_language:
+                    raise TranslationJobError(
+                        f"job {selected_job_id} already targets {existing_target}"
+                    )
+                document = self._load_document(manifest, paths)
+                previous_status = manifest["status"]
+                self._refresh_status(manifest, document, touch=False)
+                if previous_status == "completed" and self._artifact_files_current(
+                    manifest, paths
+                ):
+                    manifest["status"] = "completed"
+                return self._summary(manifest, paths)
+            if self._job_root_is_occupied(paths["root"]):
                 raise TranslationJobError(
-                    f"job {selected_job_id} already targets {existing_target}"
+                    "output directory already exists without an MCP job manifest: "
+                    f"{paths['root']}"
                 )
-            document = self._load_document(manifest, paths)
-            previous_status = manifest["status"]
-            self._refresh_status(manifest, document, touch=False)
-            if previous_status == "completed" and self._artifact_files_current(manifest, paths):
-                manifest["status"] = "completed"
-            return self._summary(manifest, paths)
-        if paths["root"].exists() and any(paths["root"].iterdir()):
-            raise TranslationJobError(
-                f"output directory already exists without an MCP job manifest: {paths['root']}"
-            )
 
-        paths["work"].mkdir(parents=True, exist_ok=True)
-        acquisition = acquire_official_arxiv_html(
-            requested_arxiv_id,
-            paths["work"],
-            self.repo_root,
-            metrics_path=paths["metrics"],
-        )
-        document = normalize_article_document(
-            acquisition,
-            paths["work"],
-            paths["document"],
-            metrics_path=paths["metrics"],
-        )
-        document["model"] = {"translation": "mcp-worker", "reasoningEffort": None}
-        document["targetLanguage"] = target_language
-        _atomic_write_json(paths["document"], document)
-        chunks = _section_chunks(document["units"], max_characters)
-        if not chunks:
-            raise TranslationJobError("the normalized paper contains no translatable blocks")
-        now = _now()
-        manifest = {
-            "schemaVersion": JOB_SCHEMA_VERSION,
-            "jobId": selected_job_id,
-            "status": "prepared",
-            "provider": "mcp",
-            "paper": {
-                "requestedArxivId": requested_arxiv_id,
-                "resolvedArxivId": acquisition["resolvedArxivId"],
-                "title": acquisition["validation"]["title"],
-                "sourceUrl": acquisition["sourceUrl"],
-                "authors": list(acquisition.get("metadata", {}).get("authors", [])),
-                "publishedAt": acquisition.get("metadata", {}).get("publishedAt"),
-            },
-            "settings": {
-                "maxCharacters": max_characters,
-                "targetLanguage": target_language,
-            },
-            "chunks": [
-                {
-                    "chunkId": f"chunk-{index:03d}",
-                    "index": index,
-                    "status": "pending",
-                    "unitIds": [unit["id"] for unit in chunk],
-                    "characters": sum(len(unit["translationSource"]) for unit in chunk),
-                    "sections": list(dict.fromkeys(unit["sectionTitle"] for unit in chunk)),
+            staging_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{selected_job_id}.mcp-prepare-",
+                    dir=self.output_root,
+                )
+            )
+            staging_paths = self._paths_for_root(selected_job_id, staging_root)
+            try:
+                staging_paths["work"].mkdir(parents=True, exist_ok=True)
+                acquisition = acquire_official_arxiv_html(
+                    requested_arxiv_id,
+                    staging_paths["work"],
+                    self.repo_root,
+                    metrics_path=staging_paths["metrics"],
+                )
+                document = normalize_article_document(
+                    acquisition,
+                    staging_paths["work"],
+                    staging_paths["document"],
+                    metrics_path=staging_paths["metrics"],
+                )
+                document["model"] = {
+                    "translation": "mcp-worker",
+                    "reasoningEffort": None,
                 }
-                for index, chunk in enumerate(chunks, start=1)
-            ],
-            "createdAt": now,
-            "updatedAt": now,
-            "finalizedAt": None,
-            "artifacts": {},
-        }
-        _atomic_write_json(paths["manifest"], manifest)
-        return self._summary(manifest, paths)
+                document["targetLanguage"] = target_language
+                _atomic_write_json(staging_paths["document"], document)
+                chunks = _section_chunks(document["units"], max_characters)
+                if not chunks:
+                    raise TranslationJobError(
+                        "the normalized paper contains no translatable blocks"
+                    )
+                now = _now()
+                manifest = {
+                    "schemaVersion": JOB_SCHEMA_VERSION,
+                    "jobId": selected_job_id,
+                    "status": "prepared",
+                    "provider": "mcp",
+                    "paper": {
+                        "requestedArxivId": requested_arxiv_id,
+                        "resolvedArxivId": acquisition["resolvedArxivId"],
+                        "title": acquisition["validation"]["title"],
+                        "sourceUrl": acquisition["sourceUrl"],
+                        "authors": list(
+                            acquisition.get("metadata", {}).get("authors", [])
+                        ),
+                        "publishedAt": acquisition.get("metadata", {}).get(
+                            "publishedAt"
+                        ),
+                    },
+                    "settings": {
+                        "maxCharacters": max_characters,
+                        "targetLanguage": target_language,
+                    },
+                    "chunks": [
+                        {
+                            "chunkId": f"chunk-{index:03d}",
+                            "index": index,
+                            "status": "pending",
+                            "unitIds": [unit["id"] for unit in chunk],
+                            "characters": sum(
+                                len(unit["translationSource"]) for unit in chunk
+                            ),
+                            "sections": list(
+                                dict.fromkeys(
+                                    unit["sectionTitle"] for unit in chunk
+                                )
+                            ),
+                        }
+                        for index, chunk in enumerate(chunks, start=1)
+                    ],
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "finalizedAt": None,
+                    "artifacts": {},
+                }
+                _atomic_write_json(staging_paths["manifest"], manifest)
+
+                # Recheck the destination immediately before publication. A directory
+                # created by software that does not honor this lock is never deleted
+                # when it contains data.
+                if self._job_root_is_occupied(paths["root"]):
+                    raise TranslationJobError(
+                        "output directory already exists without an MCP job manifest: "
+                        f"{paths['root']}"
+                    )
+                if paths["root"].exists():
+                    paths["root"].rmdir()
+                staging_root.replace(paths["root"])
+                return self._summary(manifest, paths)
+            finally:
+                if staging_root.exists():
+                    shutil.rmtree(staging_root)
 
     def _summary(self, manifest: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
         total = len(manifest["chunks"])
@@ -399,7 +490,7 @@ class MCPTranslationStore:
         source = paths["source_pdf"]
         if not source.is_file():
             raise TranslationJobError(
-                "PDF source is missing; import it at data/papers/<job-id>/source.pdf before using MCP"
+                f"PDF source is missing from the configured data root: {source}"
             )
         expected = str(manifest.get("source", {}).get("sha256", "")).strip()
         if expected:
@@ -571,6 +662,21 @@ class MCPTranslationStore:
         translations: list[dict[str, Any]],
         overwrite: bool = False,
     ) -> dict[str, Any]:
+        with self._job_lock(job_id):
+            return self._save_chunk_locked(
+                job_id,
+                chunk_id,
+                translations,
+                overwrite=overwrite,
+            )
+
+    def _save_chunk_locked(
+        self,
+        job_id: str,
+        chunk_id: str,
+        translations: list[dict[str, Any]],
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
         manifest, paths = self._load_manifest(job_id)
         document = self._load_document(manifest, paths)
         if _is_pdf_job(manifest):
@@ -639,20 +745,38 @@ class MCPTranslationStore:
             document["status"] = "translating"
             document["model"] = {"translation": "mcp-worker", "reasoningEffort": None}
             _atomic_write_json(self._document_path(manifest, paths), document)
-            result_record = {
-                "jobId": job_id,
-                "chunkId": chunk_id,
-                "savedAt": _now(),
-                "provider": "mcp",
-                "translations": normalized,
-            }
-            _atomic_write_json(paths["results"] / f"{chunk_id}.json", result_record)
+
+        result_path = paths["results"] / f"{chunk_id}.json"
+        saved_at = _now()
+        if idempotent_replay and result_path.is_file():
+            try:
+                previous_result = json.loads(
+                    result_path.read_text(encoding="utf-8")
+                )
+                if (
+                    isinstance(previous_result, dict)
+                    and previous_result.get("jobId") == job_id
+                    and previous_result.get("chunkId") == chunk_id
+                    and previous_result.get("provider") == "mcp"
+                    and previous_result.get("translations") == normalized
+                    and isinstance(previous_result.get("savedAt"), str)
+                ):
+                    saved_at = previous_result["savedAt"]
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+        result_record = {
+            "jobId": job_id,
+            "chunkId": chunk_id,
+            "savedAt": saved_at,
+            "provider": "mcp",
+            "translations": normalized,
+        }
+        _atomic_write_json(result_path, result_record)
 
         self._refresh_status(manifest, document, touch=not idempotent_replay)
-        if not idempotent_replay:
-            _atomic_write_json(paths["manifest"], manifest)
+        _atomic_write_json(paths["manifest"], manifest)
         summary = self._summary(manifest, paths)
-        if _is_pdf_job(manifest) and not idempotent_replay:
+        if _is_pdf_job(manifest):
             self._sync_pdf_job_manifest(
                 manifest, document, paths, str(summary["status"])
             )
@@ -669,6 +793,10 @@ class MCPTranslationStore:
         }
 
     def finalize(self, job_id: str) -> dict[str, Any]:
+        with self._job_lock(job_id):
+            return self._finalize_locked(job_id)
+
+    def _finalize_locked(self, job_id: str) -> dict[str, Any]:
         manifest, paths = self._load_manifest(job_id)
         if self._artifacts_current(manifest, paths):
             if _is_pdf_job(manifest):

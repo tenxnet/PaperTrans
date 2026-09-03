@@ -24,16 +24,48 @@ RUNTIME_PDF2ZH_CACHE_ROOT = Path("/opt/papertrans/home/.cache/pdf2zh_next")
 PROVENANCE_PATH = Path("/opt/papertrans/provenance.json")
 SOURCE_ROOT = Path("/opt/papertrans/corresponding-source/pdf2zh-next")
 SOURCE_MANIFEST_PATH = Path("/opt/papertrans/corresponding-source/source.manifest.json")
-FORK_PATCH_PATH = Path("/opt/papertrans/corresponding-source/0001-papertrans-safe-dependencies.patch")
-RUNTIME_REQUIREMENTS_PATH = Path("/opt/papertrans/corresponding-source/requirements.lock")
-BUILD_REQUIREMENTS_PATH = Path("/opt/papertrans/corresponding-source/build-requirements.lock")
+COMPLETE_SOURCE_ROOT = Path("/opt/papertrans/corresponding-source")
+COMPLETE_SOURCE_MANIFEST_PATH = Path(
+    "/opt/papertrans/corresponding-source.manifest.json"
+)
+SOURCE_ARTIFACTS_LOCK_PATH = Path(
+    "/opt/papertrans/corresponding-source/source-artifacts.lock"
+)
+SOURCE_ARTIFACTS_ROOT = Path("/opt/papertrans/corresponding-source/upstream-archives")
+SOURCE_ARTIFACTS_MANIFEST_PATH = (
+    SOURCE_ARTIFACTS_ROOT / "source-artifacts.manifest.json"
+)
+RUNTIME_SOURCE_MAPPING_PATH = COMPLETE_SOURCE_ROOT / "runtime-source-map.json"
+FORK_PATCH_PATH = Path(
+    "/opt/papertrans/corresponding-source/patches/0001-papertrans-safe-dependencies.patch"
+)
+RUNTIME_REQUIREMENTS_PATH = Path(
+    "/opt/papertrans/corresponding-source/requirements.lock"
+)
+BUILD_REQUIREMENTS_PATH = Path(
+    "/opt/papertrans/corresponding-source/build-requirements.lock"
+)
 UPSTREAM_LOCK_PATH = Path("/opt/papertrans/corresponding-source/UPSTREAM.lock")
 
-BUILD_MANIFEST_SHA256 = "e80f466d2ffeb6433e7f9f7ea581ea5a9a18104629103b4638db50ffee9b13e5"
-RUNTIME_REQUIREMENTS_SHA256 = "0fc3f23dc5fa0b0ebb239acaf1b5c24a14cd29b41fe48cfd3d1915dfb832366f"
-BUILD_REQUIREMENTS_SHA256 = "99c8c09e2be15ac0fa0058f6df36a2dfda624a1c239241c4f59406d7599a0243"
-FORK_PATCH_SHA256 = "80b9d80a57356b7eee9fd7d3fb90333a8c70f499d349d60e461f967b2d634f4f"
-UPSTREAM_LOCK_SHA256 = "579c5f301a44224b5bb577c4475fc9527e6ed8bd8c8754855037d2a315065f6b"
+BUILD_MANIFEST_SHA256 = (
+    "824659cf4f8d362f0b03088e943e7efd54dc7dd04006dfed83aea75e30863c6b"
+)
+RUNTIME_REQUIREMENTS_SHA256 = (
+    "0fc3f23dc5fa0b0ebb239acaf1b5c24a14cd29b41fe48cfd3d1915dfb832366f"
+)
+BUILD_REQUIREMENTS_SHA256 = (
+    "99c8c09e2be15ac0fa0058f6df36a2dfda624a1c239241c4f59406d7599a0243"
+)
+FORK_PATCH_SHA256 = "002297dac1447b3ec3e020c4495f7c0b40670677168bdef84d866e6bf296828f"
+UPSTREAM_LOCK_SHA256 = (
+    "68c5805dfd311f597817643ca0143339e6ba77984a5519b8524a024eea93d9c3"
+)
+SOURCE_ARTIFACTS_LOCK_SHA256 = (
+    "14735922967abea2cf52c177ada33e4a52e0dbd9c7188cb48205c0f3cf334514"
+)
+BABELDOC_ASSET_INVENTORY_SHA256 = (
+    "aed82c0c1fe09f09f3dc5307c646e019948992e37ab62c99e780833220bb9320"
+)
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_INPUT_BYTES = 100 * 1024 * 1024

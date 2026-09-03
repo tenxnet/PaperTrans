@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 from papertrans import __release__, __version__
@@ -35,16 +36,41 @@ def test_release_version_is_synchronized_across_public_metadata() -> None:
     model_lock = json.loads(
         (REPOSITORY_ROOT / "docling-models.lock.json").read_text(encoding="utf-8")
     )
-    changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-
     assert package["version"] == __release__
     assert _python_project_version() == __version__ == _pep440_release(__release__)
     assert model_lock["release"] == f"v{__release__}"
-    assert re.search(
-        rf"^## \[{re.escape(__release__)}\](?:\s+-\s+\d{{4}}-\d{{2}}-\d{{2}})?\s*$",
-        changelog,
-        re.MULTILINE,
+
+
+def test_web_scripts_bind_to_loopback_by_default() -> None:
+    package = json.loads(
+        (REPOSITORY_ROOT / "package.json").read_text(encoding="utf-8")
     )
+
+    for script in ("dev", "start"):
+        assert "--hostname 127.0.0.1" in package["scripts"][script]
+
+
+def test_python_sdist_excludes_separately_licensed_workers() -> None:
+    pyproject = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    sdist = pyproject.split("[tool.hatch.build.targets.sdist]", 1)[1].split(
+        "\n[", 1
+    )[0]
+    assert '"/src/papertrans"' in sdist
+    assert re.search(r'^exclude\s*=\s*\[[^\]]*"/workers"', sdist, re.MULTILINE)
+
+
+def test_docling_is_source_checkout_only_and_transformers_is_fixed() -> None:
+    pyproject = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    optional = pyproject.split("[project.optional-dependencies]", 1)[1].split(
+        "\n[", 1
+    )[0]
+    groups = pyproject.split("[dependency-groups]", 1)[1].split("\n[", 1)[0]
+    uv_policy = pyproject.split("[tool.uv]", 1)[1].split("\n[", 1)[0]
+
+    assert not re.search(r"^docling\s*=", optional, re.MULTILINE)
+    assert re.search(r"^docling\s*=", groups, re.MULTILINE)
+    assert '"transformers==5.10.4"' in groups
+    assert 'override-dependencies = ["transformers==5.10.4"]' in uv_policy
 
 
 def test_release_tag_matches_public_metadata_when_provided() -> None:
@@ -52,6 +78,21 @@ def test_release_tag_matches_public_metadata_when_provided() -> None:
     if release_tag is None:
         return
     assert release_tag == f"v{__release__}"
+    changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    release_headings = re.findall(
+        rf"^## \[{re.escape(__release__)}\]\s+-\s+(\d{{4}}-\d{{2}}-\d{{2}})\s*$",
+        changelog,
+        re.MULTILINE,
+    )
+    assert len(release_headings) == 1
+    date.fromisoformat(release_headings[0])
+
+    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+    assert not unreleased.strip(), "tagged commits must not contain unreleased entries"
+    release_section = changelog.split(
+        f"## [{__release__}] - {release_headings[0]}", 1
+    )[1].split("\n## ", 1)[0]
+    assert "### Known limitations" in release_section
 
 
 def test_arxiv_renderer_security_generation_matches_web_gate() -> None:

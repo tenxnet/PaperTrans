@@ -133,6 +133,7 @@ def test_runtime_environment_is_local_offline_and_secret_free(
 
     assert environment["PAPERTRANS_MCP_HOST"] == "127.0.0.1"
     assert environment["PAPERTRANS_REPO_ROOT"] == str(paths.repo_root)
+    assert environment["PAPERTRANS_DATA_ROOT"] == str(paths.data_root)
     assert environment["PAPERTRANS_DOCLING_ARTIFACTS_PATH"] == str(paths.model_root)
     assert environment["HF_HUB_OFFLINE"] == "1"
     assert "NODE_OPTIONS" not in environment
@@ -156,6 +157,7 @@ def test_service_argv_is_fixed_loopback_and_absolute(
     assert Path(mcp[0]).is_absolute()
     assert mcp[mcp.index("--host") + 1] == "127.0.0.1"
     assert mcp[mcp.index("--port") + 1] == "8765"
+    assert mcp[mcp.index("--data-root") + 1] == str(paths.data_root)
     assert web == ("/usr/bin/pnpm", "start", "--hostname", "127.0.0.1", "--port", "3210")
 
 

@@ -1,9 +1,21 @@
 [project]
 name = "papertrans"
-version = "0.2.0rc1"
+version = "0.2.0rc2"
 description = "Local-first academic paper translation workspace with an MCP worker"
+readme = { file = "PYPI_README.md", content-type = "text/markdown" }
 license = "Apache-2.0"
 requires-python = ">=3.10"
+keywords = ["academic-papers", "arxiv", "mcp", "translation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Web Environment",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: Japanese",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering",
+]
 dependencies = [
   "beautifulsoup4>=4.13.0",
   "html5lib>=1.1",
@@ -16,23 +28,52 @@ dependencies = [
 mcp = ["mcp>=2.1.1,<3"]
 # Compatibility alias for installs made before the MCP worker was generalized.
 chatgpt = ["mcp>=2.1.1,<3"]
+test = ["mcp>=2.1.1,<3", "pytest>=8.0.0", "pyyaml>=6.0.0"]
+
+# Docling is an application dependency for GitHub source checkouts, not a
+# published wheel extra. Its current macOS metadata caps Transformers below the
+# security-fixed release, so uv applies the exact, tested override below.
+[dependency-groups]
 docling = [
   "docling>=2.123.0,<3",
   "huggingface-hub>=1.0.0,<2",
   "onnxruntime>=1.23.0,<2",
+  "transformers==5.10.4",
 ]
-test = ["mcp>=2.1.1,<3", "pytest>=8.0.0", "pyyaml>=6.0.0"]
+
+[tool.uv]
+override-dependencies = ["transformers==5.10.4"]
 
 [project.scripts]
 papertrans = "papertrans.cli:main"
-papertrans-mcp = "papertrans.mcp_server:main"
+papertrans-mcp = "papertrans.mcp_entrypoint:main"
+
+[project.urls]
+Homepage = "https://github.com/tenxnet/PaperTrans"
+Documentation = "https://github.com/tenxnet/PaperTrans/tree/main/docs"
+Repository = "https://github.com/tenxnet/PaperTrans.git"
+Issues = "https://github.com/tenxnet/PaperTrans/issues"
+Changelog = "https://github.com/tenxnet/PaperTrans/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/papertrans"]
+
+[tool.hatch.build.targets.sdist]
+# Evaluation workers include separately licensed upstream-derived material and
+# are distributed only through the GitHub source tree with their own notices.
+# The PyPI artifact is deliberately Python-only; the complete app remains a
+# GitHub source-checkout distribution.
+include = [
+  "/src/papertrans",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/PYPI_README.md",
+]
+exclude = ["/workers"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -23,9 +23,9 @@ is refused with exit 3 unless all of these checks pass:
 
 - exact installed versions: pdf2zh-next `2.9.0+papertrans.1`, BabelDOC `0.6.4`,
   PyMuPDF `1.26.7`, Python `3.12.11`, adapter `0.1.1`;
-- exact upstream revision, patched source tree, patch, three lock files, build
-  manifest, internal CycloneDX SBOM, baked BabelDOC asset manifest, and build
-  provenance digests;
+- exact upstream revision, patched source tree, patch, runtime/build/source
+  locks, build manifest, internal CycloneDX SBOM, baked BabelDOC asset
+  manifest, and build provenance digests;
 - host-supplied source/build/image/SBOM/runtime-lock digests that match those
   verified bytes (build and image digests are the same immutable image digest);
 - a valid provider profile in `/run/secrets/papertrans-provider.json`, readable
@@ -62,6 +62,15 @@ translation gateway recorded in the trusted provider secret.
   Python distribution selected for Python 3.12/Linux. They were generated with
   uv 0.11.3; regenerating them is an explicit dependency update, not a routine
   build step.
+- `source-artifacts.lock` maps the Linux BabelDOC/PyMuPDF wheels to the exact
+  official BabelDOC 0.6.4 and PyMuPDF 1.26.7 sdists and the MuPDF 1.26.12
+  source selected by PyMuPDF. The source fetcher validates sizes, hashes,
+  archive paths, and license files before embedding all three archives.
+- `scripts/verify_installed_source_mapping.py` verifies the installed wheels'
+  complete `RECORD`s, pip's observed wheel URLs and hashes, the
+  BabelDOC/PyMuPDF wheel-to-sdist payload correspondence, and PyMuPDF's
+  recorded MuPDF/SWIG inputs. Its result is covered by the complete
+  Corresponding Source manifest.
 - `build-manifest.json` is embedded into the image and has a digest compiled
   into the adapter's readiness policy.
 - `scripts/generate_runtime_metadata.py` creates the internal CycloneDX 1.6
@@ -76,6 +85,7 @@ image by digest:
 
 ```sh
 docker buildx build \
+  --build-arg PAPERTRANS_REVISION="$(git rev-parse HEAD)" \
   --provenance=mode=max \
   --sbom=true \
   --tag papertrans-babeldoc:2.9.0-papertrans.1 \
@@ -89,6 +99,19 @@ must scan both, verify the provenance predicate, record the pushed image digest,
 and reject any critical/high issue according to PaperTrans policy. Do not
 silently regenerate the locks to make a scanner pass.
 
+The build context includes the AGPL-3.0 and Apache-2.0 texts,
+`THIRD_PARTY_NOTICES.md`, and the conditional `SOURCE-OFFER.md`; the final
+image stores them below `/opt/papertrans/licenses/`. Exact BabelDOC, PyMuPDF,
+and MuPDF source archives are embedded below
+`/opt/papertrans/corresponding-source/upstream-archives/`; the complete source
+directory also contains the patched engine, adapter source, build recipe,
+locks, patch, and legal files in the same layout as this build context, with a
+full manifest at
+`/opt/papertrans/corresponding-source.manifest.json`. This does not clear the
+image for distribution: final-image source extraction/retention, publication
+as matching release assets, and the PyMuPDF licensing decision remain explicit
+release blockers.
+
 Validate without installing engine dependencies:
 
 ```sh
@@ -97,6 +120,15 @@ git -C /path/to/exact-upstream apply --check \
 
 PYTHONPATH=workers/babeldoc/worker/src \
   uv run --extra test pytest -p no:cacheprovider workers/babeldoc/worker/tests -q
+uv run --frozen python workers/babeldoc/scripts/fetch_source_artifacts.py \
+  --lock workers/babeldoc/source-artifacts.lock \
+  --requirements-lock workers/babeldoc/requirements.lock \
+  --upstream-lock workers/babeldoc/UPSTREAM.lock \
+  --output /path/to/empty/source-output
+python3 /path/to/extracted/corresponding-source/scripts/verify_tree_manifest.py \
+  --root /path/to/extracted/corresponding-source \
+  --manifest /path/to/extracted/corresponding-source.manifest.json \
+  --revision f8dffcf4c3a33b254391d43514439b975ce8d966
 docker buildx build --check workers/babeldoc
 ```
 
@@ -227,7 +259,7 @@ The effective controls are:
 --mount type=volume,src=<quota-tmpfs-output-volume>,dst=/output,volume-nocopy
 --mount type=volume,src=<ephemeral-provider-volume>,dst=/run/secrets,volume-nocopy,readonly
 --detach --entrypoint /bin/sleep <image-by-digest> infinity
---env PAPERTRANS_WORKER_SOURCE_REVISION=579c5f301a44224b5bb577c4475fc9527e6ed8bd8c8754855037d2a315065f6b
+--env PAPERTRANS_WORKER_SOURCE_REVISION=68c5805dfd311f597817643ca0143339e6ba77984a5519b8524a024eea93d9c3
 --env PAPERTRANS_WORKER_BUILD_DIGEST=sha256:<resolved-image-digest>
 --env PAPERTRANS_WORKER_IMAGE_DIGEST=sha256:<resolved-image-digest>
 --env PAPERTRANS_WORKER_SBOM_SHA256=<sha256-of-embedded-sbom.cdx.json>
@@ -248,9 +280,15 @@ mounts; `128m` + `128m` above is the default 256 MiB total.
 The source revision above is the SHA-256 of `UPSTREAM.lock`, which in turn pins
 Git commit `f8dffcf4c3a33b254391d43514439b975ce8d966`, its tree, and original
 source-file hashes. The health `forkRevision` is the approved patch SHA-256
-`80b9d80a57356b7eee9fd7d3fb90333a8c70f499d349d60e461f967b2d634f4f`.
+`002297dac1447b3ec3e020c4495f7c0b40670677168bdef84d866e6bf296828f`.
 Record that value in the host's approved-fork list. Extract and hash the SBOM
 from the built image before launch; do not substitute a source-tree estimate.
+
+The asset byte checks do not authorize redistribution. The 182 baked font,
+CMap, DocLayout, and tiktoken files still use mutable upstream URLs and have an
+open license-notice inventory described in `THIRD_PARTY_NOTICES.md`. Pin those
+origins and close that gate in addition to the Corresponding Source and
+PyMuPDF gates before publishing an image.
 
 Also use the default seccomp profile, no Docker socket/repository/home mounts,
 and a private network whose only permitted destination is the translation

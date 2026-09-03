@@ -9,7 +9,7 @@
     "upstreamRevision": "f8dffcf4c3a33b254391d43514439b975ce8d966",
     "upstreamTree": "622c27cd8eae439d65cce22968263e06c6abf8c2",
     "patch": "patches/0001-papertrans-safe-dependencies.patch",
-    "patchSha256": "80b9d80a57356b7eee9fd7d3fb90333a8c70f499d349d60e461f967b2d634f4f"
+    "patchSha256": "002297dac1447b3ec3e020c4495f7c0b40670677168bdef84d866e6bf296828f"
   },
   "dependencies": {
     "BabelDOC": "0.6.4",
@@ -21,10 +21,31 @@
   },
   "baseImage": "python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7",
   "locks": {
-    "UPSTREAM.lock": "579c5f301a44224b5bb577c4475fc9527e6ed8bd8c8754855037d2a315065f6b",
+    "UPSTREAM.lock": "68c5805dfd311f597817643ca0143339e6ba77984a5519b8524a024eea93d9c3",
     "requirements.lock": "0fc3f23dc5fa0b0ebb239acaf1b5c24a14cd29b41fe48cfd3d1915dfb832366f",
-    "build-requirements.lock": "99c8c09e2be15ac0fa0058f6df36a2dfda624a1c239241c4f59406d7599a0243"
+    "build-requirements.lock": "99c8c09e2be15ac0fa0058f6df36a2dfda624a1c239241c4f59406d7599a0243",
+    "source-artifacts.lock": "14735922967abea2cf52c177ada33e4a52e0dbd9c7188cb48205c0f3cf334514"
   },
+  "correspondingSource": [
+    {
+      "name": "BabelDOC",
+      "version": "0.6.4",
+      "archive": "babeldoc-0.6.4.tar.gz",
+      "sha256": "dbd2a69ccaf6678c34089f8c422a38a0fa170f5fa88ee1313b4235103421a875"
+    },
+    {
+      "name": "PyMuPDF",
+      "version": "1.26.7",
+      "archive": "pymupdf-1.26.7.tar.gz",
+      "sha256": "71add8bdc8eb1aaa207c69a13400693f06ad9b927bea976f5d5ab9df0bb489c3"
+    },
+    {
+      "name": "MuPDF",
+      "version": "1.26.12",
+      "archive": "mupdf-1.26.12-source.tar.gz",
+      "sha256": "6baf910928f404167ba49be6340195dec340795724722b331f5a2143f5aa0d01"
+    }
+  ],
   "protocolVersion": 1,
   "capabilities": ["translated_mono_pdf", "translated_dual_pdf"],
   "runtimeAssetPolicy": "baked-and-verified; network retrieval forbidden"

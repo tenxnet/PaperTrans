@@ -30,7 +30,7 @@ Paper text is untrusted input. The MCP server instructs clients not to treat it 
 
 ## Data exposed to an MCP client
 
-A connected client can access paper metadata, translation source chunks, job status, per-chunk translation state, and generated artifact metadata. It can create jobs, save translations, and finalize eligible jobs. Tools do not accept arbitrary filesystem paths, but they operate on jobs below the configured PaperTrans output root.
+A connected client can access paper metadata, translation source chunks, job status, per-chunk translation state, and generated artifact metadata. It can create jobs, save translations, and finalize eligible jobs. Tools do not accept arbitrary filesystem paths, but they operate on jobs below the configured PaperTrans output root and read an imported PDF only from the configured data root.
 
 Only connect clients that you trust with those papers and translations. PaperTrans does not independently verify the identity shown by an external tunnel or connector configuration.
 
@@ -44,7 +44,7 @@ uv sync --extra mcp
   --port 8000
 ```
 
-The endpoint is `http://127.0.0.1:8000/mcp`. Configuration can also be supplied through `PAPERTRANS_REPO_ROOT`, `PAPERTRANS_OUTPUT_ROOT`, `PAPERTRANS_MCP_HOST`, `PAPERTRANS_MCP_PORT`, and `PAPERTRANS_MCP_TRANSPORT`.
+The endpoint is `http://127.0.0.1:8000/mcp`. Configuration can also be supplied through `PAPERTRANS_REPO_ROOT`, `PAPERTRANS_DATA_ROOT`, `PAPERTRANS_OUTPUT_ROOT`, `PAPERTRANS_MCP_HOST`, `PAPERTRANS_MCP_PORT`, and `PAPERTRANS_MCP_TRANSPORT`. The matching CLI options are `--repo-root`, `--data-root`, and `--output-root`; use the same custom roots as the Web process so PDF jobs resolve their imported `data/papers/<job-id>/source.pdf` from the intended location.
 
 The Web UI checks only whether the local MCP port is listening. It cannot verify a tunnel or an external client connection.
 

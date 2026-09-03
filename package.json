@@ -1,15 +1,20 @@
 {
   "name": "papertrans-web",
-  "version": "0.2.0-rc.1",
+  "version": "0.2.0-rc.2",
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --hostname 127.0.0.1",
     "build": "next build",
-    "start": "next start",
+    "start": "next start --hostname 127.0.0.1",
     "typecheck": "tsc --noEmit",
+    "test": "pnpm test:artifact-security && pnpm test:pdf-import-admission && pnpm test:arxiv-id && pnpm test:library-state && pnpm test:local-http-boundary && pnpm test:paper-review",
     "test:artifact-security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/artifact-security.test.mjs",
-    "test:pdf-import-admission": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/pdf-import-admission.test.mjs"
+    "test:pdf-import-admission": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/pdf-import-admission.test.mjs",
+    "test:arxiv-id": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/arxiv-id.test.mjs",
+    "test:library-state": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/library-state.test.mjs",
+    "test:local-http-boundary": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/local-http-boundary.test.mjs",
+    "test:paper-review": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/paper-review.test.mjs"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

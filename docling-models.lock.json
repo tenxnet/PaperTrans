@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "release": "v0.2.0-rc.1",
+  "release": "v0.2.0-rc.2",
   "sources": [
     {
       "repository": "docling-project/docling-layout-heron",

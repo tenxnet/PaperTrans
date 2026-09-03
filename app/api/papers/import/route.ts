@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { access, mkdir, open, readdir, readFile, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
+import { validateLocalMutationRequest } from "@/lib/local-http-boundary";
 import {
   claimPdfImportAdmission,
   claimPersistentPdfImportAdmission,
@@ -251,6 +252,13 @@ async function runPdfImport(
 }
 
 export async function POST(request: Request) {
+  const boundary = validateLocalMutationRequest(request, ["multipart/form-data"]);
+  if (!boundary.ok) {
+    return NextResponse.json(
+      { code: boundary.code, error: boundary.error },
+      { status: boundary.status },
+    );
+  }
   // Claim before the first await so concurrent requests cannot both pass admission.
   const admission = claimPdfImportAdmission();
   if (admission === null) {

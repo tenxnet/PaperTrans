@@ -10,10 +10,9 @@ Describe the user-visible result.
 
 ## Validation
 
-- [ ] `uv run --frozen --extra test pytest -q`
+- [ ] `uv lock --check && uv run --frozen --extra test --group docling pytest -q`
 - [ ] `pnpm typecheck`
-- [ ] `pnpm test:artifact-security`
-- [ ] `pnpm test:pdf-import-admission`
+- [ ] `pnpm test`
 - [ ] `pnpm build`
 - [ ] Experimental-worker checks are not applicable or passed as documented in `CONTRIBUTING.md`.
 - [ ] Relevant Firefox/Chromium behavior was checked when UI or generated HTML changed.

@@ -6,7 +6,7 @@
 
 [日本語](README.md) | English
 
-> **Release candidate (v0.2.0-rc.1)** — Official arXiv HTML remains the stable input path, with digital-PDF import through Docling added as an experimental path. Both use a connected MCP client to translate into Japanese.
+> **Next release candidate (v0.2.0-rc.2, unpublished)** — Official arXiv HTML remains the stable input path, with digital-PDF import through Docling as an experimental path. Both use a connected MCP client to translate into Japanese. The published `v0.2.0-rc.1` tag will not be moved.
 
 PaperTrans is a local-first academic paper translation workspace. It translates prose into Japanese while preserving document structure, MathML equations, figures, tables, citations, cross-references, identifiers, and bibliography entries.
 
@@ -71,7 +71,7 @@ The Web UI manages job preparation, progress, and artifacts. Model selection and
 ## Scope
 
 - Official arXiv HTML is the supported v1 input.
-- Digital-PDF import through Docling is experimental in v0.2.0-rc.1. Reading order, equations, and tables can still be reconstructed incorrectly in complex layouts.
+- Digital-PDF import through Docling remains experimental. Reading order, equations, and tables can still be reconstructed incorrectly in complex layouts.
 - Scanned-PDF OCR, translated-PDF generation, and ar5iv or LaTeXML fallback are unavailable or still under evaluation.
 - Japanese is the only v1 translation target. The web UI itself supports Japanese and English.
 - The web app and MCP server are local, single-user tools.
@@ -95,6 +95,7 @@ Priorities and specifications may change as experiments and issues provide new e
 
 - `data/`, `output/`, and `.env*` are excluded from Git.
 - Bind the web app and MCP server to `127.0.0.1`.
+- The Web server rejects Host headers other than `127.0.0.1`, `localhost`, and `[::1]`. DNS aliases and reverse-proxy exposure require a separate security design including authentication and are unsupported here.
 - Never expose the unauthenticated MCP server directly to the public internet.
 - You are responsible for checking the source paper's license and applicable law before using or sharing a translation.
 - Outputs are AI/MCP-generated machine translations. Translation and structural QA can be wrong, so always verify the source paper before research use or citation.
@@ -114,9 +115,10 @@ Priorities and specifications may change as experiments and issues provide new e
 ## Development and validation
 
 ```bash
-uv run --frozen --extra test pytest -q
+uv lock --check
+uv run --frozen --extra test --group docling pytest -q
 pnpm typecheck
-pnpm test:pdf-import-admission
+pnpm test
 pnpm build
 ```
 
@@ -124,4 +126,4 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. Do not attach
 
 ## License
 
-PaperTrans source code, repository Skills, templates, and documentation are provided under the [Apache License 2.0](LICENSE). This license does not automatically apply to papers acquired by users, figures and tables contained in those papers, or generated translation artifacts.
+Source code, repository Skills, templates, and documentation copyrighted by the PaperTrans project are provided under the [Apache License 2.0](LICENSE). Separately identified third-party-derived material, including the patches against upstream AGPL code under `workers/babeldoc/patches/`, remains governed by its respective license and is not relicensed by the repository's Apache-2.0 license. See the [dependency license audit](docs/dependency-licenses.md) for dependency and distribution notes. These licenses do not automatically apply to papers acquired by users, figures and tables contained in those papers, or generated translation artifacts.

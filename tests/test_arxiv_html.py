@@ -17,6 +17,8 @@ from papertrans.arxiv_html import (
     _citation_metadata,
     _decode_local_images,
     _download_assets,
+    _arxiv_identity_matches,
+    _find_resolved_id,
     _normalize_passive_image,
     _parse_codex_jsonl,
     _publish_local_assets,
@@ -67,9 +69,56 @@ PNG_BYTES = base64.b64decode(
 
 def test_normalizes_arxiv_urls_and_versions():
     assert normalize_arxiv_id("https://arxiv.org/abs/2508.19843") == "2508.19843"
+    assert normalize_arxiv_id("https://arxiv.org/html/2508.19843v3") == "2508.19843v3"
+    assert normalize_arxiv_id("https://arxiv.org/pdf/2508.19843.pdf") == "2508.19843"
     assert normalize_arxiv_id("arXiv:2508.19843v3") == "2508.19843v3"
     assert normalize_arxiv_id("https://arxiv.org/abs/math/0211159") == "math/0211159"
     assert normalize_arxiv_id("arXiv:HEP-TH/9901001V2") == "hep-th/9901001v2"
+
+
+def test_resolved_arxiv_identity_requires_the_requested_paper_and_revision():
+    assert _arxiv_identity_matches("2508.19843", "2508.19843v3")
+    assert _arxiv_identity_matches("math/0211159", "math/0211159v2")
+    assert _arxiv_identity_matches("2508.19843v3", "2508.19843v3")
+    assert not _arxiv_identity_matches("2508.19843", "2405.20947v2")
+    assert not _arxiv_identity_matches("2508.19843v2", "2508.19843v3")
+
+
+def test_resolved_arxiv_id_uses_a_bounded_complete_watermark_token():
+    exact = BeautifulSoup(
+        '<div id="watermark-tr">arXiv:2508.19843v3 [cs.CR]</div>',
+        "html.parser",
+    )
+    embedded = BeautifulSoup(
+        '<div id="watermark-tr">arXiv:12508.19843 [cs.CR]</div>',
+        "html.parser",
+    )
+
+    assert _find_resolved_id(exact) == "2508.19843v3"
+    assert _find_resolved_id(embedded) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "12508.19843",
+        "2599.19843",
+        f"2508.19843v{'1' * 80}",
+        f"{'a' * 40}/0211159",
+        "math/٠٢١١١٥٩",
+        "٢٥08.19843",
+        "2508.19843v1١",
+        "not-arxiv-2508.19843-extra",
+        "https://arxiv.org.evil.example/abs/2508.19843",
+        "https://user@arxiv.org/abs/2508.19843",
+        "http://arxiv.org/abs/2508.19843",
+        "https://arxiv.org:444/abs/2508.19843",
+        "https://example.com/?id=2508.19843",
+    ],
+)
+def test_rejects_arxiv_identifiers_embedded_in_untrusted_input(value: str):
+    with pytest.raises(ValueError, match="invalid arXiv identifier"):
+        normalize_arxiv_id(value)
 
 
 def test_reads_authors_and_publication_date_from_arxiv_html_fallbacks():

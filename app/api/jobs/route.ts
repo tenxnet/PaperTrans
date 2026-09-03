@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { NextResponse } from "next/server";
+import { normalizeArxivId } from "@/lib/arxiv-id";
+import { validateLocalMutationRequest } from "@/lib/local-http-boundary";
 import {
   getPaperTransRuntimeConfig,
   inspectPaperTransRuntime,
@@ -13,17 +15,14 @@ export const dynamic = "force-dynamic";
 const execFileAsync = promisify(execFile);
 const activeJobs = new Set<string>();
 
-function normalizeArxivId(value: unknown) {
-  if (typeof value !== "string") return null;
-  return (
-    value
-      .trim()
-      .match(/(?:arxiv:\s*)?((?:\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*\/\d{7})(?:v\d+)?)/i)?.[1]
-      ?.toLowerCase() ?? null
-  );
-}
-
 export async function POST(request: Request) {
+  const boundary = validateLocalMutationRequest(request, ["application/json"]);
+  if (!boundary.ok) {
+    return NextResponse.json(
+      { code: boundary.code, error: boundary.error },
+      { status: boundary.status },
+    );
+  }
   let body: unknown;
   try {
     body = await request.json();
@@ -44,16 +43,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "この論文のジョブを準備中です", jobId }, { status: 409 });
   }
 
-  const config = getPaperTransRuntimeConfig();
-  const readiness = await inspectPaperTransRuntime(config);
-  if (!config.configurationReady || !readiness.cliReady) {
-    return NextResponse.json(
-      { error: "PaperTransの実行環境が準備できていません" },
-      { status: 503 },
-    );
-  }
+  // Claim synchronously before runtime inspection yields; otherwise two
+  // requests can both pass the Set check and spawn duplicate preparations.
   activeJobs.add(jobId);
   try {
+    const config = getPaperTransRuntimeConfig();
+    const readiness = await inspectPaperTransRuntime(config);
+    if (!config.configurationReady || !readiness.cliReady) {
+      return NextResponse.json(
+        { error: "PaperTransの実行環境が準備できていません" },
+        { status: 503 },
+      );
+    }
     const { stdout } = await execFileAsync(
       config.cliPath,
       [

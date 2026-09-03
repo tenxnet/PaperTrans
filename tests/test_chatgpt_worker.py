@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -109,9 +112,15 @@ def _pdf_unit(
     }
 
 
-def _prepare_pdf_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ChatGPTTranslationStore:
+def _prepare_pdf_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    data_root: Path | None = None,
+) -> ChatGPTTranslationStore:
     job_id = "pdf-mcp"
-    source = tmp_path / "data" / "papers" / job_id / "source.pdf"
+    selected_data_root = data_root or tmp_path / "data"
+    source = selected_data_root / "papers" / job_id / "source.pdf"
     source.parent.mkdir(parents=True)
     pdf = pymupdf.open()
     page = pdf.new_page()
@@ -184,7 +193,9 @@ def _prepare_pdf_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ChatGPT
         return qa
 
     monkeypatch.setattr(chatgpt_worker, "write_semantic_pdf_qa", fake_pdf_qa)
-    return ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+    if data_root is None:
+        return ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+    return ChatGPTTranslationStore(tmp_path, tmp_path / "output", selected_data_root)
 
 
 def test_default_job_id_is_safe_for_legacy_arxiv_identifiers():
@@ -276,6 +287,220 @@ def test_chatgpt_worker_persists_validates_resumes_and_finalizes(
     assert refreshed_manifest["artifacts"]["rendererVersion"] == arxiv_html_artifact_version()
 
 
+def test_prepare_failure_cleans_staging_and_can_be_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    attempts = 0
+
+    def flaky_acquire(
+        arxiv_id: str,
+        work_dir: Path,
+        repo_root: Path,
+        metrics_path: Path | None = None,
+    ) -> dict:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "partial-download").write_text("partial", encoding="utf-8")
+            raise RuntimeError("synthetic acquisition failure")
+        return _fake_acquire(arxiv_id, work_dir, repo_root, metrics_path)
+
+    monkeypatch.setattr(chatgpt_worker, "acquire_official_arxiv_html", flaky_acquire)
+    output_root = tmp_path / "output"
+    store = ChatGPTTranslationStore(tmp_path, output_root)
+
+    with pytest.raises(RuntimeError, match="synthetic acquisition failure"):
+        store.prepare("2508.19843", "retryable-job")
+
+    assert not (output_root / "retryable-job").exists()
+    assert not list(output_root.glob(".retryable-job.mcp-prepare-*"))
+
+    prepared = store.prepare("2508.19843", "retryable-job")
+
+    assert prepared["status"] == "prepared"
+    assert attempts == 2
+    assert (output_root / "retryable-job/work/mcp-job.json").is_file()
+    assert not list(output_root.glob(".retryable-job.mcp-prepare-*"))
+
+
+def test_prepare_serializes_concurrent_calls_for_the_same_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    start_barrier = threading.Barrier(2)
+    acquisition_started = threading.Event()
+    allow_acquisition = threading.Event()
+    concurrent_acquisition = threading.Event()
+    attempts_lock = threading.Lock()
+    attempts = 0
+
+    def blocking_acquire(
+        arxiv_id: str,
+        work_dir: Path,
+        repo_root: Path,
+        metrics_path: Path | None = None,
+    ) -> dict:
+        nonlocal attempts
+        with attempts_lock:
+            attempts += 1
+            attempt = attempts
+        if attempt == 1:
+            acquisition_started.set()
+            assert allow_acquisition.wait(timeout=2)
+        else:
+            concurrent_acquisition.set()
+        return _fake_acquire(arxiv_id, work_dir, repo_root, metrics_path)
+
+    monkeypatch.setattr(
+        chatgpt_worker,
+        "acquire_official_arxiv_html",
+        blocking_acquire,
+    )
+    store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+
+    def prepare() -> dict:
+        start_barrier.wait(timeout=2)
+        return store.prepare("2508.19843", "concurrent-job")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(prepare) for _ in range(2)]
+        assert acquisition_started.wait(timeout=2)
+        assert not concurrent_acquisition.wait(timeout=0.1)
+        allow_acquisition.set()
+        results = [future.result(timeout=2) for future in futures]
+
+    assert attempts == 1
+    assert [result["status"] for result in results] == ["prepared", "prepared"]
+
+
+def test_concurrent_distinct_chunk_saves_are_serialized_without_lost_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(chatgpt_worker, "acquire_official_arxiv_html", _fake_acquire)
+    store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+    prepared = store.prepare("2508.19843", "concurrent-save", max_characters=1000)
+    assert prepared["chunks"]["total"] == 2
+    chunks = [
+        store.next_chunk("concurrent-save", f"chunk-{index:03d}")
+        for index in (1, 2)
+    ]
+
+    original_atomic_write = chatgpt_worker._atomic_write_json
+    active_writes = 0
+    writes_guard = threading.Lock()
+    overlapping_write = threading.Event()
+
+    def slow_atomic_write(path: Path, value: dict) -> None:
+        nonlocal active_writes
+        with writes_guard:
+            active_writes += 1
+            if active_writes > 1:
+                overlapping_write.set()
+        try:
+            time.sleep(0.03)
+            original_atomic_write(path, value)
+        finally:
+            with writes_guard:
+                active_writes -= 1
+
+    monkeypatch.setattr(chatgpt_worker, "_atomic_write_json", slow_atomic_write)
+    start_barrier = threading.Barrier(2)
+
+    def save(chunk: dict) -> dict:
+        start_barrier.wait(timeout=2)
+        return store.save_chunk(
+            "concurrent-save",
+            chunk["chunkId"],
+            _translations(chunk),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(save, chunks))
+
+    assert not overlapping_write.is_set()
+    assert all(result["chunks"]["completed"] >= 1 for result in results)
+    assert store.status("concurrent-save")["status"] == "ready_to_finalize"
+    document = json.loads(
+        (tmp_path / "output/concurrent-save/work/html-document.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    translated_ids = {
+        block["blockId"] for chunk in chunks for block in chunk["blocks"]
+    }
+    units_by_id = {unit["id"]: unit for unit in document["units"]}
+    assert all(units_by_id[block_id].get("japanese") for block_id in translated_ids)
+
+
+@pytest.mark.parametrize(
+    "failed_write",
+    ["html-document.json", "chunk-001.json", "mcp-job.json"],
+)
+def test_html_chunk_retry_repairs_every_partial_write_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_write: str,
+):
+    monkeypatch.setattr(chatgpt_worker, "acquire_official_arxiv_html", _fake_acquire)
+    store = ChatGPTTranslationStore(tmp_path, tmp_path / "output")
+    store.prepare("2508.19843", "retry-save", max_characters=1000)
+    chunk = store.next_chunk("retry-save", "chunk-001")
+    translations = _translations(chunk)
+
+    original_atomic_write = chatgpt_worker._atomic_write_json
+    failed = False
+
+    def fail_once(path: Path, value: dict) -> None:
+        nonlocal failed
+        if path.name == failed_write and not failed:
+            failed = True
+            raise OSError(f"transient failure writing {failed_write}")
+        original_atomic_write(path, value)
+
+    monkeypatch.setattr(chatgpt_worker, "_atomic_write_json", fail_once)
+    with pytest.raises(OSError, match="transient failure"):
+        store.save_chunk("retry-save", "chunk-001", translations)
+
+    retried = store.save_chunk("retry-save", "chunk-001", translations)
+
+    work = tmp_path / "output/retry-save/work"
+    result = json.loads(
+        (work / "chatgpt-translations/chunk-001.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads((work / "mcp-job.json").read_text(encoding="utf-8"))
+    document = json.loads(
+        (work / "html-document.json").read_text(encoding="utf-8")
+    )
+    units_by_id = {unit["id"]: unit for unit in document["units"]}
+
+    assert failed
+    assert result["translations"] == translations
+    assert manifest["status"] == retried["status"] == "translating"
+    assert manifest["chunks"][0]["status"] == "completed"
+    assert all(units_by_id[item["blockId"]]["japanese"] for item in translations)
+
+
+def test_prepare_preserves_manifestless_nonempty_output_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output_root = tmp_path / "output"
+    job_root = output_root / "owned-by-user"
+    job_root.mkdir(parents=True)
+    marker = job_root / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(
+        chatgpt_worker,
+        "acquire_official_arxiv_html",
+        lambda *_args, **_kwargs: pytest.fail("acquisition must not start"),
+    )
+    store = ChatGPTTranslationStore(tmp_path, output_root)
+
+    with pytest.raises(TranslationJobError, match="already exists without"):
+        store.prepare("2508.19843", "owned-by-user")
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
 def test_mcp_worker_translates_prepared_docling_pdf_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -344,6 +569,113 @@ def test_mcp_worker_translates_prepared_docling_pdf_job(
     assert repaired_common["status"] == "completed"
     assert repaired_common["updatedAt"] == completed_updated_at
     assert repaired_common["finalizedAt"] == completed_finalized_at
+
+
+@pytest.mark.parametrize(
+    "failed_write",
+    [
+        "semantic-document.json",
+        "chunk-001.json",
+        "mcp-job.json",
+        "papertrans-job.json",
+    ],
+)
+def test_pdf_chunk_retry_repairs_every_partial_write_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_write: str,
+):
+    store = _prepare_pdf_job(tmp_path, monkeypatch)
+    chunk = store.next_chunk("pdf-mcp")
+    translations = _translations(chunk)
+    original_atomic_write = chatgpt_worker._atomic_write_json
+    original_pdf_manifest_write = chatgpt_worker.write_pdf_job_manifest
+    failed = False
+
+    def fail_atomic_once(path: Path, value: dict) -> None:
+        nonlocal failed
+        if path.name == failed_write and not failed:
+            failed = True
+            raise OSError(f"transient failure writing {failed_write}")
+        original_atomic_write(path, value)
+
+    def fail_pdf_manifest_once(path: Path, **kwargs) -> dict:
+        nonlocal failed
+        if path.name == failed_write and not failed:
+            failed = True
+            raise OSError(f"transient failure writing {failed_write}")
+        return original_pdf_manifest_write(path, **kwargs)
+
+    monkeypatch.setattr(chatgpt_worker, "_atomic_write_json", fail_atomic_once)
+    monkeypatch.setattr(
+        chatgpt_worker,
+        "write_pdf_job_manifest",
+        fail_pdf_manifest_once,
+    )
+    with pytest.raises(OSError, match="transient failure"):
+        store.save_chunk("pdf-mcp", "chunk-001", translations)
+
+    retried = store.save_chunk("pdf-mcp", "chunk-001", translations)
+
+    work = tmp_path / "output/pdf-mcp/work"
+    result = json.loads(
+        (work / "chatgpt-translations/chunk-001.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads((work / "mcp-job.json").read_text(encoding="utf-8"))
+    common_manifest = json.loads(
+        (work / "papertrans-job.json").read_text(encoding="utf-8")
+    )
+    document = json.loads(
+        (work / "semantic-document.json").read_text(encoding="utf-8")
+    )
+    units_by_id = chatgpt_worker._pdf_unit_map(document)
+
+    assert failed
+    assert result["translations"] == translations
+    assert manifest["status"] == retried["status"] == "ready_to_finalize"
+    assert manifest["chunks"][0]["status"] == "completed"
+    assert common_manifest["status"] == "ready_to_finalize"
+    assert common_manifest["provider"] == "mcp"
+    assert all(units_by_id[item["blockId"]]["japanese"] for item in translations)
+
+
+def test_mcp_worker_reads_pdf_from_custom_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    custom_data_root = tmp_path / "custom-data"
+    store = _prepare_pdf_job(
+        tmp_path,
+        monkeypatch,
+        data_root=custom_data_root,
+    )
+
+    chunk = store.next_chunk("pdf-mcp")
+
+    assert store.data_root == custom_data_root.resolve()
+    assert chunk["chunkId"] == "chunk-001"
+    assert (custom_data_root / "papers/pdf-mcp/source.pdf").is_file()
+    assert not (tmp_path / "data/papers/pdf-mcp/source.pdf").exists()
+
+
+def test_mcp_worker_does_not_fallback_to_repo_data_for_pdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_pdf_job(tmp_path, monkeypatch)
+    repo_source = tmp_path / "data/papers/pdf-mcp/source.pdf"
+    custom_data_root = tmp_path / "custom-data"
+    custom_data_root.mkdir()
+    store = ChatGPTTranslationStore(
+        tmp_path,
+        tmp_path / "output",
+        custom_data_root,
+    )
+
+    assert repo_source.is_file()
+    with pytest.raises(
+        TranslationJobError,
+        match="missing from the configured data root",
+    ):
+        store.next_chunk("pdf-mcp")
 
 
 def test_mcp_pdf_finalize_marks_empty_text_pages_for_review(

@@ -55,9 +55,9 @@ for argument do
 done
 
 if [ -n "$uv_offline" ]; then
-  exec "$uv_executable" run --offline --frozen --extra mcp --extra docling \
+  exec "$uv_executable" run --offline --frozen --extra mcp --group docling \
     python -m papertrans.local_app "$@"
 fi
 
-exec "$uv_executable" run --frozen --extra mcp --extra docling \
+exec "$uv_executable" run --frozen --extra mcp --group docling \
   python -m papertrans.local_app "$@"
